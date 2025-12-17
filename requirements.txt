@@ -24,7 +24,6 @@ httpx==0.24.1
 # Testing
 pytest==7.4.3
 pytest-asyncio==0.21.1
-httpx==0.24.1
 
 # Development
 black==23.12.0
