@@ -90,16 +90,22 @@ async def add_favorite(
         tenant_id = current_user["id"]
         property_id = favorite_data.property_id
         
+        print(f"📝 [ADD FAVORITE] Request from tenant: {tenant_id}")
+        print(f"📝 [ADD FAVORITE] Property ID: {property_id}")
+        
         # Check if property exists
         property_check = supabase_admin.table("properties").select("id").eq(
             "id", property_id
         ).execute()
         
         if not property_check.data:
+            print(f"❌ [ADD FAVORITE] Property not found: {property_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Property not found"
             )
+        
+        print(f"✅ [ADD FAVORITE] Property exists: {property_id}")
         
         # Check if already favorited
         existing_fav = supabase_admin.table("favorites").select("*").eq(
@@ -107,6 +113,7 @@ async def add_favorite(
         ).eq("property_id", property_id).execute()
         
         if existing_fav.data:
+            print(f"⚠️ [ADD FAVORITE] Property already favorited: {property_id}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Property already in favorites"
@@ -118,14 +125,17 @@ async def add_favorite(
             "property_id": property_id
         }
         
+        print(f"💾 [ADD FAVORITE] Inserting favorite record: {fav_dict}")
         response = supabase_admin.table("favorites").insert(fav_dict).execute()
         
         if not response.data:
+            print(f"❌ [ADD FAVORITE] Failed to insert favorite")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Failed to add favorite"
             )
         
+        print(f"✅ [ADD FAVORITE] Successfully added favorite: {property_id}")
         return {
             "success": True,
             "message": "Property added to favorites",
@@ -135,6 +145,7 @@ async def add_favorite(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"❌ [ADD FAVORITE] Error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to add favorite: {str(e)}"
@@ -152,22 +163,28 @@ async def remove_favorite(
     try:
         tenant_id = current_user["id"]
         
+        print(f"🗑️ [REMOVE FAVORITE] Request from tenant: {tenant_id}")
+        print(f"🗑️ [REMOVE FAVORITE] Property ID: {property_id}")
+        
         # Check if favorited
         existing_fav = supabase_admin.table("favorites").select("*").eq(
             "tenant_id", tenant_id
         ).eq("property_id", property_id).execute()
         
         if not existing_fav.data:
+            print(f"❌ [REMOVE FAVORITE] Not found for tenant {tenant_id}, property {property_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Favorite not found"
             )
         
+        print(f"✅ [REMOVE FAVORITE] Found favorite, deleting...")
         # Remove from favorites
         supabase_admin.table("favorites").delete().eq(
             "tenant_id", tenant_id
         ).eq("property_id", property_id).execute()
         
+        print(f"✅ [REMOVE FAVORITE] Successfully removed favorite: {property_id}")
         return {
             "success": True,
             "message": "Property removed from favorites"
@@ -176,6 +193,7 @@ async def remove_favorite(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"❌ [REMOVE FAVORITE] Error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to remove favorite: {str(e)}"

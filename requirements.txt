@@ -20,6 +20,9 @@ python-dotenv==1.0.0
 # HTTP Client
 httpx==0.24.1
 
+# Note: Redis not required for simple optimization
+# redis==5.0.1  # Uncomment if you want to upgrade to full Redis version
+
 
 # Testing
 pytest==7.4.3
@@ -29,3 +32,4 @@ pytest-asyncio==0.21.1
 black==23.12.0
 flake8==6.1.0
 mypy==1.7.1
+jinja2>=3.1.0

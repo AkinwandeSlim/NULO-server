@@ -86,7 +86,7 @@ class PropertyResponse(BaseModel):
     landlord_id: str
     title: str
     description: Optional[str]
-    rent_amount: float = Field(alias="price")
+    price: float
     security_deposit: Optional[float] = None
     agency_fee: float = 0  # Always 0 for Nulo!
     location: str
@@ -96,13 +96,13 @@ class PropertyResponse(BaseModel):
     country: str
     latitude: Optional[float]
     longitude: Optional[float]
-    bedrooms: int = Field(alias="beds")
-    bathrooms: int = Field(alias="baths")
-    square_feet: Optional[int] = Field(None, alias="sqft")
+    beds: int
+    baths: int
+    sqft: Optional[int] = None
     property_type: PropertyType
     amenities: list[str] = []
-    photos: list[str] = Field(default=[], alias="images")
-    availability_start: Optional[date] = Field(None, alias="available_from")
+    images: list[str] = []
+    available_from: Optional[date] = None
     status: PropertyStatus
     view_count: int = 0
     favorite_count: int = 0

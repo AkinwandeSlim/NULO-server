@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_KEY: str
     SUPABASE_SERVICE_KEY: str
+    SUPABASE_SERVICE_ROLE_KEY: str | None = None
 
-
+    # SMTP
     SMTP_HOST: str
     SMTP_PORT: int
     SMTP_USER: str
@@ -23,7 +24,7 @@ class Settings(BaseSettings):
     # JWT
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 24 * 60  # 24 hours instead of 30 minutes
     
     # Server
     HOST: str = "0.0.0.0"
@@ -41,6 +42,12 @@ class Settings(BaseSettings):
     # Google Maps (Optional)
     GOOGLE_MAPS_API_KEY: str | None = None
     
+    # Redis Configuration (Optional)
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: str | None = None
+    
     @property
     def cors_origins(self) -> List[str]:
         """Parse CORS origins from comma-separated string"""
@@ -49,6 +56,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"  # Allow extra fields in .env
 
 
 @lru_cache()
