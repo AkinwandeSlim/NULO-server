@@ -13,12 +13,23 @@ VerificationStatus = Literal["pending", "approved", "rejected", "partial"]
 
 # Request Models
 class UserRegister(BaseModel):
-    """User registration request"""
+    """User registration request - minimal for Option A signup"""
     email: EmailStr
-    password: str = Field(..., min_length=6)
-    full_name: str = Field(..., min_length=2)
-    user_type: UserType  # Changed from user_type to match database column
-    phone_number: Optional[str] = None
+    password: str = Field(..., min_length=8)  # ✅ Fixed: Changed from 6 to 8 to match frontend
+    full_name: Optional[str] = None  # Will be filled in onboarding
+    user_type: Optional[UserType] = "tenant"  # Default to tenant, set in onboarding
+    phone_number: Optional[str] = None  # Will be filled in onboarding
+    
+    # Landlord verification fields
+    nin: Optional[str] = None
+    bvn: Optional[str] = None
+    id_document: Optional[str] = None  # File path or URL
+    selfie_photo: Optional[str] = None  # File path or URL
+    account_type: Optional[Literal["individual", "company"]] = "individual"
+    company_name: Optional[str] = None
+    cac_number: Optional[str] = None
+    cac_certificate: Optional[str] = None  # File path or URL
+    tax_id: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -32,6 +43,9 @@ class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
+    location: Optional[str] = None  
+    onboarding_completed: Optional[bool] = None  
+    user_type: Optional[str] = None
 
 
 # Response Models
@@ -41,6 +55,7 @@ class UserBase(BaseModel):
     email: str
     full_name: Optional[str]
     avatar_url: Optional[str]
+    location: Optional[str]
     user_type: UserType  # Changed from user_type to match database column
     trust_score: int
     verification_status: VerificationStatus
@@ -91,6 +106,21 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     message: Optional[str] = None
+
+
+class SocialLoginRequest(BaseModel):
+    """Social login request payload from frontend"""
+    provider: str
+    provider_account_id: str
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    profile: dict
+    user_type: Optional[UserType] = None
+    # Onboarding fields for Google users
+    full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    location: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
 
 
 # Trust Score Models
