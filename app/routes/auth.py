@@ -31,6 +31,53 @@ class UserUpdate(BaseModel):
     location: Optional[str] = None
     onboarding_completed: Optional[bool] = None  # 
 
+
+async def create_user_profile(
+    user_id: str, 
+    email: str, 
+    full_name: Optional[str] = None, 
+    phone_number: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    user_type: str = "tenant"
+):
+    """
+    Create a profile entry for a user in the profiles table
+    This is called after user registration or OAuth signup
+    """
+    try:
+        print(f"📝 [CREATE PROFILE] Creating profile for user: {user_id}")
+        
+        profile_data = {
+            "id": user_id,
+            "email": email,
+            "full_name": full_name or "",
+            "phone": phone_number or None,
+            "avatar_url": avatar_url or None,
+            "role": user_type or "tenant",  # profiles table uses 'role' column
+        }
+        
+        # Try to insert profile
+        try:
+            supabase_admin.postgrest.auth(settings.SUPABASE_SERVICE_KEY)
+            result = supabase_admin.table("profiles").insert(profile_data).execute()
+            print(f"✅ [CREATE PROFILE] Profile created successfully for {user_id}")
+            return True
+        except Exception as insert_err:
+            # If profile already exists, that's okay - just log it
+            if "duplicate key" in str(insert_err).lower() or "already exists" in str(insert_err).lower():
+                print(f"⚠️ [CREATE PROFILE] Profile already exists for {user_id}, skipping")
+                return True
+            else:
+                print(f"❌ [CREATE PROFILE] Failed to create profile: {insert_err}")
+                # Don't fail the registration - profiles can be created later
+                return False
+                
+    except Exception as e:
+        print(f"❌ [CREATE PROFILE] Unexpected error: {e}")
+        # Don't fail the registration - profiles can be created later
+        return False
+
+
 @router.post("/register", response_model=AuthResponse)
 async def register(user_data: UserRegister):
     """

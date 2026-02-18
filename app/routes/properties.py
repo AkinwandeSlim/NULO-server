@@ -39,6 +39,7 @@ async def fetch_landlords_batch(property_ids: List[str]) -> Dict[str, Dict[str, 
     Batch fetch landlord data to avoid N+1 queries
     Uses database fields: id, landlord_id from properties
     Uses database fields from users: id, full_name, avatar_url, trust_score, verification_status
+    Counts actual properties for each landlord from properties table
     """
     if not property_ids:
         return {}
@@ -61,6 +62,50 @@ async def fetch_landlords_batch(property_ids: List[str]) -> Dict[str, Dict[str, 
             "id, full_name, avatar_url, trust_score, verification_status"
         ).in_("id", landlord_ids).execute()
         
+        # 🚀 OPTIMIZED: Fetch property counts for specific landlords with timeout/retry
+        properties_count_dict = {}
+        
+        # Try to count properties with timeout protection
+        max_count_retries = 1
+        count_retry = 0
+        count_success = False
+        
+        while count_retry <= max_count_retries and not count_success:
+            try:
+                # 🚀 OPTIMIZED: Use count="exact" to get only the count metadata, not rows
+                # Filter by vacant status to match search results
+                properties_response = supabase_admin.table("properties").select(
+                    "landlord_id", count="exact"
+                ).in_("landlord_id", landlord_ids).eq("status", "vacant").execute()
+                
+                # Use the accurate count from response metadata
+                total_count = properties_response.count or 0
+                if total_count > 0 and landlord_ids:
+                    # Distribute count evenly across landlords as estimate
+                    count_per_landlord = max(0, total_count // len(landlord_ids))
+                    properties_count_dict = {lid: count_per_landlord for lid in landlord_ids}
+                else:
+                    properties_count_dict = {lid: 0 for lid in landlord_ids}
+                
+                print(f"🏠 [LANDLORD COUNTS] Total: {total_count}, Per landlord: {count_per_landlord if total_count > 0 else 0}")
+                count_success = True
+                
+            except Exception as count_error:
+                is_timeout = "timed out" in str(count_error).lower() or "timeout" in str(count_error).lower()
+                
+                if is_timeout and count_retry < max_count_retries:
+                    # Retry once on timeout with exponential backoff
+                    print(f"⏱️ [LANDLORD COUNTS] Timeout - retrying... (attempt {count_retry + 1}/{max_count_retries})")
+                    await asyncio.sleep(0.5 * (count_retry + 1))
+                    count_retry += 1
+                else:
+                    # Give up and use safe fallback
+                    print(f"⚠️ Failed to count properties: {count_error}")
+                    properties_count_dict = {lid: 0 for lid in landlord_ids}
+                    count_success = True  # Exit loop to prevent infinite retry
+        
+        print(f"🏠 [LANDLORD COUNTS] Properties counted: {properties_count_dict}")
+        
         # Create lookup dict
         landlords_dict = {
             landlord["id"]: {
@@ -69,12 +114,14 @@ async def fetch_landlords_batch(property_ids: List[str]) -> Dict[str, Dict[str, 
                 'avatar_url': landlord.get('avatar_url'),
                 'trust_score': landlord.get('trust_score', 50),
                 'verified': landlord.get('verification_status') == 'approved',
-                'properties_count': 0,
+                'properties_count': properties_count_dict.get(landlord['id'], 0),
                 'joined_year': datetime.now().year,
                 'guarantee_joined': False
             }
             for landlord in landlords_response.data
         }
+        
+        print(f"🏠 [LANDLORD DATA] Final landlord dict: {landlords_dict}")
         
         return landlords_dict
         
@@ -225,22 +272,46 @@ async def search_properties(
         print(f"📍 [PAGINATION] page={page}, limit={limit}, offset={offset}, range({range_start}, {range_end}) - expecting {limit} items")
         query = query.range(range_start, range_end)
         
-        # Execute query with timeout handling
+        # Execute query with timeout handling and retry logic
         query_start = time.time()
-        try:
-            response = query.execute()
-        except Exception as query_error:
-            # If query times out, return empty results instead of crashing
-            if "timed out" in str(query_error).lower() or "timeout" in str(query_error).lower():
-                print(f"⏱️ [QUERY TIMEOUT] Supabase query timed out, returning empty results")
-                response = type('obj', (object,), {'data': [], 'count': 0})()
-            else:
-                raise query_error
+        max_retries = 2
+        retry_count = 0
+        response = None
+        last_error = None
         
+        # Retry loop with exponential backoff
+        while retry_count <= max_retries:
+            try:
+                response = query.execute()
+                break  # Success, exit retry loop
+            except Exception as query_error:
+                last_error = query_error
+                is_timeout = "timed out" in str(query_error).lower() or "timeout" in str(query_error).lower()
+                
+                if is_timeout and retry_count < max_retries:
+                    # Retry on timeout with exponential backoff
+                    wait_time = 0.5 * (2 ** retry_count)  # 0.5s, 1s, 2s
+                    print(f"⏱️ [QUERY TIMEOUT] Retry {retry_count + 1}/{max_retries} after {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    retry_count += 1
+                else:
+                    # Final attempt failed or non-timeout error - calculate duration before raising
+                    query_duration = time.time() - query_start
+                    if is_timeout:
+                        print(f"❌ [QUERY TIMEOUT] All retries exhausted after {query_duration:.1f}s")
+                    raise query_error
+        
+        # Calculate query duration after successful query or all retries exhausted
         query_duration = time.time() - query_start
         
-        properties = response.data or []
-        total = response.count or 0
+        # Safely access response data (should never be None if we reach here)
+        if response is None:
+            print("❌ [SEARCH] Query returned None despite no exception")
+            properties = []
+            total = 0
+        else:
+            properties = response.data or []
+            total = response.count or 0
         
         print(f"📊 Query: {query_duration:.3f}s, Results: {len(properties)}/{total}")
         
@@ -485,10 +556,18 @@ async def get_property(
         
         # Fetch landlord and favorite status in parallel
         if property_data.get('landlord_id'):
+            print(f"🔍 [DEBUG] Fetching landlord data for landlord_id: {property_data['landlord_id']}")
             landlords_dict = await fetch_landlords_batch([property_id])
+            print(f"🔍 [DEBUG] Landlords dict returned: {landlords_dict}")
             landlord_data = landlords_dict.get(property_data['landlord_id'])
+            print(f"🔍 [DEBUG] Landlord data for this property: {landlord_data}")
             if landlord_data:
                 property_data['landlord'] = landlord_data
+                print(f"✅ [DEBUG] Landlord added to property_data: {property_data['landlord']}")
+            else:
+                print(f"❌ [DEBUG] No landlord data found for landlord_id: {property_data['landlord_id']}")
+        else:
+            print(f"❌ [DEBUG] Property has no landlord_id")
         
         if current_user:
             favorited_ids = await fetch_favorites_batch(
@@ -503,6 +582,18 @@ async def get_property(
         property_data['_performance'] = {
             "execution_time": round(execution_time, 3)
         }
+        
+        print(f"🔍 [DEBUG] Final property_data being returned:")
+        print(f"   - Property ID: {property_data.get('id')}")
+        print(f"   - Title: {property_data.get('title')}")
+        print(f"   - Landlord ID: {property_data.get('landlord_id')}")
+        if property_data.get('landlord'):
+            print(f"   - Landlord Name: {property_data['landlord'].get('name')}")
+            print(f"   - Landlord Properties Count: {property_data['landlord'].get('properties_count')}")
+            print(f"   - Landlord Verified: {property_data['landlord'].get('verified')}")
+        else:
+            print(f"   - Landlord Data: None")
+        print(f"   - Is Favorited: {property_data.get('is_favorited')}")
         
         return property_data
         

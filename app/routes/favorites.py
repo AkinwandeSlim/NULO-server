@@ -198,3 +198,33 @@ async def remove_favorite(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to remove favorite: {str(e)}"
         )
+
+
+@router.get("/check/{property_id}")
+async def check_favorite(
+    property_id: str,
+    current_user: dict = Depends(get_current_tenant)
+):
+    """
+    Check if a property is in user's favorites (tenants only)
+    """
+    try:
+        tenant_id = current_user["id"]
+        
+        # Check if favorited
+        existing_fav = supabase_admin.table("favorites").select("*").eq(
+            "tenant_id", tenant_id
+        ).eq("property_id", property_id).execute()
+        
+        is_favorite = bool(existing_fav.data and len(existing_fav.data) > 0)
+        
+        return {
+            "is_favorite": is_favorite
+        }
+        
+    except Exception as e:
+        print(f"❌ [CHECK FAVORITE] Error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to check favorite: {str(e)}"
+        )

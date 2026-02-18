@@ -37,7 +37,7 @@ ALTER TABLE viewing_requests DISABLE ROW LEVEL SECURITY;
 -- Option 2: Enable RLS with Proper Policies (Production Ready)
 -- Uncomment these if you want to keep RLS enabled:
 
-/*
+
 ALTER TABLE viewing_requests ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Tenants can view their own requests

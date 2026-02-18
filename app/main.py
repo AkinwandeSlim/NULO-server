@@ -1,68 +1,5 @@
 """
 Nulo Africa - FastAPI Backend
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }  }    }      throw error      console.error('Failed to fetch complete locations:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/complete`)    try {  async getCompleteLocations() {  // Get complete location hierarchy  },    }      throw error      console.error(`Failed to search cities for "${query}":`, error)    } catch (error) {      return data      })        params: { q: query }      const { data } = await axios.get(`${API_BASE_URL}/api/locations/search`, {    try {  async searchCities(query: string) {  // Search for cities by name  },    }      throw error      console.error('Failed to fetch all cities:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/cities`)    try {  async getAllCities() {  // Get all cities (no state filter)  },    }      throw error      console.error(`Failed to fetch cities for ${state}:`, error)    } catch (error) {      return data      })        params: { state }      const { data } = await axios.get(`${API_BASE_URL}/api/locations/cities`, {    try {  async getCities(state: string) {  // Get cities for a specific state  },    }      throw error      console.error('Failed to fetch states:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/states`)    try {  async getStates() {  // Get all statesexport const locationsAPI = {const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'Main application entry point
 """
 from fastapi import FastAPI
@@ -77,7 +14,7 @@ from app.routes import (
     admin_landlord_verification, property_verification, 
     tenant_verification, admin_signup,admin_management,
     landlord_onboarding, landlord_dashboard, notifications, admin_dashboard,
-    admin_landlord_users, admin_tenant_users, locations
+    admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health
 )
 import logging
 
@@ -152,6 +89,7 @@ async def root():
     }
 
 # Include routers
+app.include_router(health.router, tags=["Health & Diagnostics"])
 app.include_router(auth.router, prefix="/api/v1", tags=["Authentication"])
 app.include_router(google.router, tags=["Google Auth"])
 app.include_router(properties.router, prefix="/api/v1", tags=["Properties"])
@@ -173,6 +111,8 @@ app.include_router(landlord_onboarding.router, tags=["Landlord Onboarding"])
 app.include_router(landlord_dashboard.router, tags=["Landlord Dashboard"])
 app.include_router(locations.router, tags=["Locations"])
 app.include_router(notifications.router, prefix="/api/v1", tags=["Notifications"])
+app.include_router(agreements.router, prefix="/api/v1", tags=["Agreements"])
+app.include_router(maintenance.router, prefix="/api/v1", tags=["Maintenance"])
 
 
 

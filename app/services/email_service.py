@@ -7,15 +7,22 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import List
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 class EmailService:
     def __init__(self):
-        # Gmail SMTP (easier for testing)
-        self.smtp_server = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        self.smtp_port = 587
-        self.smtp_username = os.getenv("SMTP_USERNAME", "your-email@gmail.com")
-        self.smtp_password = os.getenv("SMTP_PASSWORD", "your-app-password")
-        self.from_email = os.getenv("FROM_EMAIL", "noreply@nulo.com")
+        # Use settings from config, with os.getenv fallback
+        self.smtp_server = settings.SMTP_HOST or "smtp.gmail.com"
+        self.smtp_port = int(settings.SMTP_PORT or 587)
+        self.smtp_username = settings.SMTP_USER or os.getenv("SMTP_USER", "your-email@gmail.com")
+        self.smtp_password = settings.SMTP_PASSWORD or os.getenv("SMTP_PASSWORD", "your-app-password")
+        # Use a branded display name in the From header while keeping the SMTP user as envelope sender
+        self.from_email = os.getenv("FROM_EMAIL", settings.SMTP_USER or "noreply@nulo.com")
+        self.from_display = f"Nulo Africa <{self.from_email}>"
+        self.base_url = os.getenv("BASE_URL", "http://localhost:3000")
     
     def send_landlord_onboarding_notification(
         self,
@@ -71,6 +78,290 @@ class EmailService:
         except Exception as e:
             print(f"❌ [EMAIL] Error: {str(e)}")
             return False
+    
+    def send_viewing_confirmation_email(
+        self,
+        tenant_email: str,
+        tenant_name: str,
+        property_title: str,
+        date: str,
+        time: str,
+        viewing_id: str
+    ):
+        """Send viewing confirmation email to tenant"""
+        
+        subject = f"Viewing Confirmed - {property_title} ✓"
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; background-color: #f5f5f5;">
+                <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px;">
+                    <h2 style="color: #FF7A00;">✓ Your Viewing is Confirmed!</h2>
+                    
+                    <p>Hi {tenant_name},</p>
+                    
+                    <p>Great news! Your viewing request has been confirmed. Here are the details:</p>
+                    
+                    <div style="background-color: #fff7f2; padding: 15px; border-left: 4px solid #FF7A00; margin: 20px 0;">
+                        <p><strong>Property:</strong> {property_title}</p>
+                        <p><strong>Date:</strong> {date}</p>
+                        <p><strong>Time:</strong> {time}</p>
+                    </div>
+                    
+                    <p>Please arrive on time. If you need to reschedule, contact the landlord as soon as possible.</p>
+                    
+                    <p>
+                                <a href="{self.base_url}/tenant/viewings/{viewing_id}" 
+                                    style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
+                            View Details
+                        </a>
+                    </p>
+                    
+                    <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+                    
+                    <p style="color: #666; font-size: 12px;">
+                        NuloAfrica - Zero Agency Fee Rental Platform<br>
+                        Questions? Contact us at support@nuloafrica.com
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        text_content = f"""
+        Your Viewing is Confirmed!
+        
+        Hi {tenant_name},
+        
+        Great news! Your viewing request has been confirmed.
+        
+        Property: {property_title}
+        Date: {date}
+        Time: {time}
+        
+        Please arrive on time. If you need to reschedule, contact the landlord as soon as possible.
+        
+        View Details: {self.base_url}/tenant/viewings/{viewing_id}
+        
+        ---
+        NuloAfrica - Zero Agency Fee Rental Platform
+        """
+        
+        return self._send_email(tenant_email, subject, html_content, text_content)
+    
+    def send_landlord_viewing_notification_email(
+        self,
+        landlord_email: str,
+        landlord_name: str,
+        tenant_name: str,
+        property_title: str,
+        date: str,
+        time: str,
+        viewing_id: str
+    ):
+        """Send viewing notification email to landlord"""
+        
+        subject = f"New Viewing Scheduled - {property_title}"
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; background-color: #f5f5f5;">
+                <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px;">
+                    <h2 style="color: #FF7A00;">📅 New Viewing Scheduled</h2>
+                    
+                    <p>Hi {landlord_name},</p>
+                    
+                    <p>A tenant has scheduled a viewing for your property. Here are the details:</p>
+                    
+                    <div style="background-color: #fff7f2; padding: 15px; border-left: 4px solid #FF7A00; margin: 20px 0;">
+                        <p><strong>Property:</strong> {property_title}</p>
+                        <p><strong>Tenant:</strong> {tenant_name}</p>
+                        <p><strong>Date:</strong> {date}</p>
+                        <p><strong>Time:</strong> {time}</p>
+                    </div>
+                    
+                    <p>Please make sure you're available at the scheduled time. The tenant has confirmed they will attend.</p>
+                    
+                    <p>
+                                <a href="{self.base_url}/landlord/viewings/{viewing_id}" 
+                                    style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
+                            View Details & Contact Tenant
+                        </a>
+                    </p>
+                    
+                    <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+                    
+                    <p style="color: #666; font-size: 12px;">
+                        NuloAfrica - Zero Agency Fee Rental Platform<br>
+                        Questions? Contact us at support@nuloafrica.com
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        text_content = f"""
+        New Viewing Scheduled
+        
+        Hi {landlord_name},
+        
+        A tenant has scheduled a viewing for your property.
+        
+        Property: {property_title}
+        Tenant: {tenant_name}
+        Date: {date}
+        Time: {time}
+        
+        Please make sure you're available at the scheduled time.
+        
+        View Details: {self.base_url}/landlord/viewings/{viewing_id}
+        
+        ---
+        NuloAfrica - Zero Agency Fee Rental Platform
+        """
+        
+        return self._send_email(landlord_email, subject, html_content, text_content)
+    
+    def send_viewing_reminder_email(
+        self,
+        tenant_email: str,
+        tenant_name: str,
+        property_title: str,
+        date: str,
+        time: str,
+        hours_until: int,
+        viewing_id: str
+    ):
+        """Send viewing reminder email to tenant"""
+        
+        if hours_until == 24:
+            subject = f"Reminder: Your Viewing Tomorrow - {property_title}"
+            message = "Your viewing is tomorrow!"
+        elif hours_until == 1:
+            subject = f"Reminder: Your Viewing is in 1 Hour - {property_title}"
+            message = "Your viewing is in 1 hour!"
+        else:
+            subject = f"Reminder: Upcoming Viewing - {property_title}"
+            message = f"Your viewing is in {hours_until} hours!"
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; background-color: #f5f5f5;">
+                <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px;">
+                    <h2 style="color: #FF7A00;">⏰ {message}</h2>
+                    
+                    <p>Hi {tenant_name},</p>
+                    
+                    <p>Just a friendly reminder about your upcoming viewing:</p>
+                    
+                    <div style="background-color: #fff7f2; padding: 15px; border-left: 4px solid #FF7A00; margin: 20px 0;">
+                        <p><strong>Property:</strong> {property_title}</p>
+                        <p><strong>Date:</strong> {date}</p>
+                        <p><strong>Time:</strong> {time}</p>
+                    </div>
+                    
+                    <p>Please confirm you're still planning to attend. If you need to reschedule or cancel, let the landlord know right away.</p>
+                    
+                    <p>
+                                <a href="{self.base_url}/tenant/viewings/{viewing_id}" 
+                                    style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
+                            View Viewing Details
+                        </a>
+                    </p>
+                    
+                    <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+                    
+                    <p style="color: #666; font-size: 12px;">
+                        NuloAfrica - Zero Agency Fee Rental Platform<br>
+                        Questions? Contact us at support@nuloafrica.com
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        text_content = f"""
+        {message}
+        
+        Hi {tenant_name},
+        
+        Just a friendly reminder about your upcoming viewing:
+        
+        Property: {property_title}
+        Date: {date}
+        Time: {time}
+        
+        Please confirm you're still planning to attend.
+        
+        View Details: {self.base_url}/tenant/viewings/{viewing_id}
+        
+        ---
+        NuloAfrica - Zero Agency Fee Rental Platform
+        """
+        
+        return self._send_email(tenant_email, subject, html_content, text_content)
+    
+    def _send_email(self, to_email: str, subject: str, html_content: str, text_content: str = None):
+        """
+        Internal method to send email via SMTP
+        """
+        try:
+            print(f"📧 [EMAIL] Sending to {to_email}: {subject}")
+            logger.info(f"🔧 [EMAIL CONFIG] Server: {self.smtp_server}:{self.smtp_port}, From: {self.from_email}")
+            
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            # Use branded display name in header
+            msg['From'] = getattr(self, 'from_display', self.from_email)
+            msg['To'] = to_email
+            
+            # Attach text version first (fallback)
+            if text_content:
+                msg.attach(MIMEText(text_content, 'plain'))
+            
+            # Attach HTML version
+            msg.attach(MIMEText(html_content, 'html'))
+            
+            # Send via SMTP
+            logger.info(f"🔐 [EMAIL] Attempting SMTP connection to {self.smtp_server}:{self.smtp_port}")
+            # Add Message-ID for tracking
+            try:
+                from email.utils import make_msgid
+                msgid = make_msgid()
+                msg['Message-ID'] = msgid
+                logger.info(f"🔎 [EMAIL] Message-ID: {msgid}")
+            except Exception:
+                msgid = None
+
+            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10) as server:
+                logger.info(f"✅ [EMAIL] SMTP connection established")
+                server.starttls()
+                logger.info(f"🔒 [EMAIL] TLS enabled")
+                server.login(self.smtp_username, self.smtp_password)
+                logger.info(f"✅ [EMAIL] Authentication successful")
+                server.send_message(msg)
+                logger.info(f"✅ [EMAIL] Message sent successfully")
+                if msgid:
+                    logger.info(f"📥 [EMAIL] Sent Message-ID {msgid} to {to_email}")
+
+            print(f"✅ [EMAIL] Successfully sent to {to_email}")
+            return {"success": True, "message_id": msgid}
+
+        except smtplib.SMTPAuthenticationError as auth_err:
+            error_msg = f"❌ [EMAIL] Authentication failed: Check SMTP_USER and SMTP_PASSWORD in .env - {str(auth_err)}"
+            logger.error(error_msg)
+            print(error_msg)
+            return {"success": False, "error": str(auth_err)}
+        except smtplib.SMTPException as smtp_err:
+            error_msg = f"❌ [EMAIL] SMTP Error: {str(smtp_err)}"
+            logger.error(error_msg)
+            print(error_msg)
+            return {"success": False, "error": str(smtp_err)}
+        except Exception as e:
+            error_msg = f"❌ [EMAIL] Failed to send: {str(e)}"
+            logger.error(error_msg)
+            print(error_msg)
+            return {"success": False, "error": str(e)}
 
 # Singleton
 email_service = EmailService()

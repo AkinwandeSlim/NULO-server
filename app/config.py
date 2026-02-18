@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     PAYSTACK_SECRET_KEY: str | None = None
     PAYSTACK_PUBLIC_KEY: str | None = None
     
+    # SMS Configuration (Optional)
+    TWILIO_ACCOUNT_SID: str | None = None
+    TWILIO_AUTH_TOKEN: str | None = None
+    TWILIO_MESSAGING_SERVICE_SID: str | None = None
+    TWILIO_FROM_NUMBER: str | None = None
+    
     # Google Maps (Optional)
     GOOGLE_MAPS_API_KEY: str | None = None
     
