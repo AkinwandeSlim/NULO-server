@@ -3,7 +3,7 @@ Favorites routes
 """
 from fastapi import APIRouter, HTTPException, Depends, status
 from app.database import supabase_admin
-from app.middleware.auth import get_current_tenant
+from app.middleware.auth import get_current_tenant, get_current_user
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -15,10 +15,15 @@ class FavoriteCreate(BaseModel):
 
 
 @router.get("/")
-async def get_favorites(current_user: dict = Depends(get_current_tenant)):
+async def get_favorites(current_user: dict = Depends(get_current_user)):
     """
-    Get user's favorite properties (tenants only)
+    Get user's favorite properties.
+    Returns empty list for non-tenants (admins/landlords browsing the marketplace).
     """
+    # Admins and landlords don't have favorites — return empty gracefully
+    if current_user.get("user_type") != "tenant":
+        return {"success": True, "favorites": [], "total": 0, "count": 0}
+
     try:
         tenant_id = current_user["id"]
         
@@ -203,11 +208,16 @@ async def remove_favorite(
 @router.get("/check/{property_id}")
 async def check_favorite(
     property_id: str,
-    current_user: dict = Depends(get_current_tenant)
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Check if a property is in user's favorites (tenants only)
+    Check if a property is in user's favorites.
+    Always returns false for non-tenants.
     """
+    # Non-tenants never have favorites
+    if current_user.get("user_type") != "tenant":
+        return {"is_favorite": False}
+
     try:
         tenant_id = current_user["id"]
         

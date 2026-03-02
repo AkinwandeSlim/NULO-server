@@ -118,7 +118,9 @@ async def get_tenant_stats(
         
         # Count tenants with applications (distinct user_ids)
         # This is fast even with many applications
-        apps_result = supabase_admin.rpc('count_distinct_tenant_applications').execute()
+        # ✅ FIX: supabase-py rpc() requires a params dict even for zero-param functions
+        # Without it: "Client.rpc() missing 1 required positional argument: 'params'"
+        apps_result = supabase_admin.rpc('count_distinct_tenant_applications', {}).execute()
         with_applications = apps_result.data if apps_result.data else 0
         
         # Active this month - use server-side date filtering
@@ -254,13 +256,14 @@ async def list_tenants(
         
         tenant_profiles = {}
         if user_ids:
+            # ✅ FIX: tenant_profiles.id = auth.users.id (shared PK, no user_id column)
             profiles_result = supabase_admin.table('tenant_profiles')\
                 .select('*')\
-                .in_('user_id', user_ids)\
+                .in_('id', user_ids)\
                 .execute()
             
             for profile in (profiles_result.data or []):
-                tenant_profiles[profile['user_id']] = profile
+                tenant_profiles[profile['id']] = profile
             
             print(f"✅ [TENANT-USERS] Fetched {len(tenant_profiles)} tenant profiles")
         
@@ -430,9 +433,11 @@ async def get_tenant_detail(
         user = user_result.data
         
         # Get tenant profile
+        # ✅ FIX: tenant_profiles uses a shared primary key (id = auth.users.id)
+        # There is NO user_id column — querying it caused "column does not exist" 500s
         profile_result = supabase_admin.table('tenant_profiles')\
             .select('*')\
-            .eq('user_id', tenant_id)\
+            .eq('id', tenant_id)\
             .execute()
         
         profile = profile_result.data[0] if profile_result.data else {}

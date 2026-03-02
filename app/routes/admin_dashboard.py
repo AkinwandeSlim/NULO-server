@@ -144,36 +144,17 @@ async def get_dashboard_stats(
                     logger.warning(f"⚠️ [DASHBOARD] Failed to parse tenant created_at: {e}")
         
         # ============================================================================
-        # PROPERTIES STATS - OPTIMIZED: Paginated query with timeout handling
+        # PROPERTIES STATS - OPTIMIZED: Simplified query with timeout handling
         # ============================================================================
         try:
-            # 🔧 OPTIMIZATION: Fetch in batches to avoid timeout on large datasets
-            # With 70+ properties, we need pagination
-            properties = []
-            batch_size = 500
-            offset = 0
-            max_batches = 1  # Limit to 500 properties for performance
+            # 🔧 OPTIMIZATION: Simplified query - just counts, no pagination
+            properties_result = supabase_admin.table('properties')\
+                .select('id, created_at, status, verification_status')\
+                .limit(1000)\
+                .execute()
             
-            for batch in range(max_batches):
-                try:
-                    batch_result = supabase_admin.table('properties')\
-                        .select('id, created_at, status, verification_status')\
-                        .range(offset, offset + batch_size - 1)\
-                        .execute()
-                    
-                    batch_data = batch_result.data or []
-                    if not batch_data:
-                        logger.info(f"✅ [DASHBOARD] Reached end of properties at batch {batch + 1}")
-                        break
-                    
-                    properties.extend(batch_data)
-                    offset += batch_size
-                    logger.info(f"✅ [DASHBOARD] Fetched property batch {batch + 1} ({len(batch_data)} items)")
-                except Exception as batch_error:
-                    logger.warning(f"⚠️ [DASHBOARD] Property batch {batch + 1} failed: {str(batch_error)}, continuing...")
-                    break  # Stop pagination if any batch fails
-            
-            logger.info(f"✅ [DASHBOARD] Found {len(properties)} properties total")
+            properties = properties_result.data or []
+            logger.info(f"✅ [DASHBOARD] Found {len(properties)} properties (limited to 1000 for performance)")
         except Exception as e:
             logger.error(f"❌ [DASHBOARD] Failed to fetch properties: {str(e)}")
             properties = []
@@ -334,7 +315,7 @@ async def get_recent_activity(
         # Recent landlord signups - with timeout handling
         try:
             landlords_result = supabase_admin.table('users')\
-                .select('id, email, full_name, created_at, verification_status, user_type, onboarding_completed_at')\
+                .select('id, email, full_name, created_at, verification_status, user_type, onboarding_completed')\
                 .eq('user_type', 'landlord')\
                 .gte('created_at', cutoff_iso)\
                 .order('created_at', desc=True)\

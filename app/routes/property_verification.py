@@ -3,11 +3,12 @@ Property Verification Admin Routes
 Handles admin approval/rejection of property listings
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from app.database import supabase_admin
 from app.middleware.auth import get_current_admin
 from app.models.user import UserResponse
+from app.services.notification_service import notification_service
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import logging
@@ -315,6 +316,7 @@ async def get_property_details(
 async def verify_property(
     property_id: str,
     action: PropertyVerificationAction,
+    background_tasks: BackgroundTasks,
     current_user: UserResponse = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
@@ -352,8 +354,39 @@ async def verify_property(
         
         logger.info(f"✅ [PROPERTIES] Property {property_id} {action.action}ed successfully")
         
-        # TODO: Send notification to landlord about property approval/rejection
-        # You can add email/push notification here
+        # Fetch landlord info and fire notification (non-blocking)
+        try:
+            property_data = result.data[0]
+            landlord_id = property_data.get('landlord_id')
+            property_title = property_data.get('title', 'Your property')
+            
+            if landlord_id:
+                landlord_resp = supabase_admin.table('users')\
+                    .select('full_name, email')\
+                    .eq('id', landlord_id)\
+                    .single()\
+                    .execute()
+                
+                if landlord_resp.data:
+                    landlord_name  = landlord_resp.data.get('full_name') or landlord_resp.data.get('email', 'Landlord')
+                    landlord_email = landlord_resp.data.get('email', '')
+                    
+                    # Convert 'approve'/'reject' → 'approved'/'rejected'
+                    # notify_property_reviewed checks action == "approved"
+                    notif_action = "approved" if action.action == "approve" else "rejected"
+                    background_tasks.add_task(
+                        notification_service.notify_property_reviewed,
+                        property_id=property_id,
+                        landlord_id=landlord_id,
+                        landlord_name=landlord_name,
+                        landlord_email=landlord_email,
+                        property_title=property_title,
+                        action=notif_action,
+                        rejection_reason=action.rejection_reason,
+                    )
+        except Exception as notify_err:
+            # Notification failure must never break the approval response
+            logger.warning(f"⚠️ [PROPERTIES] Notification setup failed (non-fatal): {notify_err}")
         
         return {
             'success': True,
@@ -435,195 +468,3 @@ async def bulk_property_action(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Bulk action failed: {str(e)}"
         )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# """
-# Property verification management routes for admin
-# """
-# from fastapi import APIRouter, Depends, HTTPException, status
-# from app.database import supabase_admin
-# from app.middleware.auth import get_current_user, get_current_admin
-# from app.models.user import UserResponse
-# from typing import List, Optional
-# from datetime import datetime
-# from pydantic import BaseModel
-
-# router = APIRouter(prefix="/properties", tags=["property-verification"])
-
-# class PropertyApprovalRequest(BaseModel):
-#     verification_notes: Optional[str] = None
-
-# class PropertyRejectionRequest(BaseModel):
-#     reason: str
-#     verification_notes: Optional[str] = None
-
-# @router.get("/")
-# async def get_properties_for_verification(
-#     current_user: UserResponse = Depends(get_current_admin),
-#     status: Optional[str] = None
-# ):
-#     """
-#     Get all properties for admin verification
-#     """
-#     try:
-#         # Build query
-#         query = supabase_admin.table("properties").select(
-#             """
-#             id, title, property_type, address, bedrooms, bathrooms, square_footage,
-#             amenities, rent_amount, service_charge, caution_deposit, lease_duration,
-#             photos, video_tour, documents, available_from, status,
-#             landlord_id, created_at, submitted_at, verified_at, rejection_reason
-#             """
-#         )
-        
-#         # Join with landlord info
-#         query = query.select(
-#             """
-#             landlord:landlords(id, full_name, email)
-#             """
-#         )
-        
-#         # Filter by status if provided
-#         if status:
-#             query = query.eq("status", status)
-#         else:
-#             # Default to pending verification
-#             query = query.in_("status", ["pending_verification", "rejected", "verified"])
-        
-#         # Order by creation date
-#         query = query.order("created_at", desc=True)
-        
-#         result = query.execute()
-        
-#         # Format the response
-#         properties = []
-#         if result.data:
-#             for prop in result.data:
-#                 properties.append({
-#                     "id": prop["id"],
-#                     "title": prop["title"],
-#                     "property_type": prop["property_type"],
-#                     "address": prop["address"],
-#                     "bedrooms": prop["bedrooms"],
-#                     "bathrooms": prop["bathrooms"],
-#                     "square_footage": prop["square_footage"],
-#                     "amenities": prop["amenities"] or [],
-#                     "rent_amount": prop["rent_amount"],
-#                     "service_charge": prop["service_charge"],
-#                     "caution_deposit": prop["caution_deposit"],
-#                     "lease_duration": prop["lease_duration"],
-#                     "photos": prop["photos"] or [],
-#                     "video_tour": prop.get("video_tour"),
-#                     "documents": prop["documents"] or {},
-#                     "available_from": prop["available_from"],
-#                     "status": prop["status"],
-#                     "landlord_id": prop["landlord_id"],
-#                     "landlord_name": prop["landlord"]["full_name"],
-#                     "landlord_email": prop["landlord"]["email"],
-#                     "created_at": prop["created_at"],
-#                     "submitted_at": prop.get("submitted_at"),
-#                     "verified_at": prop.get("verified_at"),
-#                     "rejection_reason": prop.get("rejection_reason")
-#                 })
-        
-#         return {
-#             "success": True,
-#             "properties": properties
-#         }
-#     except Exception as e:
-#         print(f"❌ [PROPERTY-VERIFICATION] Error fetching properties: {str(e)}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to fetch properties"
-#         )
-
-# @router.post("/{property_id}/approve")
-# async def approve_property(
-#     property_id: str,
-#     approval_data: PropertyApprovalRequest,
-#     current_user: UserResponse = Depends(get_current_admin)
-# ):
-#     """
-#     Approve a property and make it live
-#     """
-#     try:
-#         # Update property status to verified
-#         result = supabase_admin.table("properties").update({
-#             "status": "verified",
-#             "verified_at": datetime.now().isoformat(),
-#             "verification_notes": approval_data.verification_notes
-#         }).eq("id", property_id).execute()
-        
-#         if not result.data:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail="Property not found"
-#             )
-        
-#         # TODO: Send notification email to landlord
-#         # TODO: Update property search index
-        
-#         return {
-#             "success": True,
-#             "message": "Property approved and published successfully"
-#         }
-#     except Exception as e:
-#         print(f"❌ [PROPERTY-VERIFICATION] Error approving property: {str(e)}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to approve property"
-#         )
-
-# @router.post("/{property_id}/reject")
-# async def reject_property(
-#     property_id: str,
-#     rejection_data: PropertyRejectionRequest,
-#     current_user: UserResponse = Depends(get_current_admin)
-# ):
-#     """
-#     Reject a property listing
-#     """
-#     try:
-#         # Update property status to rejected
-#         result = supabase_admin.table("properties").update({
-#             "status": "rejected",
-#             "rejection_reason": rejection_data.reason,
-#             "verification_notes": rejection_data.verification_notes
-#         }).eq("id", property_id).execute()
-        
-#         if not result.data:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail="Property not found"
-#             )
-        
-#         # TODO: Send notification email to landlord with rejection reason
-#         # TODO: Log rejection for audit trail
-        
-#         return {
-#             "success": True,
-#             "message": "Property rejected successfully"
-#         }
-#     except Exception as e:
-#         print(f"❌ [PROPERTY-VERIFICATION] Error rejecting property: {str(e)}")
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail="Failed to reject property"
-#         )

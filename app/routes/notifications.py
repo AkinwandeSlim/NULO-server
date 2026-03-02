@@ -1,16 +1,166 @@
 """
 Notification API endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from pydantic import BaseModel
 from typing import List, Optional
 import logging
+import os
 from datetime import datetime
 
 from ..middleware.auth import get_current_user
 from ..database import supabase_admin
+from ..services.notification_service import notification_service
+from ..services.notification_helpers import create_notification
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/notifications", tags=["notifications"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal service key auth
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verify_internal_key(x_internal_service_key: str = Header(default="")):
+    """
+    Verifies server-to-server calls from Next.js route handlers.
+    Set INTERNAL_SERVICE_KEY in both FastAPI and Next.js env vars.
+    If no key is configured (dev), the check is skipped.
+    """
+    expected = os.getenv("INTERNAL_SERVICE_KEY", "")
+    if expected and x_internal_service_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid internal service key")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal request models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class InternalNotificationCreate(BaseModel):
+    user_id: str
+    title: str
+    message: str
+    type: str
+    link: Optional[str] = None
+    data: Optional[dict] = None
+
+
+class SignupNotificationRequest(BaseModel):
+    user_id: str
+    user_email: str
+    user_name: str
+    user_type: str                    # landlord | tenant
+    is_oauth: bool = False            # True = Google OAuth (email already verified, send welcome email)
+                                      # False = manual email signup (email not yet verified, in-app only)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL: called by Next.js auth/callback/route.ts after email verification
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/internal/create")
+async def create_internal_notification(
+    payload: InternalNotificationCreate,
+    _key: None = Depends(_verify_internal_key),
+):
+    """
+    Create a welcome notification after email verification.
+    Called by route.ts immediately after the user clicks their email link.
+    Fires notify_email_verified() which sends email + in-app notification.
+    """
+    try:
+        # Fetch full user data from DB so we can personalise the email
+        user_r = supabase_admin.table("users").select(
+            "email, full_name, user_type"
+        ).eq("id", payload.user_id).execute()
+
+        user_data = user_r.data[0] if user_r.data else None
+
+        if user_data:
+            await notification_service.notify_email_verified(
+                user_id=payload.user_id,
+                user_email=user_data.get("email", ""),
+                user_name=user_data.get("full_name") or "there",
+                user_type=user_data.get("user_type", "tenant"),
+            )
+        else:
+            # Fallback: plain in-app insert with what route.ts provided
+            create_notification(
+                user_id=payload.user_id,
+                notif_type=payload.type,
+                title=payload.title,
+                message=payload.message,
+                link=payload.link,
+                data=payload.data or {},
+            )
+
+        logger.info(f"✅ [NOTIF] email_verified notification fired for {payload.user_id}")
+        return {"success": True, "message": "Notification created"}
+
+    except Exception as e:
+        logger.error(f"❌ [NOTIF] internal/create failed: {e}")
+        # Return 200 so the auth flow is never blocked by a notification failure
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/signup")
+async def notify_signup(
+    payload: SignupNotificationRequest,
+    _key: None = Depends(_verify_internal_key),
+):
+    """
+    Signup notification — behaviour differs by auth flow:
+
+    Manual email signup (is_oauth=False):
+      - In-app ONLY: "Account created, check your email to verify"
+      - No welcome email — Supabase already sent the verification link,
+        and notify_email_verified() sends the welcome email once they click it.
+        Sending an email here would mean 3 emails in quick succession (bad UX).
+
+    Google OAuth (is_oauth=True):
+      - In-app notification (welcome message)
+      - Welcome EMAIL via notify_signup() — because notify_email_verified()
+        never fires for OAuth users (their email was verified by Google,
+        they never click a verification link). This is their only welcome email.
+    """
+    try:
+        if payload.is_oauth:
+            # OAuth path: in-app + welcome email
+            await notification_service.notify_signup(
+                user_id=payload.user_id,
+                user_email=payload.user_email,
+                user_name=payload.user_name,
+                user_type=payload.user_type,
+            )
+            logger.info(f"✅ [NOTIF] OAuth signup: in-app + welcome email for {payload.user_id} ({payload.user_type})")
+        else:
+            # Manual email path: in-app only
+            is_landlord = payload.user_type == "landlord"
+            create_notification(
+                user_id=payload.user_id,
+                notif_type="system",
+                title="🏠 Welcome to NuloAfrica!" if is_landlord else "👋 Welcome to NuloAfrica!",
+                message=(
+                    "Your landlord account has been created. Check your email for the verification link to get started."
+                    if is_landlord
+                    else "Your account has been created. Check your email for the verification link, then start exploring properties."
+                ),
+                link=(
+                    "/signup/landlord/confirmation"
+                    if is_landlord
+                    else "/signup/tenant/confirmation"
+                ),
+            )
+            logger.info(f"✅ [NOTIF] Manual signup: in-app only for {payload.user_id} ({payload.user_type})")
+
+        return {"success": True}
+
+    except Exception as e:
+        logger.error(f"❌ [NOTIF] signup notification failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+
 
 
 @router.get("/")
@@ -59,6 +209,9 @@ async def get_notifications(
     
     except Exception as e:
         logger.error(f"🔔 [NOTIF] Error fetching notifications: {str(e)}")
+        # Return 401 if it's an auth error, 500 for other errors
+        if "Unauthorized" in str(e) or "401" in str(e):
+            raise HTTPException(status_code=401, detail="Authentication failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 

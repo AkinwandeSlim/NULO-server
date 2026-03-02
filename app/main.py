@@ -1,6 +1,5 @@
 """
 Nulo Africa - FastAPI Backend
-}  }    }      throw error      console.error('Failed to fetch complete locations:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/complete`)    try {  async getCompleteLocations() {  // Get complete location hierarchy  },    }      throw error      console.error(`Failed to search cities for "${query}":`, error)    } catch (error) {      return data      })        params: { q: query }      const { data } = await axios.get(`${API_BASE_URL}/api/locations/search`, {    try {  async searchCities(query: string) {  // Search for cities by name  },    }      throw error      console.error('Failed to fetch all cities:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/cities`)    try {  async getAllCities() {  // Get all cities (no state filter)  },    }      throw error      console.error(`Failed to fetch cities for ${state}:`, error)    } catch (error) {      return data      })        params: { state }      const { data } = await axios.get(`${API_BASE_URL}/api/locations/cities`, {    try {  async getCities(state: string) {  // Get cities for a specific state  },    }      throw error      console.error('Failed to fetch states:', error)    } catch (error) {      return data      const { data } = await axios.get(`${API_BASE_URL}/api/locations/states`)    try {  async getStates() {  // Get all statesexport const locationsAPI = {const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'Main application entry point
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +13,13 @@ from app.routes import (
     admin_landlord_verification, property_verification, 
     tenant_verification, admin_signup,admin_management,
     landlord_onboarding, landlord_dashboard, notifications, admin_dashboard,
-    admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health
+    admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health,
+    engagement,payments,
 )
+
 import logging
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,13 +61,26 @@ async def validation_exception_handler(request, exc):
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    logger.error(f"Global exception: {exc}")
+    error_msg = str(exc)
+    logger.error(f"Global exception: {error_msg}")
+    
+    # Handle SSL/network errors specifically
+    if "SSL handshake" in error_msg or "timeout" in error_msg.lower():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error": "Service temporarily unavailable",
+                "detail": "Network connectivity issues. Please try again in a moment."
+            }
+        )
+    
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
             "error": "Internal server error",
-            "detail": str(exc) if settings.DEBUG else "An error occurred"
+            "detail": error_msg if settings.DEBUG else "An error occurred"
         }
     )
 
@@ -99,8 +115,9 @@ app.include_router(favorites.router, prefix="/api/v1", tags=["Favorites"])
 app.include_router(messages.router, prefix="/api/v1", tags=["Messages"])
 app.include_router(viewing_requests.router, prefix="/api/v1", tags=["Viewing Requests"])
 app.include_router(verifications.router, prefix="/api/v1", tags=["Verifications"])
-app.include_router(admin_landlord_verification.router, prefix="/api/v1", tags=["Landlord Verification"])
-app.include_router(property_verification.router, prefix="/api/v1/admin", tags=["Property Verification"])
+app.include_router(admin_landlord_verification.router, prefix="/api/v1/admin", tags=["Admin Landlord Verification"])
+app.include_router(admin_landlord_verification.router, prefix="/api/v1/admin", tags=["Admin Landlord Verification"])
+app.include_router(property_verification.router, prefix="/api/v1/admin", tags=["Admin Property Verification"])
 app.include_router(tenant_verification.router, prefix="/api/v1/admin", tags=["Tenant Verification"])
 app.include_router(admin_management.router, prefix="/api/v1", tags=["Admin Management"])
 app.include_router(admin_signup.router, prefix="/api/v1", tags=["Admin Signup"])
@@ -113,7 +130,8 @@ app.include_router(locations.router, tags=["Locations"])
 app.include_router(notifications.router, prefix="/api/v1", tags=["Notifications"])
 app.include_router(agreements.router, prefix="/api/v1", tags=["Agreements"])
 app.include_router(maintenance.router, prefix="/api/v1", tags=["Maintenance"])
-
+app.include_router(engagement.router, prefix="/api/v1", tags=["Engagement"])
+app.include_router(payments.router, prefix="/api/v1",tags=["Payment"])
 
 
 # Startup event

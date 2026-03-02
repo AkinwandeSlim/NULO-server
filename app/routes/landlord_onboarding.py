@@ -18,7 +18,9 @@ from ..models.landlord_onboarding import (
 )
 from ..middleware.auth import get_current_user, get_current_admin
 from ..services.email_service import email_service
+from ..services.notification_service import notification_service
 from datetime import datetime
+import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/onboarding", tags=["landlord-onboarding"])
@@ -296,246 +298,164 @@ async def _process_step_4(
 
 
 
-"""
-FIXED /submit endpoint for landlord onboarding
-Simple approach that creates landlord_profiles if missing
-"""
-
 @router.post("/submit", response_model=OnboardingSubmissionResponse)
 async def submit_complete_onboarding(
     request: Request,
     background_tasks: BackgroundTasks,
     current_user = Depends(get_current_user)
 ):
-    """Submit complete onboarding for admin review - SIMPLIFIED & FIXED"""
-    print(f"\n✅ [ONBOARDING] Submitting complete onboarding for user: {current_user['id']}")
-    
+    """Submit complete onboarding for admin review."""
+    print(f"\n🚀 [ONBOARDING/submit] User: {current_user['id']}")
+
     try:
-        # Get data from request body
-        request_data = await request.json()
-        print(f"📦 [ONBOARDING] Received data: {request_data.keys()}")
-        
-        # ============================================================================
-        # STEP 1: Ensure landlord_profiles exists (CRITICAL - Foreign key dependency!)
-        # ============================================================================
-        print(f"🔍 [ONBOARDING] Checking if landlord_profiles exists...")
-        profile_check = supabase_admin.table("landlord_profiles").select("*").eq(
-            "id", current_user['id']
+        # Accept optional body — frontend sends payload but truth is in DB + current_user
+        try:
+            request_data = await request.json()
+        except Exception:
+            request_data = {}
+
+        # ── 1. Ensure landlord_profiles row exists ────────────────────────────
+        profile_check = supabase_admin.table("landlord_profiles").select("id").eq(
+            "id", current_user["id"]
         ).execute()
-        
+
         if not profile_check.data:
-            # Create landlord_profiles FIRST (required for foreign key)
-            print(f"🆕 [ONBOARDING] Creating landlord_profiles...")
-            profile_data = {
-                "id": current_user['id'],  # Primary key (links to auth.users)
+            print(f"🆕 [ONBOARDING/submit] Creating landlord_profiles for {current_user['id']}")
+            supabase_admin.table("landlord_profiles").insert({
+                "id": current_user["id"],
                 "onboarding_started": True,
                 "first_time_visit": False,
                 "profile_step_completed": True,
                 "property_step_completed": True,
                 "payment_step_completed": True,
                 "protection_step_completed": True,
-                "created_at": "now()",
-                "updated_at": "now()"
-            }
-            
-            profile_result = supabase_admin.table("landlord_profiles").insert(profile_data).execute()
-            print(f"✅ [ONBOARDING] landlord_profiles created: {profile_result.data[0]['id']}")
+                "onboarding_completed_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }).execute()
+            print(f"✅ [ONBOARDING/submit] landlord_profiles created")
         else:
-            # Update existing profile
-            print(f"✅ [ONBOARDING] landlord_profiles exists, updating...")
-            profile_update = {
-                "onboarding_started": True,
+            supabase_admin.table("landlord_profiles").update({
                 "first_time_visit": False,
                 "profile_step_completed": True,
                 "property_step_completed": True,
                 "payment_step_completed": True,
                 "protection_step_completed": True,
-                "onboarding_completed_at": "now()",
-                "updated_at": "now()"
-            }
-            supabase_admin.table("landlord_profiles").update(profile_update).eq(
-                "id", current_user['id']
-            ).execute()
-        
-        # ============================================================================
-        # STEP 2: Check if landlord_onboarding exists
-        # ============================================================================
-        print(f"🔍 [ONBOARDING] Checking if landlord_onboarding exists...")
+                "onboarding_completed_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("id", current_user["id"]).execute()
+            print(f"✅ [ONBOARDING/submit] landlord_profiles updated")
+
+        # ── 2. Upsert landlord_onboarding record ──────────────────────────────
         onboarding_check = supabase_admin.table("landlord_onboarding").select("*").eq(
-            "landlord_id", current_user['id']
+            "landlord_id", current_user["id"]
         ).execute()
-        
-        # Prepare onboarding data
-        onboarding_data = {
-            "landlord_id": current_user['id'],
-            "full_name": request_data.get("full_name"),
-            "phone": request_data.get("phone"),
+
+        upsert_data = {
+            "landlord_id":   current_user["id"],
+            "full_name":     request_data.get("full_name"),
+            "phone":         request_data.get("phone"),
             "date_of_birth": request_data.get("date_of_birth"),
             "landlord_type": request_data.get("landlord_type"),
-            "company_name": request_data.get("company_name"),
+            "company_name":  request_data.get("company_name"),
             "company_address": request_data.get("company_address"),
-            "bank_name": request_data.get("bank_name"),
+            "bank_name":     request_data.get("bank_name"),
             "account_number": request_data.get("account_number"),
-            "account_name": request_data.get("account_name"),
-            
-            # Property info (optional for MVP)
-            "first_property_id": request_data.get("property_address"),
-            
-            # Step completion flags
-            "profile_step_completed": True,
-            "property_step_completed": True,
-            "payment_step_completed": True,
+            "account_name":  request_data.get("account_name"),
+            "profile_step_completed":    True,
+            "property_step_completed":   True,
+            "payment_step_completed":    True,
             "protection_step_completed": True,
-            "all_steps_completed": True,
-            "current_step": 4,  # Max step
-            
-            # Submission flags
-            "submitted_for_review": True,
-            "submitted_for_review_at": "now()",
-            "submitted_at": "now()",
-            "admin_review_status": "pending",
-            "onboarding_completed_at": "now()",
-            "last_updated_at": "now()"
+            "all_steps_completed":       True,
+            "current_step":              4,
+            "submitted_for_review":      True,
+            "submitted_for_review_at":   datetime.utcnow().isoformat(),
+            "submitted_at":              datetime.utcnow().isoformat(),
+            "admin_review_status":       "pending",
+            "onboarding_completed_at":   datetime.utcnow().isoformat(),
+            "last_updated_at":           datetime.utcnow().isoformat(),
         }
-        
+
         if onboarding_check.data:
-            # ============================================================================
-            # STEP 3A: Update existing onboarding
-            # ============================================================================
-            onboarding_id = onboarding_check.data[0]['id']
-            print(f"📝 [ONBOARDING] Updating existing onboarding: {onboarding_id}")
-            
+            onboarding_id = onboarding_check.data[0]["id"]
+            print(f"📝 [ONBOARDING/submit] Updating existing record: {onboarding_id}")
             result = supabase_admin.table("landlord_onboarding").update(
-                onboarding_data
+                upsert_data
             ).eq("id", onboarding_id).execute()
-            
-            print(f"✅ [ONBOARDING] Onboarding updated successfully")
-            
         else:
-            # ============================================================================
-            # STEP 3B: Create new onboarding
-            # ============================================================================
-            print(f"🆕 [ONBOARDING] Creating new onboarding record")
-            
-            # Add creation timestamp
-            onboarding_data["created_at"] = "now()"
-            onboarding_data["onboarding_started_at"] = "now()"
-            
-            result = supabase_admin.table("landlord_onboarding").insert(
-                onboarding_data
-            ).execute()
-            
-            print(f"✅ [ONBOARDING] Onboarding created successfully: {result.data[0]['id']}")
-            
-            # ============================================================================
-            # SEND NOTIFICATIONS TO ALL RELEVANT USERS
-            # ============================================================================
-            try:
-                onboarding = result.data[0]
-                landlord_name = request_data.get("full_name", "Unknown")
-                landlord_email = request_data.get("email", current_user.get('email', 'Unknown'))
-                
-                print(f"📧 [NOTIFICATION] Sending notifications to all relevant users...")
-                print(f"📧 [NOTIFICATION] Sending notifications to admins...")
-
-                # Get all admin users for notifications
-                admins = supabase_admin.table("users").select("id, email").eq(
-                    "user_type", "admin"
-                ).execute()
-                
-                # Also notify the landlord who submitted the onboarding
-                landlord_notification = {
-                    "user_id": current_user['id'],
-                    "type": "onboarding_submitted",
-                    "title": "Onboarding Submitted Successfully",
-                    "message": "Your onboarding has been submitted and is under review",
-                    "link": "/landlord/onboarding/status",
-                    "read": False,
-                    "created_at": "now()"
-                }
-                
-                try:
-                    supabase_admin.table("notifications").insert(landlord_notification).execute()
-                    print(f"✅ [NOTIFICATION] Landlord notification created: {current_user['id']}")
-                except Exception as notif_error:
-                    print(f"⚠️ [NOTIFICATION] Failed to create landlord notification: {str(notif_error)}")
-                
-                # Create admin notifications
-                if admins.data:
-                    admin_emails = [admin['email'] for admin in admins.data if admin.get('email')]
-                    
-                    # Send emails (non-blocking - don't fail if email fails)
-                    if admin_emails:
-                        try:
-                            email_service.send_landlord_onboarding_notification(
-                                admin_emails=admin_emails,
-                                landlord_name=landlord_name,
-                                landlord_email=landlord_email,
-                                onboarding_id=onboarding['id']
-                            )
-                        except Exception as email_error:
-                            print(f"⚠️ [EMAIL] Failed to send emails: {str(email_error)}")
-                    
-                    # Create in-app notifications for each admin
-                    for admin in admins.data:
-                        try:
-                            supabase_admin.table("notifications").insert({
-                                "user_id": admin['id'],
-                                "type": "landlord_onboarding",
-                                "title": f"New Landlord Verification: {landlord_name}",
-                                "message": f"{landlord_name} ({landlord_email}) submitted onboarding for review",
-                                "link": "/admin/landlord-verification",
-                                "read": False,
-                                "data": {
-                                    "landlord_name": landlord_name,
-                                    "landlord_email": landlord_email,
-                                    "onboarding_id": onboarding['id']
-                                }
-                            }).execute()
-                        except Exception as notif_error:
-                            print(f"⚠️ [NOTIFICATION] Failed to create notification: {str(notif_error)}")
-                    
-                    print(f"✅ [NOTIFICATION] Sent to {len(admin_emails)} admins")
-                else:
-                    print(f"⚠️ [NOTIFICATION] No admin users found")
-                
-            except Exception as e:
-                # Don't fail onboarding if notifications fail
-                print(f"⚠️ [NOTIFICATION] Error (onboarding still succeeded): {str(e)}")
-        
-        # ============================================================================
-        # STEP 4: Return success response
-        # ============================================================================
-        # return {
-        #     "success": True,
-        #     "message": "Onboarding submitted successfully for admin review",
-        #     "data": result.data[0] if result.data else {}
-        # }
-
+            print(f"🆕 [ONBOARDING/submit] Creating new record")
+            upsert_data["onboarding_started_at"] = datetime.utcnow().isoformat()
+            result = supabase_admin.table("landlord_onboarding").insert(upsert_data).execute()
 
         onboarding = result.data[0] if result.data else {}
+        print(f"✅ [ONBOARDING/submit] DB updated for {onboarding.get('id')}")
+
+        # ── 3. Update users table ─────────────────────────────────────────────
+        supabase.table("users").update({
+            "verification_status": "pending",
+            "onboarding_completed": True,
+            "onboarding_step": 5,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", current_user["id"]).execute()
+
+        # ── 4. Fire notifications via notification_service (non-fatal) ────────
+        try:
+            user_r = supabase.table("users").select("email, full_name").eq(
+                "id", current_user["id"]
+            ).execute()
+            user_row = user_r.data[0] if user_r.data else {}
+
+            # Email + in-app → landlord
+            await notification_service.notify_onboarding_submitted(
+                user_id=current_user["id"],
+                user_email=user_row.get("email", ""),
+                user_name=user_row.get("full_name") or "Landlord",
+                onboarding_id=onboarding.get("id", ""),
+            )
+            print(f"✅ [ONBOARDING/submit] Landlord notified at {user_row.get('email')}")
+
+            # Email + in-app → admin
+            await notification_service.notify_admin_new_submission(
+                admin_email=os.getenv("ADMIN_EMAIL", "nuloafrica26@outlook.com"),
+                landlord_name=user_row.get("full_name") or "Landlord",
+                landlord_email=user_row.get("email", ""),
+                onboarding_id=onboarding.get("id", ""),
+            )
+            print(f"✅ [ONBOARDING/submit] Admin notified")
+
+        except Exception as _ne:
+            logger.warning(f"⚠️ [ONBOARDING/submit] Notifications failed (non-fatal): {_ne}")
+
+        # ── 5. Return ─────────────────────────────────────────────────────────
         return {
             "success": True,
             "message": "Onboarding submitted successfully for admin review",
-            "onboarding_id": onboarding.get('id'),
+            "onboarding_id": onboarding.get("id"),
             "submitted_for_review": True,
-            "submitted_at": onboarding.get('submitted_for_review_at'),
-            "admin_review_status": onboarding.get('admin_review_status', 'pending')
+            "submitted_at": onboarding.get("submitted_for_review_at"),
+            "admin_review_status": onboarding.get("admin_review_status", "pending"),
         }
 
-
-        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ [ONBOARDING] Error submitting onboarding: {str(e)}")
+        print(f"❌ [ONBOARDING/submit] Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+
+
+@router.post("/submit-complete", response_model=OnboardingSubmissionResponse)
+async def submit_complete_onboarding_v2(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user = Depends(get_current_user)
+):
+    """Alias for /submit — frontend calls this path to avoid legacy router conflicts."""
+    return await submit_complete_onboarding(request, background_tasks, current_user)
 
 
 @router.get("/progress", response_model=LandlordOnboardingResponse)
@@ -669,16 +589,53 @@ async def review_onboarding(
         
         result = supabase.table("landlord_onboarding").update(update_data).eq("id", onboarding_id).execute()
         
-        # Update user verification status in main users table
+        # Update user verification status + fire landlord notification
+        landlord_id = onboarding_check.data[0]['landlord_id']
+
+        # Fetch landlord details once — used by all 3 branches
+        landlord_row = supabase.table("users").select(
+            "email, full_name"
+        ).eq("id", landlord_id).execute()
+        landlord = landlord_row.data[0] if landlord_row.data else {}
+        landlord_email = landlord.get("email", "")
+        landlord_name  = landlord.get("full_name") or "Landlord"
+
         if review_data.admin_review_status == 'approved':
-            await _update_user_verification_status(onboarding_check.data[0]['landlord_id'], 'verified')
-            # TODO: Send approval notification
-            print(f"✅ [ONBOARDING] Approval notification sent to user")
+            await _update_user_verification_status(landlord_id, 'verified')
+            background_tasks.add_task(
+                notification_service.notify_verification_approved,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                trust_score=100,
+            )
+            print(f"✅ [ONBOARDING] Approval notification queued for {landlord_email}")
+
         elif review_data.admin_review_status == 'rejected':
-            await _update_user_verification_status(onboarding_check.data[0]['landlord_id'], 'rejected')
-            # TODO: Send rejection notification
-            print(f"✅ [ONBOARDING] Rejection notification sent to user")
-        
+            await _update_user_verification_status(landlord_id, 'rejected')
+            background_tasks.add_task(
+                notification_service.notify_verification_rejected,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                rejection_reason=review_data.admin_feedback or "Your documents could not be verified.",
+                onboarding_id=onboarding_id,
+            )
+            print(f"✅ [ONBOARDING] Rejection notification queued for {landlord_email}")
+
+        elif review_data.admin_review_status == 'needs_correction':
+            # Reset to pending so landlord can resubmit
+            await _update_user_verification_status(landlord_id, 'pending')
+            background_tasks.add_task(
+                notification_service.notify_verification_needs_correction,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                admin_feedback=review_data.admin_feedback or "Please review and resubmit your documents.",
+                onboarding_id=onboarding_id,
+            )
+            print(f"✅ [ONBOARDING] Needs-correction notification queued for {landlord_email}")
+
         return result.data[0]
         
     except HTTPException:

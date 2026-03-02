@@ -59,6 +59,9 @@ class UserBase(BaseModel):
     user_type: UserType  # Changed from user_type to match database column
     trust_score: int
     verification_status: VerificationStatus
+    engagement_score: int = 0
+    engagement_level: str = 'Low'
+    last_engagement_update: Optional[datetime] = None
     created_at: datetime
     
     class Config:

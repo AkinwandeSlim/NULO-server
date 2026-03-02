@@ -177,62 +177,122 @@ def get_landlord_profile(landlord_id: str) -> dict:
                 "created_at": user.get("created_at"),
                 "updated_at": user.get("updated_at")
             }
-        except:
-            return {}
+        except Exception as fallback_err:
+            # Both DB calls timed out. Return a safe skeleton so Pydantic never
+            # sees {} and the dashboard renders a degraded-but-working state.
+            logger.error(f"Profile fallback also failed: {str(fallback_err)}")
+            now = datetime.utcnow().isoformat()
+            return {
+                "id": landlord_id,
+                "user_id": landlord_id,
+                "full_name": "Unknown",
+                "email": "",
+                "phone_number": None,
+                "avatar_url": None,
+                "trust_score": 50,
+                "account_type": "individual",
+                "company_name": None,
+                "verification_status": "pending",
+                "verification_fee_paid": False,
+                "verification_submitted_at": None,
+                "verification_approved_at": None,
+                "onboarding_started": False,
+                "first_time_visit": True,
+                "created_at": now,
+                "updated_at": now,
+            }
 
 def calculate_landlord_stats(landlord_id: str) -> dict:
-    """Calculate landlord statistics with optimized queries"""
+    """
+    Calculate landlord statistics with per-query fault isolation.
+
+    Each Supabase call has its own try/except so a timeout on one query
+    (e.g. messages) never zeros out the others (e.g. properties).
+
+    Returns a _fetch_failed flag so the caller knows not to cache the result
+    when any query failed -- prevents zeros being cached for 5 minutes.
+    """
+    stats = {
+        "total_properties": 0,
+        "properties_vacant": 0,
+        "properties_occupied": 0,
+        "active_listings": 0,
+        "pending_viewings": 0,
+        "unread_messages": 0,
+        "applications_pending": 0,
+        "applications_approved": 0,
+        "total_views": 0,
+        "monthly_revenue": 0.0,
+        "occupancy_rate": 0.0,
+        "avg_response_time": "0 hours",
+        # Internal flag -- stripped before returning to caller if all OK.
+        # Set True if any sub-query fails so the dashboard knows not to cache.
+        "_fetch_failed": False,
+    }
+
+    # ── Query 1: Properties (most important) ────────────────────────────────
     try:
-        stats = {
-            "total_properties": 0,
-            "properties_vacant": 0,
-            "properties_occupied": 0,
-            "active_listings": 0,
-            "pending_viewings": 0,
-            "unread_messages": 0,
-            "applications_pending": 0,
-            "applications_approved": 0,
-            "total_views": 0,
-            "monthly_revenue": 0,
-            "occupancy_rate": 0.0
-        }
-        
-        # Get properties with basic stats in one query
-        properties_result = supabase_admin.table("properties").select("id, status, view_count, price").eq("landlord_id", landlord_id).execute()
+        properties_result = supabase_admin.table("properties") \
+            .select("id, status, view_count, price") \
+            .eq("landlord_id", landlord_id).execute()
         properties = properties_result.data or []
-        
+
         stats["total_properties"] = len(properties)
-        
-        # Calculate property stats
         for prop in properties:
             if prop.get("status") == "vacant":
                 stats["properties_vacant"] += 1
                 stats["active_listings"] += 1
             elif prop.get("status") == "occupied":
                 stats["properties_occupied"] += 1
-            
             stats["total_views"] += prop.get("view_count", 0)
-            stats["monthly_revenue"] += prop.get("price", 0)
-        
-        # Calculate occupancy rate
+            stats["monthly_revenue"] += float(prop.get("price", 0))
+
         if stats["total_properties"] > 0:
-            stats["occupancy_rate"] = (stats["properties_occupied"] / stats["total_properties"]) * 100
-        
-        # Get counts only (no full data) for performance
-        viewings_count_result = supabase_admin.table("viewing_requests").select("id").eq("landlord_id", landlord_id).eq("status", "pending").execute()
-        stats["pending_viewings"] = len(viewings_count_result.data or [])
-        
-        # Get unread messages count with optimized query
-        messages_count_result = supabase_admin.table("messages").select("id").eq("recipient_id", landlord_id).eq("read", False).execute()
-        stats["unread_messages"] = len(messages_count_result.data or [])
-        
-        # Add avg_response_time (placeholder for now)
-        stats["avg_response_time"] = "0 hours"
-        
-        return stats
+            stats["occupancy_rate"] = (
+                stats["properties_occupied"] / stats["total_properties"]
+            ) * 100
     except Exception as e:
-        logger.error(f"Error calculating landlord stats: {str(e)}")
-        return {}
+        logger.error(f"Stats query failed (properties): {e}")
+        stats["_fetch_failed"] = True
+
+    # ── Query 2: Pending viewings ────────────────────────────────────────────
+    try:
+        vr = supabase_admin.table("viewing_requests") \
+            .select("id") \
+            .eq("landlord_id", landlord_id) \
+            .eq("status", "pending").execute()
+        stats["pending_viewings"] = len(vr.data or [])
+    except Exception as e:
+        logger.error(f"Stats query failed (viewings): {e}")
+        stats["_fetch_failed"] = True
+
+    # ── Query 3: Unread messages ─────────────────────────────────────────────
+    try:
+        msgs = supabase_admin.table("messages") \
+            .select("id") \
+            .eq("recipient_id", landlord_id) \
+            .eq("read", False).execute()
+        stats["unread_messages"] = len(msgs.data or [])
+    except Exception as e:
+        logger.error(f"Stats query failed (messages): {e}")
+        stats["_fetch_failed"] = True
+
+    # ── Query 4: Applications ────────────────────────────────────────────────
+    try:
+        apps = supabase_admin.table("applications") \
+            .select("id, status") \
+            .eq("landlord_id", landlord_id).execute()
+        for app in (apps.data or []):
+            if app.get("status") == "pending":
+                stats["applications_pending"] += 1
+            elif app.get("status") == "approved":
+                stats["applications_approved"] += 1
+    except Exception as e:
+        logger.error(f"Stats query failed (applications): {e}")
+        # Non-fatal -- applications table may not have landlord_id column yet
+        # Don't mark _fetch_failed for this one
+
+    return stats
 
 def get_landlord_properties(landlord_id: str) -> List[dict]:
     """Get all properties for a landlord with complete data - OPTIMIZED"""
@@ -394,59 +454,102 @@ async def get_landlord_dashboard(
         
         print(f"🔄 [LANDLORD DASHBOARD] Cache miss or expired - fetching fresh data")
         
-        # Get all dashboard data (optimized queries)
-        # 🚀 OPTIMIZATION: Fetch data with graceful fallbacks - return partial data if a query fails
+        # 🚀 PARALLEL FETCH: Run all Supabase calls concurrently via thread pool.
+        # Previously sequential → 10+ round trips × 500-1500ms each = 10-15s total.
+        # Now parallel → slowest single call determines total time = ~2-4s.
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch_onboarding():
+            try:
+                result = supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
+                return result.data if result.data else None
+            except Exception as e:
+                logger.error(f"Failed to get onboarding: {str(e)}")
+                return None
+
+        def fetch_stats():
+            try:
+                result = calculate_landlord_stats(landlord_id)
+                # _fetch_failed is an internal signal -- strip it so Pydantic
+                # never sees it, but first record it for the cache decision below.
+                fetch_stats._failed = result.pop("_fetch_failed", False)
+                return result
+            except Exception as e:
+                logger.error(f"Failed to calculate stats: {str(e)}")
+                fetch_stats._failed = True
+                return {
+                    "total_properties": 0, "active_listings": 0, "pending_viewings": 0,
+                    "unread_messages": 0, "total_views": 0, "occupancy_rate": 0.0,
+                    "monthly_revenue": 0.0, "avg_response_time": "0 hours",
+                    "applications_pending": 0, "applications_approved": 0,
+                    "properties_vacant": 0, "properties_occupied": 0,
+                }
+        fetch_stats._failed = False  # default
+
+        def fetch_properties():
+            try:
+                return get_landlord_properties(landlord_id)
+            except Exception as e:
+                logger.error(f"Failed to get properties: {str(e)}")
+                return []
+
+        def fetch_activity():
+            try:
+                return get_recent_activity(landlord_id)
+            except Exception as e:
+                logger.error(f"Failed to get activity: {str(e)}")
+                return []
+
+        def fetch_notifications():
+            try:
+                return get_notifications(landlord_id)
+            except Exception as e:
+                logger.error(f"Failed to get notifications: {str(e)}")
+                return []
+
+        # profile is needed to build the response model -- fetch first if not cached
         try:
             profile_data = get_landlord_profile(landlord_id)
         except Exception as e:
             logger.error(f"Failed to get profile: {str(e)}")
-            profile_data = {}
-        
-        try:
-            stats_data = calculate_landlord_stats(landlord_id)
-        except Exception as e:
-            logger.error(f"Failed to calculate stats: {str(e)}")
-            stats_data = {
-                "total_properties": 0,
-                "active_listings": 0,
-                "pending_viewings": 0,
-                "unread_messages": 0,
-                "total_views": 0,
-                "occupancy_rate": 0,
-                "monthly_revenue": 0,
-                "avg_response_time": "0 hours",
-                "applications_pending": 0,
-                "applications_approved": 0,
-                "properties_vacant": 0,
-                "properties_occupied": 0,
+            # get_landlord_profile already returns a safe skeleton on timeout,
+            # but if it throws instead, build the fallback here too.
+            now = datetime.utcnow().isoformat()
+            profile_data = {
+                "id": landlord_id,
+                "user_id": landlord_id,
+                "full_name": "Unknown",
+                "email": "",
+                "phone_number": None,
+                "avatar_url": None,
+                "trust_score": 50,
+                "account_type": "individual",
+                "company_name": None,
+                "verification_status": "pending",
+                "verification_fee_paid": False,
+                "verification_submitted_at": None,
+                "verification_approved_at": None,
+                "onboarding_started": False,
+                "first_time_visit": True,
+                "created_at": now,
+                "updated_at": now,
             }
-        
-        try:
-            properties_data = get_landlord_properties(landlord_id)
-        except Exception as e:
-            logger.error(f"Failed to get properties: {str(e)}")
-            properties_data = []
-        
-        try:
-            activity_data = get_recent_activity(landlord_id)
-        except Exception as e:
-            logger.error(f"Failed to get activity: {str(e)}")
-            activity_data = []
-        
-        try:
-            notifications_data = get_notifications(landlord_id)
-        except Exception as e:
-            logger.error(f"Failed to get notifications: {str(e)}")
-            notifications_data = []
-        
-        # Get onboarding data
-        onboarding_data = None
-        try:
-            onboarding_result = supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
-            if onboarding_result.data:
-                onboarding_data = onboarding_result.data
-        except Exception as e:
-            logger.error(f"Failed to get onboarding: {str(e)}")
+
+        # Run remaining 5 fetches in parallel
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                loop.run_in_executor(executor, fetch_onboarding),
+                loop.run_in_executor(executor, fetch_stats),
+                loop.run_in_executor(executor, fetch_properties),
+                loop.run_in_executor(executor, fetch_activity),
+                loop.run_in_executor(executor, fetch_notifications),
+            ]
+            results = await asyncio.gather(*futures)
+
+        onboarding_data, stats_data, properties_data, activity_data, notifications_data = results
+        print(f"✅ [LANDLORD DASHBOARD] All parallel fetches complete")
 
         
         # Build response
@@ -459,9 +562,14 @@ async def get_landlord_dashboard(
             "notifications": notifications_data
         }
         
-        # 🚀 OPTIMIZATION: Cache the response
-        _dashboard_cache[cache_key] = (dashboard_data, datetime.now().timestamp())
-        
+        # Only cache when stats fetched cleanly -- never cache a degraded response
+        # with zeros caused by timeouts, or the zeros persist for CACHE_TTL seconds.
+        if not fetch_stats._failed:
+            _dashboard_cache[cache_key] = (dashboard_data, datetime.now().timestamp())
+            print(f"✅ [LANDLORD DASHBOARD] Dashboard data cached successfully")
+        else:
+            print(f"⚠️ [LANDLORD DASHBOARD] Stats fetch had failures -- skipping cache so next request retries")
+
         print(f"✅ [LANDLORD DASHBOARD] Dashboard data retrieved successfully")
         return dashboard_data
         

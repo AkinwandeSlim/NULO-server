@@ -7,15 +7,16 @@ Focus: Review and approve/reject landlord onboarding applications
 ✅ PRESERVED: All existing endpoints and functionality unchanged
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Query
 from app.database import supabase_admin
 from app.middleware.auth import get_current_admin
 from app.models.user import UserResponse
+from app.services.notification_service import notification_service
 from typing import Dict, Any, Optional, Literal
 from datetime import datetime, timedelta, timezone
 import time
 
-router = APIRouter(prefix="/admin/landlord-verifications", tags=["admin-verification"])
+router = APIRouter(prefix="/landlord-verifications", tags=["Admin Landlord Verification"])
 
 # In-memory cache
 _cache = {}
@@ -37,60 +38,62 @@ def set_cached(key: str, value: Any, ttl_seconds: int = 60):
     print(f"💾 [CACHE SET] {key} (TTL: {ttl_seconds}s)")
 
 
-async def sync_verification_status(landlord_id: str, onboarding_id: str, approved: bool):
+async def sync_verification_status(landlord_id: str, onboarding_id: str, new_status: str):
     """
-    Sync verification status across tables
+    Sync verification status across tables.
     Critical: Keep users.verification_status in sync with landlord_onboarding.admin_review_status
-    
-    ✅ UNCHANGED: This function remains exactly the same
+    Handles: approved | rejected | needs_correction
     """
     try:
         print(f"🔄 [SYNC] Syncing verification status for landlord {landlord_id}")
-        
-        if approved:
-            # Update user table
-            user_update = {
-                "verification_status": "approved",
-                "trust_score": 80,  # Base 50 + Verification 30
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            
+
+        if new_status == 'approved':
             supabase_admin.table('users')\
-                .update(user_update)\
+                .update({
+                    "verification_status": "approved",
+                    "trust_score": 80,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })\
                 .eq('id', landlord_id)\
                 .execute()
-            
-            # Update landlord_profiles
-            profile_update = {
-                "verification_submitted_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            
+
             supabase_admin.table('landlord_profiles')\
-                .update(profile_update)\
+                .update({
+                    "verification_submitted_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })\
                 .eq('id', landlord_id)\
                 .execute()
-            
+
             print(f"✅ [SYNC] Approved: user.verification_status='approved', trust_score=80")
-            
-        else:
-            # Update user table (rejected)
-            user_update = {
-                "verification_status": "rejected",
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            
+
+        elif new_status == 'rejected':
             supabase_admin.table('users')\
-                .update(user_update)\
+                .update({
+                    "verification_status": "rejected",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })\
                 .eq('id', landlord_id)\
                 .execute()
-            
+
             print(f"✅ [SYNC] Rejected: user.verification_status='rejected'")
-        
+
+        elif new_status == 'needs_correction':
+            # Reset to pending so landlord can fix and resubmit
+            supabase_admin.table('users')\
+                .update({
+                    "verification_status": "pending",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })\
+                .eq('id', landlord_id)\
+                .execute()
+
+            print(f"✅ [SYNC] Needs-correction: user.verification_status reset to 'pending'")
+
         # Clear all caches
         _cache.clear()
         _cache_ttl.clear()
-        
+
     except Exception as e:
         print(f"❌ [SYNC] Failed to sync: {str(e)}")
         # Don't raise - let the main operation succeed even if sync fails
@@ -373,7 +376,7 @@ async def get_verification_detail(
         jobs = []
         try:
             jobs_result = supabase_admin.table('document_processing_jobs')\
-                .select('id, job_status, document_type, processing_status')\
+                .select('id, job_status, document_type')\
                 .eq('onboarding_id', verification_id)\
                 .execute()
             jobs = jobs_result.data or []
@@ -429,10 +432,19 @@ async def get_verification_detail(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [VERIFICATION-DETAIL] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [VERIFICATION-DETAIL] Error: {error_msg}")
+        
+        # Handle SSL timeout specifically
+        if "SSL handshake" in error_msg or "timeout" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service temporarily unavailable due to network issues. Please try again."
+            )
+        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch verification details: {str(e)}"
+            detail=f"Failed to fetch verification details: {error_msg}"
         )
 
 
@@ -440,6 +452,7 @@ async def get_verification_detail(
 async def review_verification(
     verification_id: str,
     review_data: Dict[str, Any],
+    background_tasks: BackgroundTasks,
     current_admin: UserResponse = Depends(get_current_admin)
 ) -> Dict[str, Any]:
     """
@@ -531,9 +544,50 @@ async def review_verification(
         await sync_verification_status(
             landlord_id=landlord_id,
             onboarding_id=verification_id,
-            approved=(new_status == 'approved')
+            new_status=new_status
         )
-        
+
+        # Fetch landlord details for notifications (email + full_name)
+        landlord_row = supabase_admin.table('users')\
+            .select('email, full_name')\
+            .eq('id', landlord_id)\
+            .execute()
+        landlord = landlord_row.data[0] if landlord_row.data else {}
+        landlord_email = landlord.get('email', '')
+        landlord_name  = landlord.get('full_name') or 'Landlord'
+
+        if new_status == 'approved':
+            background_tasks.add_task(
+                notification_service.notify_verification_approved,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                trust_score=80,
+            )
+            print(f"✅ [VERIFICATION-REVIEW] Approval notification queued for {landlord_email}")
+
+        elif new_status == 'rejected':
+            background_tasks.add_task(
+                notification_service.notify_verification_rejected,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                rejection_reason=review_data.get('admin_feedback') or 'Your documents could not be verified.',
+                onboarding_id=verification_id,
+            )
+            print(f"✅ [VERIFICATION-REVIEW] Rejection notification queued for {landlord_email}")
+
+        elif new_status == 'needs_correction':
+            background_tasks.add_task(
+                notification_service.notify_verification_needs_correction,
+                user_id=landlord_id,
+                user_email=landlord_email,
+                user_name=landlord_name,
+                admin_feedback=review_data.get('admin_feedback') or 'Please review and resubmit your documents.',
+                onboarding_id=verification_id,
+            )
+            print(f"✅ [VERIFICATION-REVIEW] Needs-correction notification queued for {landlord_email}")
+
         print(f"✅ [VERIFICATION-REVIEW] Review completed: {new_status}")
         
         return {
