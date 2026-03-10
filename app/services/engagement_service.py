@@ -114,13 +114,14 @@ class EngagementService:
             
             if not metrics_response.data:
                 # Initialize metrics if not exists
-                supabase_admin.table("user_engagement_metrics").insert({
+                init_metrics = {
                     "user_id": user_id,
                     "user_type": user_type,
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat()
-                }).execute()
-                metrics_response.data = {}
+                }
+                supabase_admin.table("user_engagement_metrics").upsert(init_metrics).execute()
+                metrics_response.data = init_metrics
             
             metrics = metrics_response.data or {}
             

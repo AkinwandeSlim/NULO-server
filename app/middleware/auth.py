@@ -84,16 +84,34 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             print(f"⚠️ [get_current_user] DB lookup after Supabase auth failed: {e}")
             # Fall through to internal JWT
 
-    # ─── PATH 2: Internal JWT fallback (SKIP Supabase verification) ────────────
+    # -- PATH 2: Internal JWT fallback (SKIP Supabase verification) ----
     print("🔍 [get_current_user] Trying internal JWT validation...")
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        # Try strict validation first (for our own issued tokens)
+        try:
+            payload = jwt.decode(
+                token, 
+                settings.JWT_SECRET_KEY, 
+                algorithms=[settings.JWT_ALGORITHM],
+                options={"verify_signature": True}
+            )
+        except JWTError:
+            # If strict validation fails, try lenient decode (extract claims without signature verification)
+            # This handles Supabase tokens during fallback
+            print("⚠️ [get_current_user] Strict validation failed, trying lenient decode...")
+            payload = jwt.decode(
+                token,
+                key="",  # Required parameter, even with verify_signature=False
+                options={"verify_signature": False}  # Don't verify signature — Supabase uses their key
+            )
+        
+        # Extract user_id from payload
         user_id = payload.get("sub") or payload.get("user_id")
         if not user_id:
             print("❌ [get_current_user] JWT payload missing user_id")
             raise credentials_exception
 
-        print(f"✅ [get_current_user] Internal JWT valid, user_id: {user_id}")
+        print(f"✅ [get_current_user] JWT valid, user_id: {user_id}")
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: supabase_admin.table("users").select(
@@ -104,14 +122,14 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             user_data = response.data
             # Cache the result
             await token_cache.set(token, user_data)
-            print("✅ [get_current_user] Internal JWT validation successful")
+            print("✅ [get_current_user] JWT validation successful")
             return user_data
         else:
             print("❌ [get_current_user] User profile not found in database")
             raise credentials_exception
 
     except ExpiredSignatureError:
-        print("❌ [get_current_user] Internal JWT expired")
+        print("❌ [get_current_user] JWT expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",

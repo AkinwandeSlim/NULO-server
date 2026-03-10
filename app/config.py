@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # Paystack (Optional)
     PAYSTACK_SECRET_KEY: str | None = None
     PAYSTACK_PUBLIC_KEY: str | None = None
+    PAYSTACK_WEBHOOK_URL: str | None = None  # Local: https://abc123.ngrok.io, Cloud: https://nuloafrica.com
+    
+    # Environment
+    ENV: str = "local"  # local | development | production
     
     # SMS Configuration (Optional)
     TWILIO_ACCOUNT_SID: str | None = None
@@ -59,6 +63,11 @@ class Settings(BaseSettings):
         """Parse CORS origins from comma-separated string"""
         return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",")]
     
+    @property
+    def is_local(self) -> bool:
+        """Check if running in local development"""
+        return self.ENV == "local" or self.ENVIRONMENT == "development"
+    
     class Config:
         env_file = ".env"
         case_sensitive = True
@@ -73,3 +82,5 @@ def get_settings() -> Settings:
 
 # Global settings instance
 settings = get_settings()
+
+

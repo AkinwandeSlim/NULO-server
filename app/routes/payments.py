@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from app.database import supabase_admin
@@ -57,6 +57,21 @@ def _paystack_headers() -> dict:
     }
 
 
+def _fetch_property_details(property_id: str) -> dict:
+    """
+    Fetch property details efficiently.
+    Returns property dict or None if not found.
+    """
+    try:
+        resp = supabase_admin.table("properties").select(
+            "id, title, location, city, state, address, full_address, price, images"
+        ).eq("id", property_id).single().execute()
+        return resp.data if resp.data else None
+    except Exception as e:
+        logger.warning(f"[PAY] Could not fetch property {property_id}: {e}")
+        return None
+
+
 def _generate_ref(agreement_id: str) -> str:
     """
     Stable, unique reference for Paystack.
@@ -79,6 +94,49 @@ def _total_due(agreement: dict) -> int:
     service_charge = float(agreement.get("service_charge", 0) or 0)
     annual_rent = rent * 12
     return int(annual_rent + deposit + platform_fee + service_charge)
+
+
+def _create_payment_breakdown(agreement: dict, tenant_id: str, paystack_ref: str) -> dict:
+    """
+    Create a single transaction with detailed payment breakdown.
+    Returns transaction record with breakdown metadata.
+    """
+    rent = float(agreement.get("rent_amount", 0) or 0)
+    deposit = float(agreement.get("deposit_amount", 0) or 0)
+    platform_fee = float(agreement.get("platform_fee", 0) or 0)
+    service_charge = float(agreement.get("service_charge", 0) or 0)
+    
+    annual_rent = rent * 12
+    total_amount = int(annual_rent + deposit + platform_fee + service_charge)
+    
+    # Create breakdown metadata
+    breakdown = {
+        "monthly_rent": rent,
+        "annual_rent": annual_rent,
+        "security_deposit": deposit,
+        "platform_fee": platform_fee,
+        "service_charge": service_charge,
+        "total_amount": total_amount
+    }
+    
+    return {
+        "tenant_id": tenant_id,
+        "landlord_id": agreement["landlord_id"],
+        "property_id": agreement["property_id"],
+        "agreement_id": agreement["id"],
+        "application_id": agreement.get("application_id"),
+        "amount": total_amount,
+        "currency": "NGN",
+        "status": "pending",
+        "transaction_type": "rent_payment",  # Keep as rent_payment for compatibility
+        "payment_gateway": "paystack",
+        "paystack_ref": paystack_ref,
+        "notes": json.dumps({
+            "payment_breakdown": breakdown,
+            "agreement_id": agreement["id"],
+            "breakdown_type": "detailed"
+        })
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -172,31 +230,35 @@ async def initiate_payment(
     # -- 5. Generate unique reference -----------------------------------------
     paystack_ref = _generate_ref(body.agreement_id)
 
-    # -- 6. Insert pending transaction -----------------------------------------
+    # -- 6. Insert transaction with breakdown -----------------------------------------
     base_url = os.getenv("BASE_URL", "http://localhost:3000")
     callback_url = f"{base_url}/tenant/payments/callback?reference={paystack_ref}"
 
     try:
-        txn_resp = supabase_admin.table("transactions").insert({
-            "tenant_id": tenant_id,
-            "landlord_id": agreement["landlord_id"],
-            "property_id": agreement["property_id"],
-            "application_id": agreement.get("application_id"),
-            "amount": amount_ngn,
-            "currency": "NGN",
-            "status": "pending",
-            "transaction_type": "rent_payment",
-            "payment_gateway": "paystack",
-            "paystack_ref": paystack_ref,
-        }).execute()
+        # Create single transaction with detailed breakdown
+        transaction_record = _create_payment_breakdown(agreement, tenant_id, paystack_ref)
+        
+        # Insert the transaction
+        txn_resp = supabase_admin.table("transactions").insert(transaction_record).execute()
+        
+        if not txn_resp.data:
+            raise HTTPException(status_code=500, detail="Failed to create payment record")
+        
+        transaction_id = txn_resp.data[0]["id"]
+        
+        # Log the payment breakdown
+        breakdown = json.loads(transaction_record["notes"]).get("payment_breakdown", {})
+        logger.info(f"[PAY] Created payment with breakdown for agreement {body.agreement_id}")
+        logger.info(f"[PAY]   - Monthly Rent: ₦{breakdown.get('monthly_rent', 0):,}")
+        logger.info(f"[PAY]   - Annual Rent (×12): ₦{breakdown.get('annual_rent', 0):,}")
+        logger.info(f"[PAY]   - Security Deposit: ₦{breakdown.get('security_deposit', 0):,}")
+        logger.info(f"[PAY]   - Platform Fee: ₦{breakdown.get('platform_fee', 0):,}")
+        logger.info(f"[PAY]   - Service Charge: ₦{breakdown.get('service_charge', 0):,}")
+        logger.info(f"[PAY]   - Total Amount: ₦{breakdown.get('total_amount', 0):,}")
+            
     except Exception as e:
-        logger.error(f"[PAY] Failed to insert transaction: {e}")
+        logger.error(f"[PAY] Failed to insert payment transaction: {e}")
         raise HTTPException(status_code=500, detail="Failed to create payment record")
-
-    if not txn_resp.data:
-        raise HTTPException(status_code=500, detail="Failed to create payment record")
-
-    transaction_id = txn_resp.data[0]["id"]
 
     # -- 7. Call Paystack initialize -------------------------------------------
     paystack_payload = {
@@ -358,7 +420,7 @@ async def paystack_webhook(request: Request):
     # -- Fetch transaction by reference ----------------------------------------
     try:
         txn_resp = supabase_admin.table("transactions").select(
-            "id, status, tenant_id, landlord_id, property_id, application_id, amount"
+            "id, status, tenant_id, landlord_id, property_id, application_id, amount, notes"
         ).eq("paystack_ref", paystack_ref).single().execute()
     except Exception as e:
         logger.error(f"[PAY][WEBHOOK] Failed to fetch transaction for ref {paystack_ref}: {e}")
@@ -379,6 +441,13 @@ async def paystack_webhook(request: Request):
 
     # -- Mark transaction as released -----------------------------------------
     try:
+        # Preserve existing breakdown notes if present
+        existing_notes = {}
+        try:
+            existing_notes = json.loads(transaction.get("notes", "{}"))
+        except:
+            existing_notes = {}
+        
         supabase_admin.table("transactions").update({
             "status": "released",
             "released_at": now_iso,
@@ -386,6 +455,8 @@ async def paystack_webhook(request: Request):
                 "paystack_event": event_type,
                 "paystack_data": data,
                 "processed_at": now_iso,
+                "payment_breakdown": existing_notes.get("payment_breakdown", {}),
+                "breakdown_type": existing_notes.get("breakdown_type", "simple")
             }),
             "updated_at": now_iso,
         }).eq("id", transaction["id"]).execute()
@@ -397,7 +468,7 @@ async def paystack_webhook(request: Request):
     try:
         supabase_admin.table("agreements").update({
             "status": "ACTIVE",
-            "updated_at": now_iso,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("tenant_id", transaction["tenant_id"]).eq(
             "property_id", transaction["property_id"]
         ).in_("status", ["SIGNED", "ACTIVE"]).execute()
@@ -408,7 +479,7 @@ async def paystack_webhook(request: Request):
     try:
         supabase_admin.table("properties").update({
             "status": "occupied",
-            "updated_at": now_iso,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", transaction["property_id"]).execute()
     except Exception as e:
         logger.warning(f"[PAY][WEBHOOK] Could not update property status: {e}")
@@ -481,8 +552,6 @@ async def paystack_webhook(request: Request):
 
     return {"status": "ok"}
 
-
-# -----------------------------------------------------------------------------
 # GET /payments/my-payments  (tenant)
 # -----------------------------------------------------------------------------
 
@@ -492,11 +561,44 @@ async def get_my_payments(
 ):
     """Tenant's full payment history, newest first."""
     try:
+        # Get transactions for this tenant
         resp = supabase_admin.table("transactions").select(
-            "*, property:properties(id, title, city, state, images)"
+            "id, tenant_id, landlord_id, property_id, agreement_id, application_id, "
+            "amount, currency, status, transaction_type, payment_gateway, "
+            "paystack_ref, paystack_access_code, held_at, released_at, refunded_at, "
+            "notes, created_at, updated_at"
         ).eq("tenant_id", current_user["id"]).order("created_at", desc=True).execute()
 
-        return {"success": True, "payments": resp.data or []}
+        transactions = resp.data or []
+        
+        # Enrich each transaction with property and landlord data
+        enriched_transactions = []
+        for txn in transactions:
+            # Fetch property details
+            property_data = None
+            if txn.get("property_id"):
+                property_data = _fetch_property_details(txn["property_id"])
+            
+            # Fetch landlord details
+            landlord_data = None
+            if txn.get("landlord_id"):
+                try:
+                    landlord_resp = supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).eq("id", txn["landlord_id"]).single().execute()
+                    landlord_data = landlord_resp.data
+                except Exception as e:
+                    logger.warning(f"[PAY] Could not fetch landlord {txn.get('landlord_id')}: {e}")
+            
+            # Combine data
+            enriched_txn = {
+                **txn,
+                "property": property_data,
+                "landlord": landlord_data
+            }
+            enriched_transactions.append(enriched_txn)
+
+        return {"success": True, "payments": enriched_transactions}
     except Exception as e:
         logger.error(f"[PAY] get_my_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch payment history")
@@ -512,24 +614,51 @@ async def get_received_payments(
 ):
     """Landlord's received payments with tenant and property info."""
     try:
+        # Get transactions for this landlord
         resp = supabase_admin.table("transactions").select(
-            "*, property:properties(id, title, city, state, images), "
-            "tenant:users!tenant_id(id, full_name, email, phone_number)"
+            "id, tenant_id, landlord_id, property_id, agreement_id, application_id, "
+            "amount, currency, status, transaction_type, payment_gateway, "
+            "paystack_ref, paystack_access_code, held_at, released_at, refunded_at, "
+            "notes, created_at, updated_at"
         ).eq("landlord_id", current_user["id"]).order("created_at", desc=True).execute()
 
-        return {"success": True, "payments": resp.data or []}
+        transactions = resp.data or []
+        
+        # Enrich each transaction with property and tenant data
+        enriched_transactions = []
+        for txn in transactions:
+            # Fetch property details
+            property_data = None
+            if txn.get("property_id"):
+                property_data = _fetch_property_details(txn["property_id"])
+            
+            # Fetch tenant details
+            tenant_data = None
+            if txn.get("tenant_id"):
+                try:
+                    tenant_resp = supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).eq("id", txn["tenant_id"]).single().execute()
+                    tenant_data = tenant_resp.data
+                except Exception as e:
+                    logger.warning(f"[PAY] Could not fetch tenant {txn.get('tenant_id')}: {e}")
+            
+            # Combine data
+            enriched_txn = {
+                **txn,
+                "property": property_data,
+                "tenant": tenant_data
+            }
+            enriched_transactions.append(enriched_txn)
+
+        return {"success": True, "payments": enriched_transactions}
     except Exception as e:
         logger.error(f"[PAY] get_received_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch received payments")
 
-
-# -----------------------------------------------------------------------------
-# GET /payments/status  (by reference -- used by callback page)
-# -----------------------------------------------------------------------------
-
 @router.get("/status")
 async def get_payment_status_by_reference(
-    reference: str,
+    reference: str = Query(...),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -540,7 +669,8 @@ async def get_payment_status_by_reference(
     try:
         resp = supabase_admin.table("transactions").select(
             "id, status, amount, currency, paystack_ref, created_at, released_at, "
-            "property:properties(id, title)"
+            "property_id, tenant_id, landlord_id, application_id, transaction_type, "
+            "payment_gateway, held_at, refunded_at, notes"
         ).eq("paystack_ref", reference).single().execute()
     except Exception as e:
         logger.error(f"[PAY] get_payment_status error: {e}")
@@ -550,22 +680,18 @@ async def get_payment_status_by_reference(
         raise HTTPException(status_code=404, detail="Payment not found")
 
     transaction = resp.data
+    user_id = current_user["id"]
 
     # Verify caller is the tenant or landlord on this transaction
-    user_id = current_user["id"]
     if transaction.get("tenant_id") != user_id and transaction.get("landlord_id") != user_id:
-        # Re-fetch with tenant_id/landlord_id for the access check
-        try:
-            full_resp = supabase_admin.table("transactions").select(
-                "tenant_id, landlord_id"
-            ).eq("paystack_ref", reference).single().execute()
-            full = full_resp.data or {}
-            if full.get("tenant_id") != user_id and full.get("landlord_id") != user_id:
-                raise HTTPException(status_code=403, detail="Access denied")
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=403, detail="Access denied")
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # -- Fetch property details for better response --------------------------------
+    property_data = None
+    if transaction.get("property_id"):
+        property_data = _fetch_property_details(transaction["property_id"])
+        if property_data:
+            transaction["property"] = property_data
 
     return {"success": True, "payment": transaction}
 
@@ -582,8 +708,7 @@ async def get_payment(
     """Single transaction detail. Accessible by the tenant or landlord on it."""
     try:
         resp = supabase_admin.table("transactions").select(
-            "*, property:properties(id, title, city, state, images), "
-            "tenant:users!tenant_id(id, full_name, email, phone_number)"
+            "*, property_id, tenant_id, landlord_id"
         ).eq("id", transaction_id).single().execute()
     except Exception as e:
         logger.error(f"[PAY] get_payment error: {e}")
@@ -599,3 +724,68 @@ async def get_payment(
         raise HTTPException(status_code=403, detail="Access denied")
 
     return {"success": True, "payment": transaction}
+
+
+# -----------------------------------------------------------------------------
+# POST /payments/confirm-webhook-manually  (DEV ONLY - simulate webhook)
+# -----------------------------------------------------------------------------
+
+@router.post("/confirm-webhook-manually")
+async def confirm_payment_manually(
+    reference: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    DEV ONLY: Manually confirm a payment to simulate Paystack webhook.
+    This is needed because Paystack webhooks don't work with localhost.
+    """
+    # Fetch transaction
+    try:
+        txn_resp = supabase_admin.table("transactions").select(
+            "id, status, tenant_id, landlord_id, property_id, application_id, amount"
+        ).eq("paystack_ref", reference).single().execute()
+    except Exception as e:
+        logger.error(f"[PAY] Manual confirm failed for ref {reference}: {e}")
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if not txn_resp.data:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    transaction = txn_resp.data
+
+    # Check if already released
+    if transaction["status"] == "released":
+        return {"success": True, "message": "Payment already confirmed"}
+
+    # Verify caller is the tenant or landlord
+    user_id = current_user["id"]
+    if transaction.get("tenant_id") != user_id and transaction.get("landlord_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Update transaction to released
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        supabase_admin.table("transactions").update({
+            "status": "released",
+            "released_at": now_iso,
+            "notes": "Manually confirmed via dev endpoint",
+            "updated_at": now_iso,
+        }).eq("id", transaction["id"]).execute()
+    except Exception as e:
+        logger.error(f"[PAY] Manual confirm update failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to confirm payment")
+
+    # Update agreement status to ACTIVE
+    try:
+        supabase_admin.table("agreements").update({
+            "status": "ACTIVE",
+            "updated_at": now_iso,
+        }).eq("tenant_id", transaction["tenant_id"]).eq(
+            "property_id", transaction["property_id"]
+        ).in_("status", ["SIGNED", "ACTIVE"]).execute()
+    except Exception as e:
+        logger.warning(f"[PAY] Manual confirm could not update agreement: {e}")
+
+    logger.info(f"[PAY] Payment manually confirmed - transaction {transaction['id']}, ref {reference}")
+
+    return {"success": True, "message": "Payment confirmed successfully"}

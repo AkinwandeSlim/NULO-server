@@ -1464,17 +1464,6 @@ class NotificationService:
             f"✅ [NOTIF] notify_agreement_fully_signed done for agreement {agreement_id}"
         )
 
-
-# =============================================================================
-# PAYMENT NOTIFICATIONS
-# Add these two methods to the NotificationService class, after
-# notify_agreement_fully_signed() and before the BACKWARD COMPATIBILITY block.
-# Then add the two HTML builder functions at the bottom of the file,
-# after _html_agreement_fully_signed().
-# =============================================================================
-
-# -- PASTE INTO NotificationService class -------------------------------------
-
     async def notify_payment_initiated(
         self,
         *,
@@ -1679,6 +1668,75 @@ class NotificationService:
 
 
 
+    async def notify_new_message(
+        recipient_id: str,
+        sender_id: str,
+        conversation_id: str,
+        property_id: Optional[str],
+        message_preview: str,
+    ) -> None:
+        """
+        In-app notification when a user receives a new message.
+
+        Deliberately in-app ONLY -- no email, no SMS.
+        Rationale: messages are high-frequency; email/SMS on every message
+        would spam users and violate Nigerian UX norms. Use email/SMS only
+        for the FIRST message in a brand-new conversation thread (TODO: future).
+
+        Non-fatal: logs errors but never raises. A notification failure must
+        never block the message from being saved.
+        """
+        try:
+            # Resolve sender display name.
+            # COALESCE full_name -> first_name -> 'Someone' guards against
+            # OAuth users whose full_name is NULL in public.users (Rule: always
+            # handle NULL full_name for OAuth accounts).
+            loop = asyncio.get_event_loop()
+            sender_resp = await loop.run_in_executor(
+                None,
+                lambda: supabase_admin.table("users")
+                .select("full_name, first_name, user_type")
+                .eq("id", sender_id)
+                .execute()
+            )
+            sender = sender_resp.data[0] if sender_resp.data else None
+            sender_name = (
+                (sender.get("full_name") or sender.get("first_name") or "Someone")
+                if sender
+                else "Someone"
+            )
+
+            # Truncate preview to keep notifications tidy
+            preview = (
+                message_preview[:77] + "..."
+                if len(message_preview) > 77
+                else message_preview
+            )
+
+            # Build the deep-link.
+            # Frontend messages page is at /tenant/messages or /landlord/messages
+            # but the conversation route is the same for both.
+            # Use a generic /messages/{id} path -- layout will route correctly.
+            link = f"/messages/{conversation_id}"
+
+            await create_notification(
+                user_id=recipient_id,
+                notification_type="new_message",
+                title=f"New message from {sender_name}",
+                message=preview,
+                link=link,
+                data={
+                    "conversation_id": conversation_id,
+                    "sender_id": sender_id,
+                    "property_id": property_id,
+                },
+            )
+
+        except Exception as e:
+            # Non-fatal -- log and continue (matches pattern of all notify_* functions)
+            print(f"[NOTIFICATIONS] notify_new_message failed for recipient {recipient_id}: {e}")
+
+
 
 
 
@@ -1751,6 +1809,8 @@ class NotificationService:
             document_type=document_type,
             error_message=error_message,
         )
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
