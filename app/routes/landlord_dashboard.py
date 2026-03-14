@@ -15,7 +15,7 @@ from ..models.landlord_onboarding import LandlordOnboardingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/landlord", tags=["landlord-dashboard"])
+router = APIRouter(prefix="/landlord", tags=["landlord-dashboard"])
 
 # 🚀 OPTIMIZATION: Simple in-memory cache for dashboard data (2 minute TTL)
 # Reduced from 5 minutes to 2 minutes for fresher data but still fast responses
@@ -51,6 +51,7 @@ class LandlordStats(BaseModel):
     active_listings: int
     pending_viewings: int
     unread_messages: int
+    total_conversations: int
     total_views: int
     occupancy_rate: float
     monthly_revenue: float
@@ -111,6 +112,9 @@ class DashboardResponse(BaseModel):
     properties: List[LandlordProperty]
     recent_activity: List[RecentActivity]
     notifications: List[Notification]
+    viewing_requests: List[dict] = []
+    received_applications: List[dict] = []
+    agreements: List[dict] = []
 
 
 # ============================================================================
@@ -219,6 +223,7 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         "active_listings": 0,
         "pending_viewings": 0,
         "unread_messages": 0,
+        "total_conversations": 0,
         "applications_pending": 0,
         "applications_approved": 0,
         "total_views": 0,
@@ -291,6 +296,17 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         logger.error(f"Stats query failed (applications): {e}")
         # Non-fatal -- applications table may not have landlord_id column yet
         # Don't mark _fetch_failed for this one
+
+    # -- Query 5: Total conversations ----------------------------------------
+    # conversations table has landlord_id directly
+    try:
+        convos = supabase_admin.table("conversations") \
+            .select("id") \
+            .eq("landlord_id", landlord_id).execute()
+        stats["total_conversations"] = len(convos.data or [])
+    except Exception as e:
+        logger.error("Stats query failed (conversations): %s", str(e))
+        # Non-fatal -- do not set _fetch_failed
 
     return stats
 
@@ -508,6 +524,141 @@ async def get_landlord_dashboard(
                 logger.error(f"Failed to get notifications: {str(e)}")
                 return []
 
+        def fetch_viewing_requests():
+            # viewing_requests has landlord_id directly
+            try:
+                result = supabase_admin.table("viewing_requests") \
+                    .select(
+                        "id, property_id, tenant_id, status, preferred_date, "
+                        "confirmed_date, confirmed_time, time_slot, viewing_type, created_at"
+                    ) \
+                    .eq("landlord_id", landlord_id) \
+                    .in_("status", ["pending", "confirmed"]) \
+                    .order("created_at", desc=True) \
+                    .limit(50) \
+                    .execute()
+                rows = result.data or []
+
+                # Batch-fetch names -- one query per table, not one per row
+                tenant_ids = list({r["tenant_id"] for r in rows if r.get("tenant_id")})
+                property_ids = list({r["property_id"] for r in rows if r.get("property_id")})
+
+                tenants_map = {}
+                props_map = {}
+                if tenant_ids:
+                    t_res = supabase_admin.table("users") \
+                        .select("id, full_name, first_name") \
+                        .in_("id", tenant_ids).execute()
+                    tenants_map = {t["id"]: t for t in (t_res.data or [])}
+                if property_ids:
+                    p_res = supabase_admin.table("properties") \
+                        .select("id, title") \
+                        .in_("id", property_ids).execute()
+                    props_map = {p["id"]: p for p in (p_res.data or [])}
+
+                for row in rows:
+                    row["tenant"] = tenants_map.get(row.get("tenant_id"), {})
+                    row["property"] = props_map.get(row.get("property_id"), {})
+                return rows
+            except Exception as e:
+                logger.error("Failed to get viewing requests: %s", str(e))
+                return []
+
+        def fetch_received_applications():
+            # IMPORTANT: applications table has NO landlord_id column.
+            # Must get property_ids for this landlord first, then filter by them.
+            try:
+                # Step 1: get this landlord's property IDs
+                props_res = supabase_admin.table("properties") \
+                    .select("id") \
+                    .eq("landlord_id", landlord_id).execute()
+                property_ids = [p["id"] for p in (props_res.data or [])]
+
+                if not property_ids:
+                    return []
+
+                # Step 2: get applications for those properties
+                # Tenant FK is user_id -- there is no tenant_id column on applications
+                result = supabase_admin.table("applications") \
+                    .select(
+                        "id, property_id, user_id, status, "
+                        "created_at, viewed_by_landlord"
+                    ) \
+                    .in_("property_id", property_ids) \
+                    .neq("status", "withdrawn") \
+                    .order("created_at", desc=True) \
+                    .limit(50) \
+                    .execute()
+                rows = result.data or []
+
+                # Batch-fetch tenant names and property titles
+                tenant_ids = list({r["user_id"] for r in rows if r.get("user_id")})
+                props_to_fetch = list({r["property_id"] for r in rows if r.get("property_id")})
+
+                tenants_map = {}
+                props_map = {}
+                if tenant_ids:
+                    t_res = supabase_admin.table("users") \
+                        .select("id, full_name") \
+                        .in_("id", tenant_ids).execute()
+                    tenants_map = {t["id"]: t for t in (t_res.data or [])}
+                if props_to_fetch:
+                    p_res = supabase_admin.table("properties") \
+                        .select("id, title, price") \
+                        .in_("id", props_to_fetch).execute()
+                    props_map = {p["id"]: p for p in (p_res.data or [])}
+
+                for row in rows:
+                    row["user"] = tenants_map.get(row.get("user_id"), {})
+                    row["property"] = props_map.get(row.get("property_id"), {})
+                    # Expose as tenant_id too so the frontend can use either key
+                    row["tenant_id"] = row.get("user_id")
+                return rows
+            except Exception as e:
+                logger.error("Failed to get received applications: %s", str(e))
+                return []
+
+        def fetch_agreements():
+            # agreements table has landlord_id directly
+            # DB field names: rent_amount, lease_start_date, lease_end_date
+            try:
+                result = supabase_admin.table("agreements") \
+                    .select(
+                        "id, tenant_id, property_id, status, "
+                        "lease_start_date, lease_end_date, rent_amount, "
+                        "deposit_amount, created_at, updated_at"
+                    ) \
+                    .eq("landlord_id", landlord_id) \
+                    .in_("status", ["ACTIVE", "SIGNED", "PENDING_LANDLORD", "PENDING_TENANT", "EXPIRED"]) \
+                    .order("created_at", desc=True) \
+                    .limit(50) \
+                    .execute()
+                rows = result.data or []
+
+                tenant_ids = list({r["tenant_id"] for r in rows if r.get("tenant_id")})
+                property_ids = list({r["property_id"] for r in rows if r.get("property_id")})
+
+                tenants_map = {}
+                props_map = {}
+                if tenant_ids:
+                    t_res = supabase_admin.table("users") \
+                        .select("id, full_name") \
+                        .in_("id", tenant_ids).execute()
+                    tenants_map = {t["id"]: t for t in (t_res.data or [])}
+                if property_ids:
+                    p_res = supabase_admin.table("properties") \
+                        .select("id, title") \
+                        .in_("id", property_ids).execute()
+                    props_map = {p["id"]: p for p in (p_res.data or [])}
+
+                for row in rows:
+                    row["tenant"] = tenants_map.get(row.get("tenant_id"), {})
+                    row["property"] = props_map.get(row.get("property_id"), {})
+                return rows
+            except Exception as e:
+                logger.error("Failed to get agreements: %s", str(e))
+                return []
+
         # profile is needed to build the response model -- fetch first if not cached
         try:
             profile_data = get_landlord_profile(landlord_id)
@@ -536,19 +687,24 @@ async def get_landlord_dashboard(
                 "updated_at": now,
             }
 
-        # Run remaining 5 fetches in parallel
+        # Run remaining 8 fetches in parallel
         loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [
                 loop.run_in_executor(executor, fetch_onboarding),
                 loop.run_in_executor(executor, fetch_stats),
                 loop.run_in_executor(executor, fetch_properties),
                 loop.run_in_executor(executor, fetch_activity),
                 loop.run_in_executor(executor, fetch_notifications),
+                loop.run_in_executor(executor, fetch_viewing_requests),
+                loop.run_in_executor(executor, fetch_received_applications),
+                loop.run_in_executor(executor, fetch_agreements),
             ]
             results = await asyncio.gather(*futures)
 
-        onboarding_data, stats_data, properties_data, activity_data, notifications_data = results
+        (onboarding_data, stats_data, properties_data, activity_data,
+         notifications_data, viewing_requests_data,
+         received_applications_data, agreements_data) = results
         print(f"✅ [LANDLORD DASHBOARD] All parallel fetches complete")
 
         
@@ -559,7 +715,10 @@ async def get_landlord_dashboard(
             "stats": stats_data,
             "properties": properties_data,
             "recent_activity": activity_data,
-            "notifications": notifications_data
+            "notifications": notifications_data,
+            "viewing_requests": viewing_requests_data,
+            "received_applications": received_applications_data,
+            "agreements": agreements_data,
         }
         
         # Only cache when stats fetched cleanly -- never cache a degraded response

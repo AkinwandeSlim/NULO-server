@@ -12,7 +12,7 @@ from app.routes import (
     messages, viewing_requests, verifications, google,
     admin_landlord_verification, property_verification, 
     tenant_verification, admin_signup,admin_management,
-    landlord_onboarding, landlord_dashboard, notifications, admin_dashboard,
+    landlord_onboarding, landlord_dashboard, tenant_dashboard, notifications, admin_dashboard,
     admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health,
     engagement,payments,
 )
@@ -125,7 +125,8 @@ app.include_router(admin_dashboard.router, prefix="/api/v1", tags=["Admin Dashbo
 app.include_router(admin_landlord_users.router, prefix="/api/v1", tags=["Admin Landlord Users"])
 app.include_router(admin_tenant_users.router, prefix="/api/v1", tags=["Admin Tenant Users"])
 app.include_router(landlord_onboarding.router, tags=["Landlord Onboarding"])
-app.include_router(landlord_dashboard.router, tags=["Landlord Dashboard"])
+app.include_router(landlord_dashboard.router, prefix="/api/v1", tags=["Landlord Dashboard"])
+app.include_router(tenant_dashboard.router, prefix="/api/v1", tags=["Tenant Dashboard"])
 app.include_router(locations.router, tags=["Locations"])
 app.include_router(notifications.router, prefix="/api/v1", tags=["Notifications"])
 app.include_router(agreements.router, prefix="/api/v1", tags=["Agreements"])

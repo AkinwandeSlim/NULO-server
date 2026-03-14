@@ -313,20 +313,51 @@ async def get_property_maintenance_requests(
 ):
     """
     Get all maintenance requests for a specific property
-    Only property owner/landlord can view all requests for their property
+    - Landlords: Can view all requests for their properties
+    - Tenants: Can view requests only for properties they're actively renting
     """
     try:
-        # Verify user owns the property
+        # Verify property exists
         property_response = supabase_admin.table("properties").select("*").eq(
             "id", property_id
-        ).eq("landlord_id", current_user["id"]).execute()
+        ).execute()
         
         if not property_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Property not found or access denied"
+                detail="Property not found"
             )
         
+        property_data = property_response.data[0]
+        
+        # Check access permissions based on user type
+        if current_user["user_type"] == "landlord":
+            # Landlords can only view maintenance for their own properties
+            if property_data.get("landlord_id") != current_user["id"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: This property is not yours"
+                )
+        elif current_user["user_type"] == "tenant":
+            # Tenants can only view maintenance for properties they're actively renting
+            agreement_response = supabase_admin.table("agreements").select("id").eq(
+                "property_id", property_id
+            ).eq("tenant_id", current_user["id"]).eq(
+                "status", "ACTIVE"
+            ).execute()
+            
+            if not agreement_response.data:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: You must have an active agreement for this property to view maintenance"
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Only landlords and tenants can view maintenance"
+            )
+        
+        # Get maintenance requests
         query = supabase_admin.table("maintenance_requests").select("*").eq(
             "property_id", property_id
         )
@@ -336,7 +367,7 @@ async def get_property_maintenance_requests(
         
         response = query.order("created_at", desc=True).execute()
         
-        return response.data
+        return response.data if response.data else []
         
     except HTTPException:
         raise
