@@ -28,8 +28,54 @@ import math
 import json
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 router = APIRouter(prefix="/properties")
+executor = ThreadPoolExecutor(max_workers=4)
+
+# ============================================================================
+# IMAGE UPLOAD HELPER WITH TIMEOUT
+# ============================================================================
+
+async def upload_image_with_timeout(file_content: bytes, file_name: str, content_type: str, timeout: int = 30) -> Optional[str]:
+    """
+    Upload image to Supabase storage with timeout handling.
+    Returns public URL on success, None on failure.
+    """
+    try:
+        # Run storage upload in thread executor with timeout
+        def do_upload():
+            return supabase_admin.storage.from_("property-images").upload(
+                path=file_name,
+                file=file_content,
+                file_options={"content-type": content_type}
+            )
+        
+        # Execute with timeout
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(executor, do_upload),
+            timeout=timeout
+        )
+        
+        # Get public URL
+        def get_url():
+            return supabase_admin.storage.from_("property-images").get_public_url(file_name)
+        
+        public_url = await asyncio.wait_for(
+            loop.run_in_executor(executor, get_url),
+            timeout=10
+        )
+        
+        print(f"✅ Image uploaded: {public_url}")
+        return public_url
+        
+    except asyncio.TimeoutError:
+        print(f"⚠️ Image upload timed out after {timeout}s: {file_name}")
+        return None
+    except Exception as e:
+        print(f"⚠️ Image upload failed: {type(e).__name__}: {str(e)}")
+        return None
 
 # ============================================================================
 # OPTIMIZED BATCH OPERATIONS
@@ -613,7 +659,7 @@ async def get_property(
 # CREATE PROPERTY
 # ============================================================================
 
-@router.post("/")
+@router.post("")
 async def create_property(
     background_tasks: BackgroundTasks,
     title: str = Form(...),
@@ -672,39 +718,34 @@ async def create_property(
             amenities_list = []
             print(f"⚠️ [CREATE] Failed to parse amenities JSON, defaulting to []")
         
-        # Handle images - upload to Supabase storage
+        # Handle images - upload to Supabase storage with timeout protection
         image_urls = []
         if images:
             for image in images:
                 try:
-                    # Upload image to Supabase storage
+                    # Read file content
+                    file_content = await image.read()
                     file_extension = image.filename.split('.')[-1] if image.filename else 'jpg'
                     file_name = f"properties/{landlord_id}/{int(time.time())}_{image.filename}"
                     
-                    # Read file content
-                    file_content = await image.read()
-                    
-                    # Upload to Supabase storage
-                    storage_response = supabase_admin.storage.from_("property-images").upload(
-                        path=file_name,
-                        file=file_content,
-                        file_options={"content-type": image.content_type}
+                    # Upload with timeout (30 seconds per image)
+                    public_url = await upload_image_with_timeout(
+                        file_content=file_content,
+                        file_name=file_name,
+                        content_type=image.content_type or "image/jpeg",
+                        timeout=30
                     )
                     
-                    # Check if upload was successful (status 200 means success)
-                    if hasattr(storage_response, 'status_code') and storage_response.status_code == 200:
-                        # Get public URL
-                        public_url = supabase_admin.storage.from_("property-images").get_public_url(file_name)
+                    if public_url:
                         image_urls.append(public_url)
-                        print(f"✅ Image uploaded: {public_url}")
                     else:
-                        # Fallback to placeholder
+                        # Fallback to placeholder on timeout or failure
                         placeholder_url = f"https://images.unsplash.com/photo-{1560448204 + len(image_urls)}-e02f11c3d0e2?w=800&h=600&fit=crop"
                         image_urls.append(placeholder_url)
                         print(f"⚠️ Image upload failed, using placeholder: {placeholder_url}")
                         
                 except Exception as img_error:
-                    print(f"⚠️ Image upload failed: {img_error}")
+                    print(f"⚠️ Image processing error: {type(img_error).__name__}: {img_error}")
                     # Fallback to placeholder
                     placeholder_url = f"https://images.unsplash.com/photo-{1560448204 + len(image_urls)}-e02f11c3d0e2?w=800&h=600&fit=crop"
                     image_urls.append(placeholder_url)
