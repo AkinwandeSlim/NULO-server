@@ -95,8 +95,11 @@ async def add_favorite(
         tenant_id = current_user["id"]
         property_id = favorite_data.property_id
         
+        print(f"\n{'='*60}")
         print(f"📝 [ADD FAVORITE] Request from tenant: {tenant_id}")
         print(f"📝 [ADD FAVORITE] Property ID: {property_id}")
+        print(f"📝 [ADD FAVORITE] Current user data: {current_user}")
+        print(f"{'='*60}\n")
         
         # Check if property exists
         property_check = supabase_admin.table("properties").select("id").eq(
