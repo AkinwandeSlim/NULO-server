@@ -171,48 +171,71 @@ async def get_notifications(
     notification_type: Optional[str] = Query(None),
     current_user = Depends(get_current_user)
 ):
-    """Get notifications for current user"""
+    """Get notifications for current user with timeout protection"""
     try:
         user_id = current_user["id"]
         logger.info(f"🔔 [NOTIF] Fetching notifications for user: {user_id}")
         
-        # Build query
-        # Build query efficiently
-        query = supabase_admin.table("notifications").select("*").eq("user_id", user_id)
-        
-        # Apply filters
-        if unread_only:
-            query = query.eq("read", False)
-        
-        if notification_type:
-            query = query.eq("type", notification_type)
-        
-        # Apply pagination and ordering
-        result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-        
-        notifications = result.data or []
-        total_count = len(notifications)
-        
-        # Calculate unread count from fetched data (no extra DB call!)
-        unread_count = len([n for n in notifications if not n.get("read", False)])
-        
-        logger.info(f"🔔 [NOTIF] Retrieved {total_count} notifications ({unread_count} unread)")
-        
-        return {
-            "success": True,
-            "notifications": notifications,
-            "unread_count": unread_count,
-            "total_count": total_count,
-            "limit": limit,
-            "offset": offset
-        }
+        try:
+            # Build query efficiently with timeout protection
+            query = supabase_admin.table("notifications").select("*").eq("user_id", user_id)
+            
+            # Apply filters
+            if unread_only:
+                query = query.eq("read", False)
+            
+            if notification_type:
+                query = query.eq("type", notification_type)
+            
+            # Apply pagination and ordering - wrapp in try/except for timeout
+            result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+            
+            notifications = result.data or []
+            total_count = len(notifications)
+            
+            # Calculate unread count from fetched data (no extra DB call!)
+            unread_count = len([n for n in notifications if not n.get("read", False)])
+            
+            logger.info(f"🔔 [NOTIF] Retrieved {total_count} notifications ({unread_count} unread)")
+            
+            return {
+                "success": True,
+                "notifications": notifications,
+                "unread_count": unread_count,
+                "total_count": total_count,
+                "limit": limit,
+                "offset": offset
+            }
+            
+        except (TimeoutError, Exception) as db_error:
+            # Timeout or DB error - return empty list with 200 (graceful degradation)
+            if "timed out" in str(db_error).lower() or "timeout" in str(db_error).lower():
+                logger.warning(f"⚠️ [NOTIF] Database query timed out: {str(db_error)}")
+                return {
+                    "success": True,
+                    "notifications": [],  # Empty list on timeout
+                    "unread_count": 0,
+                    "total_count": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "warning": "Data temporarily unavailable - database timeout"
+                }
+            else:
+                # Re-raise other errors
+                raise db_error
     
     except Exception as e:
-        logger.error(f"🔔 [NOTIF] Error fetching notifications: {str(e)}")
-        # Return 401 if it's an auth error, 500 for other errors
+        logger.error(f"🔔 [NOTIF] Error fetching notifications: {type(e).__name__}: {str(e)}")
+        # Return 401 if it's an auth error
         if "Unauthorized" in str(e) or "401" in str(e):
             raise HTTPException(status_code=401, detail="Authentication failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return graceful error for other issues
+        raise HTTPException(status_code=200, detail={
+            "success": False,
+            "notifications": [],
+            "unread_count": 0,
+            "error": "Unable to fetch notifications"
+        })
 
 
 @router.get("/unread-count")
