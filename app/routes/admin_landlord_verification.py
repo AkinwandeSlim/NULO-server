@@ -48,14 +48,17 @@ async def sync_verification_status(landlord_id: str, onboarding_id: str, new_sta
         print(f"🔄 [SYNC] Syncing verification status for landlord {landlord_id}")
 
         if new_status == 'approved':
+            print(f"🔄 [SYNC] Updating user_type to 'landlord' and verification_status to 'approved' for landlord {landlord_id}")
             supabase_admin.table('users')\
                 .update({
+                    "user_type": "landlord",  # CRITICAL FIX: Ensure user_type remains landlord
                     "verification_status": "approved",
                     "trust_score": 80,
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 })\
                 .eq('id', landlord_id)\
                 .execute()
+            print(f"✅ [SYNC] User table updated - user_type='landlord', verification_status='approved'")
 
             supabase_admin.table('landlord_profiles')\
                 .update({
@@ -64,6 +67,30 @@ async def sync_verification_status(landlord_id: str, onboarding_id: str, new_sta
                 })\
                 .eq('id', landlord_id)\
                 .execute()
+
+            # CRITICAL: Sync Supabase auth metadata immediately after approval
+            # This ensures frontend gets the updated verification_status without race conditions
+            try:
+                print(f" [SYNC] Updating Supabase auth metadata for landlord {landlord_id}")
+                auth_update_result = supabase_admin.auth.admin.update_user_by_id(
+                    landlord_id,
+                    {
+                        "user_metadata": {
+                            "verification_status": "approved",
+                            "user_type": "landlord",  # reinforce correct type
+                            "trust_score": 80
+                        },
+                        "app_metadata": {
+                            "verification_status": "approved",
+                            "user_type": "landlord",  # reinforce correct type
+                            "trust_score": 80
+                        }
+                    }
+                )
+                print(f" [SYNC] Supabase auth metadata updated: {auth_update_result}")
+            except Exception as auth_err:
+                print(f" [SYNC] Failed to update Supabase auth metadata: {str(auth_err)}")
+                # Don't fail the approval - the database update succeeded
 
             print(f"✅ [SYNC] Approved: user.verification_status='approved', trust_score=80")
 

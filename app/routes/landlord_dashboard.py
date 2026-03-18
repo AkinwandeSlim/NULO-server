@@ -283,15 +283,27 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         stats["_fetch_failed"] = True
 
     # ── Query 4: Applications ────────────────────────────────────────────────
+    # IMPORTANT: applications table has NO landlord_id column
+    # Must get property_ids for this landlord first, then filter by them
     try:
-        apps = supabase_admin.table("applications") \
-            .select("id, status") \
+        # Step 1: Get landlord's property IDs
+        props = supabase_admin.table("properties") \
+            .select("id") \
             .eq("landlord_id", landlord_id).execute()
-        for app in (apps.data or []):
-            if app.get("status") == "pending":
-                stats["applications_pending"] += 1
-            elif app.get("status") == "approved":
-                stats["applications_approved"] += 1
+        
+        property_ids = [p["id"] for p in (props.data or [])]
+        
+        if property_ids:
+            # Step 2: Get applications for those properties
+            apps = supabase_admin.table("applications") \
+                .select("id, status") \
+                .in_("property_id", property_ids).execute()
+            
+            for app in (apps.data or []):
+                if app.get("status") == "pending":
+                    stats["applications_pending"] += 1
+                elif app.get("status") == "approved":
+                    stats["applications_approved"] += 1
     except Exception as e:
         logger.error(f"Stats query failed (applications): {e}")
         # Non-fatal -- applications table may not have landlord_id column yet

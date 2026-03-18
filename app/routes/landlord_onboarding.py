@@ -390,14 +390,42 @@ async def submit_complete_onboarding(
         print(f"✅ [ONBOARDING/submit] DB updated for {onboarding.get('id')}")
 
         # ── 3. Update users table ─────────────────────────────────────────────
+        print(f"🔄 [ONBOARDING/submit] Updating user_type to 'landlord' for user {current_user['id']}")
         supabase.table("users").update({
+            "user_type": "landlord",  # CRITICAL FIX: Ensure user_type is set to landlord
             "verification_status": "pending",
             "onboarding_completed": True,
             "onboarding_step": 5,
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("id", current_user["id"]).execute()
+        print(f"✅ [ONBOARDING/submit] User table updated - user_type='landlord', verification_status='pending'")
 
-        # ── 4. Fire notifications via notification_service (non-fatal) ────────
+        # ── 4. CRITICAL: Update Supabase auth metadata immediately ───────────────
+        print(f"🔄 [ONBOARDING/submit] Updating Supabase auth metadata for user {current_user['id']}")
+        try:
+            auth_update_result = supabase_admin.auth.admin.update_user_by_id(
+                current_user["id"],
+                {
+                    "user_metadata": {
+                        "user_type": "landlord",
+                        "verification_status": "pending",
+                        "onboarding_completed": True,
+                        "onboarding_step": 5,
+                    },
+                    "app_metadata": {
+                        "user_type": "landlord",
+                        "verification_status": "pending",
+                        "onboarding_completed": True,
+                        "onboarding_step": 5,
+                    }
+                }
+            )
+            print(f"✅ [ONBOARDING/submit] Supabase auth metadata updated successfully")
+        except Exception as auth_error:
+            print(f"⚠️ [ONBOARDING/submit] Failed to update auth metadata: {auth_error}")
+            # Don't fail the request, but log the error
+
+        # ── 5. Fire notifications via notification_service (non-fatal) ────────
         try:
             user_r = supabase.table("users").select("email, full_name").eq(
                 "id", current_user["id"]

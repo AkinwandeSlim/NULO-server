@@ -86,7 +86,9 @@ def get_supabase_client() -> Client:
 @retry_on_timeout(max_retries=3, delay=1.0)
 def get_supabase_admin() -> Client:
     """Get Supabase admin client (service role key) with optimizations"""
-    return create_optimized_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+    # Use SERVICE_ROLE_KEY for admin operations (has auth admin privileges)
+    service_key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+    return create_optimized_client(settings.SUPABASE_URL, service_key)
 
 
 # Global instances with connection pooling (via @lru_cache)
