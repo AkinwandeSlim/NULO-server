@@ -551,9 +551,9 @@ class NotificationService:
         create_notification(
             user_id=user_id,
             notif_type="onboarding_submitted",
-            title="Application Submitted! ⏳",
+            title="Account Verification Submitted! ⏳",
             message=(
-                "Your landlord verification application has been submitted. "
+                "Your landlord account verification  has been submitted. "
                 "Our team will review it within 24–48 hours. "
                 "You'll be notified once a decision is made."
             ),
