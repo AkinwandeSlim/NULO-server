@@ -19,8 +19,11 @@ from ..models.landlord_onboarding import (
 from ..middleware.auth import get_current_user, get_current_admin
 from ..services.email_service import email_service
 from ..services.notification_service import notification_service
+from ..config import settings
+from ..middleware.token_cache import token_cache
 from datetime import datetime
 import os
+import asyncio
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/onboarding", tags=["landlord-onboarding"])
@@ -401,9 +404,10 @@ async def submit_complete_onboarding(
         print(f"✅ [ONBOARDING/submit] User table updated - user_type='landlord', verification_status='pending'")
 
         # ── 4. CRITICAL: Update Supabase auth metadata immediately ───────────────
-        print(f"🔄 [ONBOARDING/submit] Updating Supabase auth metadata for user {current_user['id']}")
+        print(f"🔄 [ONBOARDING/submit] Updating auth metadata for {current_user['id']}")
         try:
-            auth_update_result = supabase_admin.auth.admin.update_user_by_id(
+            supabase_admin.postgrest.auth(settings.SUPABASE_SERVICE_KEY)
+            supabase_admin.auth.admin.update_user_by_id(
                 current_user["id"],
                 {
                     "user_metadata": {
@@ -420,10 +424,10 @@ async def submit_complete_onboarding(
                     }
                 }
             )
-            print(f"✅ [ONBOARDING/submit] Supabase auth metadata updated successfully")
-        except Exception as auth_error:
-            print(f"⚠️ [ONBOARDING/submit] Failed to update auth metadata: {auth_error}")
-            # Don't fail the request, but log the error
+            print(f"✅ [ONBOARDING/submit] Auth metadata updated for {current_user['id']}")
+        except Exception as meta_err:
+            print(f"⚠️ [ONBOARDING/submit] Auth metadata update failed (non-fatal): {str(meta_err)}")
+            # Non-fatal — DB already updated correctly above
 
         # ── 5. Fire notifications via notification_service (non-fatal) ────────
         try:
@@ -453,7 +457,14 @@ async def submit_complete_onboarding(
         except Exception as _ne:
             logger.warning(f"⚠️ [ONBOARDING/submit] Notifications failed (non-fatal): {_ne}")
 
-        # ── 5. Return ─────────────────────────────────────────────────────────
+        # ── 6. Clear token cache so next API request re-reads user from DB
+        try:
+            asyncio.create_task(token_cache.clear())
+            print("🧹 [ONBOARDING/submit] Token cache cleared")
+        except Exception as cache_err:
+            print(f"⚠️ [ONBOARDING/submit] Token cache clear failed (non-fatal): {cache_err}")
+
+        # ── 7. Return ─────────────────────────────────────────────────────────
         return {
             "success": True,
             "message": "Onboarding submitted successfully for admin review",
