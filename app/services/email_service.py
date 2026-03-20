@@ -1,9 +1,10 @@
 """
-Simple Email Service using Gmail SMTP
+Email Service using Resend (primary) or SMTP (fallback)
 """
 
 import os
 import smtplib
+import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import List
@@ -14,17 +15,27 @@ logger = logging.getLogger(__name__)
 
 class EmailService:
     def __init__(self):
+        # Resend configuration (preferred)
+        self.resend_api_key = settings.RESEND_API_KEY
+        self.from_email = settings.FROM_EMAIL
+        self.from_display = f"Nulo Africa <{self.from_email}>"
+        
+        # SMTP configuration (fallback)
         self.smtp_server = settings.SMTP_HOST or "smtp.gmail.com"
         self.smtp_port = int(settings.SMTP_PORT or 587)
         self.smtp_username = settings.SMTP_USER or os.getenv("SMTP_USER", "your-email@gmail.com")
         self.smtp_password = settings.SMTP_PASSWORD or os.getenv("SMTP_PASSWORD", "your-app-password")
-        self.from_email = os.getenv("FROM_EMAIL", settings.SMTP_USER or "noreply@nulo.com")
-        self.from_display = f"Nulo Africa <{self.from_email}>"
-        # FIX: Changed fallback from "https://nulo-africa.vercel.app" to
-        # "http://localhost:3000" so local dev always gets local URLs.
-        # In production, BASE_URL is set in .env to the live domain —
-        # that env value takes priority over this fallback in both environments.
+        
+        # Base URL for links
         self.base_url = os.getenv("BASE_URL", "http://localhost:3000")
+        
+        # Determine email method
+        self.use_resend = bool(self.resend_api_key)
+        
+        if self.use_resend:
+            print(f"📧 [EMAIL] Using Resend API")
+        else:
+            print(f"📧 [EMAIL] Using SMTP fallback: {self.smtp_server}:{self.smtp_port}")
 
     def send_landlord_onboarding_notification(
         self,
@@ -37,8 +48,6 @@ class EmailService:
 
         subject = f"🔔 New Landlord Verification: {landlord_name}"
 
-        # FIX: Was hardcoded to "http://localhost:3000/admin/..." — now uses
-        # self.base_url so the link is correct in both local and prod environments.
         html_content = f"""
         <html>
         <body style="font-family: Arial, sans-serif;">
@@ -62,20 +71,7 @@ class EmailService:
 
         try:
             for admin_email in admin_emails:
-                msg = MIMEMultipart('alternative')
-                msg['Subject'] = subject
-                msg['From'] = self.from_email
-                msg['To'] = admin_email
-
-                html_part = MIMEText(html_content, 'html')
-                msg.attach(html_part)
-
-                with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                    server.starttls()
-                    server.login(self.smtp_username, self.smtp_password)
-                    server.send_message(msg)
-
-                print(f"✅ [EMAIL] Sent to {admin_email}")
+                return self._send_email(admin_email, subject, html_content)
 
             return True
 
@@ -306,10 +302,70 @@ NuloAfrica - Zero Agency Fee Rental Platform
         return self._send_email(tenant_email, subject, html_content, text_content)
 
     def _send_email(self, to_email: str, subject: str, html_content: str, text_content: str = None):
-        """Internal method to send email via SMTP"""
+        """Send email using Resend (primary) or SMTP (fallback)"""
+        
+        if self.use_resend:
+            return self._send_via_resend(to_email, subject, html_content, text_content)
+        else:
+            return self._send_via_smtp(to_email, subject, html_content, text_content)
+    
+    def _send_via_resend(self, to_email: str, subject: str, html_content: str, text_content: str = None):
+        """Send email via Resend API"""
         try:
-            print(f"📧 [EMAIL] Sending to {to_email}: {subject}")
-            logger.info(f"🔧 [EMAIL CONFIG] Server: {self.smtp_server}:{self.smtp_port}, From: {self.from_email}")
+            print(f"📧 [RESEND] Sending to {to_email}: {subject}")
+            logger.info(f"🔧 [RESEND CONFIG] From: {self.from_email}")
+            
+            # Prepare email data for Resend
+            email_data = {
+                "from": self.from_display,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_content
+            }
+            
+            # Add text content if provided
+            if text_content:
+                email_data["text"] = text_content
+            
+            # Send via Resend API
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {self.resend_api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=email_data
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    message_id = result.get("id")
+                    logger.info(f"✅ [RESEND] Email sent successfully. Message ID: {message_id}")
+                    print(f"✅ [RESEND] Successfully sent to {to_email}")
+                    return {"success": True, "message_id": message_id}
+                else:
+                    error_msg = f"❌ [RESEND] API Error {response.status_code}: {response.text}"
+                    logger.error(error_msg)
+                    print(error_msg)
+                    return {"success": False, "error": f"API Error {response.status_code}"}
+                    
+        except httpx.TimeoutException:
+            error_msg = "❌ [RESEND] Request timeout"
+            logger.error(error_msg)
+            print(error_msg)
+            return {"success": False, "error": "Request timeout"}
+        except Exception as e:
+            error_msg = f"❌ [RESEND] Failed to send: {str(e)}"
+            logger.error(error_msg)
+            print(error_msg)
+            return {"success": False, "error": str(e)}
+    
+    def _send_via_smtp(self, to_email: str, subject: str, html_content: str, text_content: str = None):
+        """Send email via SMTP (fallback method)"""
+        try:
+            print(f"📧 [SMTP] Sending to {to_email}: {subject}")
+            logger.info(f"🔧 [SMTP CONFIG] Server: {self.smtp_server}:{self.smtp_port}, From: {self.from_email}")
 
             msg = MIMEMultipart('alternative')
             msg['Subject'] = subject
@@ -321,42 +377,42 @@ NuloAfrica - Zero Agency Fee Rental Platform
 
             msg.attach(MIMEText(html_content, 'html'))
 
-            logger.info(f"🔐 [EMAIL] Attempting SMTP connection to {self.smtp_server}:{self.smtp_port}")
+            logger.info(f"🔐 [SMTP] Attempting SMTP connection to {self.smtp_server}:{self.smtp_port}")
 
             try:
                 from email.utils import make_msgid
                 msgid = make_msgid()
                 msg['Message-ID'] = msgid
-                logger.info(f"🔎 [EMAIL] Message-ID: {msgid}")
+                logger.info(f"🔎 [SMTP] Message-ID: {msgid}")
             except Exception:
                 msgid = None
 
             with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10) as server:
-                logger.info(f"✅ [EMAIL] SMTP connection established")
+                logger.info(f"✅ [SMTP] SMTP connection established")
                 server.starttls()
-                logger.info(f"🔒 [EMAIL] TLS enabled")
+                logger.info(f"🔒 [SMTP] TLS enabled")
                 server.login(self.smtp_username, self.smtp_password)
-                logger.info(f"✅ [EMAIL] Authentication successful")
+                logger.info(f"✅ [SMTP] Authentication successful")
                 server.send_message(msg)
-                logger.info(f"✅ [EMAIL] Message sent successfully")
+                logger.info(f"✅ [SMTP] Message sent successfully")
                 if msgid:
-                    logger.info(f"📥 [EMAIL] Sent Message-ID {msgid} to {to_email}")
+                    logger.info(f"📥 [SMTP] Sent Message-ID {msgid} to {to_email}")
 
-            print(f"✅ [EMAIL] Successfully sent to {to_email}")
+            print(f"✅ [SMTP] Successfully sent to {to_email}")
             return {"success": True, "message_id": msgid}
 
         except smtplib.SMTPAuthenticationError as auth_err:
-            error_msg = f"❌ [EMAIL] Authentication failed: Check SMTP_USER and SMTP_PASSWORD in .env - {str(auth_err)}"
+            error_msg = f"❌ [SMTP] Authentication failed: Check SMTP_USER and SMTP_PASSWORD in .env - {str(auth_err)}"
             logger.error(error_msg)
             print(error_msg)
             return {"success": False, "error": str(auth_err)}
         except smtplib.SMTPException as smtp_err:
-            error_msg = f"❌ [EMAIL] SMTP Error: {str(smtp_err)}"
+            error_msg = f"❌ [SMTP] SMTP Error: {str(smtp_err)}"
             logger.error(error_msg)
             print(error_msg)
             return {"success": False, "error": str(smtp_err)}
         except Exception as e:
-            error_msg = f"❌ [EMAIL] Failed to send: {str(e)}"
+            error_msg = f"❌ [SMTP] Failed to send: {str(e)}"
             logger.error(error_msg)
             print(error_msg)
             return {"success": False, "error": str(e)}

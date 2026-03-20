@@ -15,11 +15,16 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_KEY: str
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
 
-    # SMTP
-    SMTP_HOST: str
-    SMTP_PORT: int
-    SMTP_USER: str
-    SMTP_PASSWORD: str
+    # Email Configuration (Resend preferred over SMTP)
+    # Resend settings (recommended for production)
+    RESEND_API_KEY: str | None = None
+    FROM_EMAIL: str = "noreply@nuloafrica.com"
+    
+    # SMTP settings (fallback for development)
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int | None = None
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
     
     # JWT
     JWT_SECRET_KEY: str
