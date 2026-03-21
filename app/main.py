@@ -1,7 +1,7 @@
 """
 Nulo Africa - FastAPI Backend
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -43,6 +43,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"🔍 [REQUEST] {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"🔍 [RESPONSE] {request.method} {request.url} - {response.status_code}")
+    return response
 
 # Validation error handler
 @app.exception_handler(RequestValidationError)

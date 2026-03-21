@@ -33,7 +33,7 @@ class ViewingRequestUpdate(BaseModel):
 
 
 class LandlordViewingReview(BaseModel):
-    status: Literal['confirmed', 'cancelled']
+    status: Literal['confirmed', 'cancelled', 'pending', 'completed']
     landlord_notes: Optional[str] = None
     confirmed_date: Optional[str] = None   # YYYY-MM-DD
     confirmed_time: Optional[str] = None   # e.g. "10:00 AM"
@@ -365,6 +365,10 @@ async def review_viewing_request(
 ):
     """Landlord confirms or cancels a viewing request, then fires notification"""
     try:
+        logger.info(f"🔍 [REVIEW] Received review request for ID: {request_id}")
+        logger.info(f"🔍 [REVIEW] Review data: {review_data}")
+        logger.info(f"🔍 [REVIEW] Current user: {current_user['id']}")
+        
         landlord_id = current_user["id"]
 
         existing = supabase_admin.table("viewing_requests").select("*").eq(
@@ -419,9 +423,14 @@ async def review_viewing_request(
             "viewing_request": response.data[0],
         }
 
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"❌ [REVIEW] HTTP Exception: {he.status_code} - {he.detail}")
         raise
     except Exception as e:
+        logger.error(f"❌ [REVIEW] Failed to review viewing request: {str(e)}")
+        logger.error(f"❌ [REVIEW] Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"❌ [REVIEW] Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to review viewing request: {str(e)}"
