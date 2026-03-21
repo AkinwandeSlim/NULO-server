@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_KEY: str
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
 
-    # Email Configuration (Resend preferred over SMTP)
-    # Resend settings (recommended for production)
-    RESEND_API_KEY: str | None = None
+    # Email Configuration (Brevo preferred over SMTP)
+    # Brevo settings (recommended for production)
+    BREVO_API_KEY: str | None = None
     FROM_EMAIL: str = "noreply@nuloafrica.com"
     
     # SMTP settings (fallback for development)

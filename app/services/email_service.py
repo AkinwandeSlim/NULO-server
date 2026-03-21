@@ -1,5 +1,5 @@
 """
-Email Service using Resend (primary) or SMTP (fallback)
+Email Service using Brevo (primary) or SMTP (fallback)
 """
 
 import os
@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 class EmailService:
     def __init__(self):
-        # Resend configuration (preferred)
-        self.resend_api_key = settings.RESEND_API_KEY
+        # Brevo configuration (preferred)
+        self.brevo_api_key = settings.BREVO_API_KEY
         self.from_email = settings.FROM_EMAIL
         self.from_display = f"Nulo Africa <{self.from_email}>"
         
@@ -30,10 +30,10 @@ class EmailService:
         self.base_url = os.getenv("BASE_URL", "http://localhost:3000")
         
         # Determine email method
-        self.use_resend = bool(self.resend_api_key)
+        self.use_brevo = bool(self.brevo_api_key)
         
-        if self.use_resend:
-            print(f"📧 [EMAIL] Using Resend API")
+        if self.use_brevo:
+            print(f"📧 [EMAIL] Using Brevo API")
         else:
             print(f"📧 [EMAIL] Using SMTP fallback: {self.smtp_server}:{self.smtp_port}")
 
@@ -302,61 +302,46 @@ NuloAfrica - Zero Agency Fee Rental Platform
         return self._send_email(tenant_email, subject, html_content, text_content)
 
     def _send_email(self, to_email: str, subject: str, html_content: str, text_content: str = None):
-        """Send email using Resend (primary) or SMTP (fallback)"""
+        """Send email using Brevo (primary) or SMTP (fallback)"""
         
-        if self.use_resend:
-            return self._send_via_resend(to_email, subject, html_content, text_content)
+        if self.use_brevo:
+            return self._send_via_brevo(to_email, subject, html_content, text_content)
         else:
             return self._send_via_smtp(to_email, subject, html_content, text_content)
     
-    def _send_via_resend(self, to_email: str, subject: str, html_content: str, text_content: str = None):
-        """Send email via Resend API"""
+    def _send_via_brevo(self, to_email, subject, html_content, text_content=None):
         try:
-            print(f"📧 [RESEND] Sending to {to_email}: {subject}")
-            logger.info(f"🔧 [RESEND CONFIG] From: {self.from_email}")
-            
-            # Prepare email data for Resend
-            email_data = {
-                "from": self.from_display,
-                "to": [to_email],
+            print(f"📧 [BREVO] Sending to {to_email}: {subject}")
+            payload = {
+                "sender": {"name": "Nulo Africa", "email": self.from_email},
+                "to": [{"email": to_email}],
                 "subject": subject,
-                "html": html_content
+                "htmlContent": html_content
             }
-            
-            # Add text content if provided
             if text_content:
-                email_data["text"] = text_content
-            
-            # Send via Resend API
+                payload["textContent"] = text_content
+
             with httpx.Client(timeout=30.0) as client:
                 response = client.post(
-                    "https://api.resend.com/emails",
+                    "https://api.brevo.com/v3/smtp/email",
                     headers={
-                        "Authorization": f"Bearer {self.resend_api_key}",
+                        "api-key": self.brevo_api_key,
                         "Content-Type": "application/json"
                     },
-                    json=email_data
+                    json=payload
                 )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    message_id = result.get("id")
-                    logger.info(f"✅ [RESEND] Email sent successfully. Message ID: {message_id}")
-                    print(f"✅ [RESEND] Successfully sent to {to_email}")
-                    return {"success": True, "message_id": message_id}
-                else:
-                    error_msg = f"❌ [RESEND] API Error {response.status_code}: {response.text}"
-                    logger.error(error_msg)
-                    print(error_msg)
-                    return {"success": False, "error": f"API Error {response.status_code}"}
-                    
-        except httpx.TimeoutException:
-            error_msg = "❌ [RESEND] Request timeout"
-            logger.error(error_msg)
-            print(error_msg)
-            return {"success": False, "error": "Request timeout"}
+            if response.status_code == 201:
+                message_id = response.json().get("messageId")
+                logger.info(f"✅ [BREVO] Email sent successfully. Message ID: {message_id}")
+                print(f"✅ [BREVO] Successfully sent to {to_email}")
+                return {"success": True, "message_id": message_id}
+            else:
+                error_msg = f"❌ [BREVO] API Error {response.status_code}: {response.text}"
+                logger.error(error_msg)
+                print(error_msg)
+                return {"success": False, "error": f"API Error {response.status_code}"}
         except Exception as e:
-            error_msg = f"❌ [RESEND] Failed to send: {str(e)}"
+            error_msg = f"❌ [BREVO] Failed: {str(e)}"
             logger.error(error_msg)
             print(error_msg)
             return {"success": False, "error": str(e)}
