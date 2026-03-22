@@ -29,6 +29,7 @@ class TenantStats(BaseModel):
     totalFavorites: int
     pendingViewings: int
     confirmedViewings: int
+    completedViewings: int
     propertiesContacted: int
     totalConversations: int
     unreadMessages: int
@@ -182,6 +183,17 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
         stats["confirmedViewings"] = len(confirmed.data or [])
     except Exception as e:
         logger.error(f"Stats query failed (confirmed viewings): {e}")
+        stats["_fetch_failed"] = True
+
+    try:
+        completed = supabase_admin.table("viewing_requests") \
+            .select("id") \
+            .eq("tenant_id", tenant_id) \
+            .eq("status", "completed").execute()
+        stats["completedViewings"] = len(completed.data or [])
+    except Exception as e:
+        logger.error(f"Stats query failed (completed viewings): {e}")
+        stats["completedViewings"] = 0  # Default value on error
         stats["_fetch_failed"] = True
 
     try:

@@ -183,7 +183,7 @@ NuloAfrica - Zero Agency Fee Rental Platform
                     <p>Please make sure you're available at the scheduled time.</p>
 
                     <p>
-                        <a href="{self.base_url}/landlord/viewings/{viewing_id}"
+                        <a href="{self.base_url}/landlord/viewings"
                             style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
                             View Details & Contact Tenant
                         </a>
@@ -214,7 +214,7 @@ Time: {time}
 
 Please make sure you're available at the scheduled time.
 
-View Details: {self.base_url}/landlord/viewings/{viewing_id}
+View Details: {self.base_url}/landlord/viewings
 
 ---
 NuloAfrica - Zero Agency Fee Rental Platform
