@@ -559,7 +559,7 @@ async def paystack_webhook(request: Request):
 async def get_my_payments(
     current_user: dict = Depends(get_current_tenant),
 ):
-    """Tenant's full payment history, newest first."""
+    """Tenant's full payment history, newest first - OPTIMIZED with batch loading."""
     try:
         # Get transactions for this tenant
         resp = supabase_admin.table("transactions").select(
@@ -571,30 +571,36 @@ async def get_my_payments(
 
         transactions = resp.data or []
         
-        # Enrich each transaction with property and landlord data
+        if not transactions:
+            return {"success": True, "payments": []}
+        
+        # OPTIMIZATION: Batch-fetch all properties and landlords instead of N+1 queries
+        property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
+        landlord_ids = list({t["landlord_id"] for t in transactions if t.get("landlord_id")})
+        
+        # Batch-fetch properties
+        properties_map = {}
+        if property_ids:
+            props_resp = supabase_admin.table("properties").select(
+                "id, title, location, city, state, address, full_address, price, images"
+            ).in_("id", property_ids).execute()
+            properties_map = {p["id"]: p for p in (props_resp.data or [])}
+        
+        # Batch-fetch landlords
+        landlords_map = {}
+        if landlord_ids:
+            landlords_resp = supabase_admin.table("users").select(
+                "id, full_name, email, phone_number, avatar_url"
+            ).in_("id", landlord_ids).execute()
+            landlords_map = {l["id"]: l for l in (landlords_resp.data or [])}
+        
+        # Enrich transactions with pre-fetched data (no more DB queries)
         enriched_transactions = []
         for txn in transactions:
-            # Fetch property details
-            property_data = None
-            if txn.get("property_id"):
-                property_data = _fetch_property_details(txn["property_id"])
-            
-            # Fetch landlord details
-            landlord_data = None
-            if txn.get("landlord_id"):
-                try:
-                    landlord_resp = supabase_admin.table("users").select(
-                        "id, full_name, email, phone_number, avatar_url"
-                    ).eq("id", txn["landlord_id"]).single().execute()
-                    landlord_data = landlord_resp.data
-                except Exception as e:
-                    logger.warning(f"[PAY] Could not fetch landlord {txn.get('landlord_id')}: {e}")
-            
-            # Combine data
             enriched_txn = {
                 **txn,
-                "property": property_data,
-                "landlord": landlord_data
+                "property": properties_map.get(txn.get("property_id")),
+                "landlord": landlords_map.get(txn.get("landlord_id"))
             }
             enriched_transactions.append(enriched_txn)
 
@@ -612,7 +618,7 @@ async def get_my_payments(
 async def get_received_payments(
     current_user: dict = Depends(get_current_landlord),
 ):
-    """Landlord's received payments with tenant and property info."""
+    """Landlord's received payments with tenant and property info - OPTIMIZED with batch loading."""
     try:
         # Get transactions for this landlord
         resp = supabase_admin.table("transactions").select(
@@ -624,30 +630,36 @@ async def get_received_payments(
 
         transactions = resp.data or []
         
-        # Enrich each transaction with property and tenant data
+        if not transactions:
+            return {"success": True, "payments": []}
+        
+        # OPTIMIZATION: Batch-fetch all properties and tenants instead of N+1 queries
+        property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
+        tenant_ids = list({t["tenant_id"] for t in transactions if t.get("tenant_id")})
+        
+        # Batch-fetch properties
+        properties_map = {}
+        if property_ids:
+            props_resp = supabase_admin.table("properties").select(
+                "id, title, location, city, state, address, full_address, price, images"
+            ).in_("id", property_ids).execute()
+            properties_map = {p["id"]: p for p in (props_resp.data or [])}
+        
+        # Batch-fetch tenants
+        tenants_map = {}
+        if tenant_ids:
+            tenants_resp = supabase_admin.table("users").select(
+                "id, full_name, email, phone_number, avatar_url"
+            ).in_("id", tenant_ids).execute()
+            tenants_map = {t["id"]: t for t in (tenants_resp.data or [])}
+        
+        # Enrich transactions with pre-fetched data (no more DB queries)
         enriched_transactions = []
         for txn in transactions:
-            # Fetch property details
-            property_data = None
-            if txn.get("property_id"):
-                property_data = _fetch_property_details(txn["property_id"])
-            
-            # Fetch tenant details
-            tenant_data = None
-            if txn.get("tenant_id"):
-                try:
-                    tenant_resp = supabase_admin.table("users").select(
-                        "id, full_name, email, phone_number, avatar_url"
-                    ).eq("id", txn["tenant_id"]).single().execute()
-                    tenant_data = tenant_resp.data
-                except Exception as e:
-                    logger.warning(f"[PAY] Could not fetch tenant {txn.get('tenant_id')}: {e}")
-            
-            # Combine data
             enriched_txn = {
                 **txn,
-                "property": property_data,
-                "tenant": tenant_data
+                "property": properties_map.get(txn.get("property_id")),
+                "tenant": tenants_map.get(txn.get("tenant_id"))
             }
             enriched_transactions.append(enriched_txn)
 

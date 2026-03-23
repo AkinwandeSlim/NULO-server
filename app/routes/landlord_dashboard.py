@@ -115,6 +115,7 @@ class DashboardResponse(BaseModel):
     viewing_requests: List[dict] = []
     received_applications: List[dict] = []
     agreements: List[dict] = []
+    received_payments: List[dict] = []  # Cached payments for real-time stat updates
 
 
 # ============================================================================
@@ -671,6 +672,48 @@ async def get_landlord_dashboard(
                 logger.error("Failed to get agreements: %s", str(e))
                 return []
 
+        def fetch_payments():
+            # Fetch received payments for real-time stat updates
+            # transactions table has landlord_id directly
+            try:
+                result = supabase_admin.table("transactions") \
+                    .select(
+                        "id, tenant_id, property_id, agreement_id, application_id, "
+                        "amount, currency, status, transaction_type, payment_gateway, "
+                        "paystack_ref, held_at, released_at, refunded_at, "
+                        "notes, created_at, updated_at"
+                    ) \
+                    .eq("landlord_id", landlord_id) \
+                    .order("created_at", desc=True) \
+                    .limit(100) \
+                    .execute()
+                rows = result.data or []
+
+                # Batch-fetch tenant and property data
+                tenant_ids = list({r["tenant_id"] for r in rows if r.get("tenant_id")})
+                property_ids = list({r["property_id"] for r in rows if r.get("property_id")})
+
+                tenants_map = {}
+                props_map = {}
+                if tenant_ids:
+                    t_res = supabase_admin.table("users") \
+                        .select("id, full_name, email, phone_number, avatar_url") \
+                        .in_("id", tenant_ids).execute()
+                    tenants_map = {t["id"]: t for t in (t_res.data or [])}
+                if property_ids:
+                    p_res = supabase_admin.table("properties") \
+                        .select("id, title, address, city") \
+                        .in_("id", property_ids).execute()
+                    props_map = {p["id"]: p for p in (p_res.data or [])}
+
+                for row in rows:
+                    row["tenant"] = tenants_map.get(row.get("tenant_id"), {})
+                    row["property"] = props_map.get(row.get("property_id"), {})
+                return rows
+            except Exception as e:
+                logger.error("Failed to get payments: %s", str(e))
+                return []
+
         # profile is needed to build the response model -- fetch first if not cached
         try:
             profile_data = get_landlord_profile(landlord_id)
@@ -699,9 +742,9 @@ async def get_landlord_dashboard(
                 "updated_at": now,
             }
 
-        # Run remaining 8 fetches in parallel
+        # Run remaining 9 fetches in parallel
         loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=9) as executor:
             futures = [
                 loop.run_in_executor(executor, fetch_onboarding),
                 loop.run_in_executor(executor, fetch_stats),
@@ -711,12 +754,13 @@ async def get_landlord_dashboard(
                 loop.run_in_executor(executor, fetch_viewing_requests),
                 loop.run_in_executor(executor, fetch_received_applications),
                 loop.run_in_executor(executor, fetch_agreements),
+                loop.run_in_executor(executor, fetch_payments),
             ]
             results = await asyncio.gather(*futures)
 
         (onboarding_data, stats_data, properties_data, activity_data,
          notifications_data, viewing_requests_data,
-         received_applications_data, agreements_data) = results
+         received_applications_data, agreements_data, payments_data) = results
         print(f"✅ [LANDLORD DASHBOARD] All parallel fetches complete")
 
         
@@ -731,6 +775,7 @@ async def get_landlord_dashboard(
             "viewing_requests": viewing_requests_data,
             "received_applications": received_applications_data,
             "agreements": agreements_data,
+            "received_payments": payments_data,
         }
         
         # Only cache when stats fetched cleanly -- never cache a degraded response
