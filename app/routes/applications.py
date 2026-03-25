@@ -61,7 +61,11 @@ async def create_application(
     Submit rental application (tenants only)
     Requires 100% profile completion (deferred KYC gate)
     """
-    logger.info(f"📋 [APP] Received application data: {application_data.dict()}")
+    logger.info(f"📋 [APP] Received application request")
+    logger.info(f"📋 [APP] Property ID: {application_data.property_id}")
+    logger.info(f"📋 [APP] Viewing ID: {application_data.viewing_id}")
+    logger.info(f"📋 [APP] References type: {type(application_data.references)}, value: {application_data.references}")
+    logger.info(f"📋 [APP] Documents type: {type(application_data.documents)}, count: {len(application_data.documents) if application_data.documents else 0}")
     
     try:
         tenant_id = current_user["id"]
@@ -135,9 +139,13 @@ async def create_application(
         app_response = supabase_admin.table("applications").insert(app_dict).execute()
         
         if not app_response.data:
+            logger.error(f"❌ [APP] Failed to create application - insert returned no data")
+            logger.error(f"❌ [APP] Insert dict: {app_dict}")
+            if hasattr(app_response, 'error') and app_response.error:
+                logger.error(f"❌ [APP] Supabase error: {app_response.error}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to create application"
+                detail="Failed to create application: check server logs"
             )
         
         application = app_response.data[0]

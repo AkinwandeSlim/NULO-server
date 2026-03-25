@@ -574,37 +574,70 @@ async def get_my_payments(
         if not transactions:
             return {"success": True, "payments": []}
         
-        # OPTIMIZATION: Batch-fetch all properties and landlords instead of N+1 queries
-        property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
-        landlord_ids = list({t["landlord_id"] for t in transactions if t.get("landlord_id")})
-        
-        # Batch-fetch properties
-        properties_map = {}
-        if property_ids:
-            props_resp = supabase_admin.table("properties").select(
-                "id, title, location, city, state, address, full_address, price, images"
-            ).in_("id", property_ids).execute()
-            properties_map = {p["id"]: p for p in (props_resp.data or [])}
-        
-        # Batch-fetch landlords
-        landlords_map = {}
-        if landlord_ids:
-            landlords_resp = supabase_admin.table("users").select(
-                "id, full_name, email, phone_number, avatar_url"
-            ).in_("id", landlord_ids).execute()
-            landlords_map = {l["id"]: l for l in (landlords_resp.data or [])}
-        
-        # Enrich transactions with pre-fetched data (no more DB queries)
-        enriched_transactions = []
-        for txn in transactions:
-            enriched_txn = {
-                **txn,
-                "property": properties_map.get(txn.get("property_id")),
-                "landlord": landlords_map.get(txn.get("landlord_id"))
-            }
-            enriched_transactions.append(enriched_txn)
+        try:
+            # OPTIMIZATION: Batch-fetch all properties and landlords instead of N+1 queries
+            property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
+            landlord_ids = list({t["landlord_id"] for t in transactions if t.get("landlord_id")})
+            
+            # Batch-fetch properties
+            properties_map = {}
+            if property_ids:
+                try:
+                    props_resp = supabase_admin.table("properties").select(
+                        "id, title, location, city, state, address, full_address, price, images"
+                    ).in_("id", property_ids).execute()
+                    properties_map = {p["id"]: p for p in (props_resp.data or [])}
+                except Exception as e:
+                    logger.warning(f"[PAY] Failed to batch-fetch properties: {e}")
+            
+            # Batch-fetch landlords
+            landlords_map = {}
+            if landlord_ids:
+                try:
+                    landlords_resp = supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).in_("id", landlord_ids).execute()
+                    landlords_map = {l["id"]: l for l in (landlords_resp.data or [])}
+                except Exception as e:
+                    logger.warning(f"[PAY] Failed to batch-fetch landlords: {e}")
+            
+            # Enrich transactions with pre-fetched data (no more DB queries)
+            # Ensure proper serialization by explicitly mapping fields
+            enriched_transactions = []
+            for txn in transactions:
+                property_data = properties_map.get(txn.get("property_id"))
+                landlord_data = landlords_map.get(txn.get("landlord_id"))
+                
+                enriched_txn = {
+                    "id": txn.get("id"),
+                    "tenant_id": txn.get("tenant_id"),
+                    "landlord_id": txn.get("landlord_id"),
+                    "property_id": txn.get("property_id"),
+                    "agreement_id": txn.get("agreement_id"),
+                    "application_id": txn.get("application_id"),
+                    "amount": txn.get("amount"),
+                    "currency": txn.get("currency"),
+                    "status": txn.get("status"),
+                    "transaction_type": txn.get("transaction_type"),
+                    "payment_gateway": txn.get("payment_gateway"),
+                    "paystack_ref": txn.get("paystack_ref"),
+                    "paystack_access_code": txn.get("paystack_access_code"),
+                    "held_at": txn.get("held_at"),
+                    "released_at": txn.get("released_at"),
+                    "refunded_at": txn.get("refunded_at"),
+                    "notes": txn.get("notes"),
+                    "created_at": txn.get("created_at"),
+                    "updated_at": txn.get("updated_at"),
+                    "property": property_data,
+                    "landlord": landlord_data
+                }
+                enriched_transactions.append(enriched_txn)
 
-        return {"success": True, "payments": enriched_transactions}
+            return {"success": True, "payments": enriched_transactions}
+        except Exception as batch_err:
+            logger.error(f"[PAY] Batch enrichment failed: {batch_err}")
+            # Fallback: return transactions without enrichment
+            return {"success": True, "payments": transactions}
     except Exception as e:
         logger.error(f"[PAY] get_my_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch payment history")
@@ -633,37 +666,70 @@ async def get_received_payments(
         if not transactions:
             return {"success": True, "payments": []}
         
-        # OPTIMIZATION: Batch-fetch all properties and tenants instead of N+1 queries
-        property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
-        tenant_ids = list({t["tenant_id"] for t in transactions if t.get("tenant_id")})
-        
-        # Batch-fetch properties
-        properties_map = {}
-        if property_ids:
-            props_resp = supabase_admin.table("properties").select(
-                "id, title, location, city, state, address, full_address, price, images"
-            ).in_("id", property_ids).execute()
-            properties_map = {p["id"]: p for p in (props_resp.data or [])}
-        
-        # Batch-fetch tenants
-        tenants_map = {}
-        if tenant_ids:
-            tenants_resp = supabase_admin.table("users").select(
-                "id, full_name, email, phone_number, avatar_url"
-            ).in_("id", tenant_ids).execute()
-            tenants_map = {t["id"]: t for t in (tenants_resp.data or [])}
-        
-        # Enrich transactions with pre-fetched data (no more DB queries)
-        enriched_transactions = []
-        for txn in transactions:
-            enriched_txn = {
-                **txn,
-                "property": properties_map.get(txn.get("property_id")),
-                "tenant": tenants_map.get(txn.get("tenant_id"))
-            }
-            enriched_transactions.append(enriched_txn)
+        try:
+            # OPTIMIZATION: Batch-fetch all properties and tenants instead of N+1 queries
+            property_ids = list({t["property_id"] for t in transactions if t.get("property_id")})
+            tenant_ids = list({t["tenant_id"] for t in transactions if t.get("tenant_id")})
+            
+            # Batch-fetch properties
+            properties_map = {}
+            if property_ids:
+                try:
+                    props_resp = supabase_admin.table("properties").select(
+                        "id, title, location, city, state, address, full_address, price, images"
+                    ).in_("id", property_ids).execute()
+                    properties_map = {p["id"]: p for p in (props_resp.data or [])}
+                except Exception as e:
+                    logger.warning(f"[PAY] Failed to batch-fetch properties: {e}")
+            
+            # Batch-fetch tenants
+            tenants_map = {}
+            if tenant_ids:
+                try:
+                    tenants_resp = supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).in_("id", tenant_ids).execute()
+                    tenants_map = {t["id"]: t for t in (tenants_resp.data or [])}
+                except Exception as e:
+                    logger.warning(f"[PAY] Failed to batch-fetch tenants: {e}")
+            
+            # Enrich transactions with pre-fetched data (no more DB queries)
+            # Ensure proper serialization by converting dates and null values
+            enriched_transactions = []
+            for txn in transactions:
+                property_data = properties_map.get(txn.get("property_id"))
+                tenant_data = tenants_map.get(txn.get("tenant_id"))
+                
+                enriched_txn = {
+                    "id": txn.get("id"),
+                    "tenant_id": txn.get("tenant_id"),
+                    "landlord_id": txn.get("landlord_id"),
+                    "property_id": txn.get("property_id"),
+                    "agreement_id": txn.get("agreement_id"),
+                    "application_id": txn.get("application_id"),
+                    "amount": txn.get("amount"),
+                    "currency": txn.get("currency"),
+                    "status": txn.get("status"),
+                    "transaction_type": txn.get("transaction_type"),
+                    "payment_gateway": txn.get("payment_gateway"),
+                    "paystack_ref": txn.get("paystack_ref"),
+                    "paystack_access_code": txn.get("paystack_access_code"),
+                    "held_at": txn.get("held_at"),
+                    "released_at": txn.get("released_at"),
+                    "refunded_at": txn.get("refunded_at"),
+                    "notes": txn.get("notes"),
+                    "created_at": txn.get("created_at"),
+                    "updated_at": txn.get("updated_at"),
+                    "property": property_data,
+                    "tenant": tenant_data
+                }
+                enriched_transactions.append(enriched_txn)
 
-        return {"success": True, "payments": enriched_transactions}
+            return {"success": True, "payments": enriched_transactions}
+        except Exception as batch_err:
+            logger.error(f"[PAY] Batch enrichment failed: {batch_err}")
+            # Fallback: return transactions without enrichment
+            return {"success": True, "payments": transactions}
     except Exception as e:
         logger.error(f"[PAY] get_received_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch received payments")
