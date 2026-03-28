@@ -805,8 +805,8 @@ async def get_payment(
 
 
 # -----------------------------------------------------------------------------
-# POST /payments/confirm-webhook-manually  (DEV ONLY - simulate webhook)
-# -----------------------------------------------------------------------------
+# POST /payments/confirm-webhook-manually  (Works on any server)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/confirm-webhook-manually")
 async def confirm_payment_manually(
@@ -814,13 +814,20 @@ async def confirm_payment_manually(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    DEV ONLY: Manually confirm a payment to simulate Paystack webhook.
-    This is needed because Paystack webhooks don't work with localhost.
+    Manually confirm a payment.
+    Used for dev testing (Paystack webhooks can't reach localhost) and
+    as fallback on live server if webhook doesn't fire in time.
+    
+    Does everything the webhook does:
+    - Update transaction status to 'released'
+    - Update agreement status to 'ACTIVE'
+    - Update property status to 'occupied'
+    - Send payment confirmed notifications
     """
     # Fetch transaction
     try:
         txn_resp = supabase_admin.table("transactions").select(
-            "id, status, tenant_id, landlord_id, property_id, application_id, amount"
+            "id, status, tenant_id, landlord_id, property_id, application_id, amount, notes"
         ).eq("paystack_ref", reference).single().execute()
     except Exception as e:
         logger.error(f"[PAY] Manual confirm failed for ref {reference}: {e}")
@@ -831,29 +838,43 @@ async def confirm_payment_manually(
 
     transaction = txn_resp.data
 
-    # Check if already released
+    # Check if already released (idempotent)
     if transaction["status"] == "released":
         return {"success": True, "message": "Payment already confirmed"}
 
-    # Verify caller is the tenant or landlord
+    # Verify caller is the tenant or landlord (authorization check)
     user_id = current_user["id"]
     if transaction.get("tenant_id") != user_id and transaction.get("landlord_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Update transaction to released
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    # -- Update transaction to released ----------------------------------------
     try:
+        # Preserve existing breakdown notes if present
+        existing_notes = {}
+        try:
+            existing_notes = json.loads(transaction.get("notes", "{}"))
+        except:
+            existing_notes = {}
+        
         supabase_admin.table("transactions").update({
             "status": "released",
             "released_at": now_iso,
-            "notes": "Manually confirmed via dev endpoint",
+            "notes": json.dumps({
+                "confirmed_via": "manual_endpoint",
+                "confirmed_by": "tenant",
+                "confirmed_at": now_iso,
+                "payment_breakdown": existing_notes.get("payment_breakdown", {}),
+                "breakdown_type": existing_notes.get("breakdown_type", "simple")
+            }),
             "updated_at": now_iso,
         }).eq("id", transaction["id"]).execute()
     except Exception as e:
-        logger.error(f"[PAY] Manual confirm update failed: {e}")
+        logger.error(f"[PAY] Manual confirm transaction update failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to confirm payment")
 
-    # Update agreement status to ACTIVE
+    # -- Update agreement status to ACTIVE ------------------------------------
     try:
         supabase_admin.table("agreements").update({
             "status": "ACTIVE",
@@ -863,6 +884,76 @@ async def confirm_payment_manually(
         ).in_("status", ["SIGNED", "ACTIVE"]).execute()
     except Exception as e:
         logger.warning(f"[PAY] Manual confirm could not update agreement: {e}")
+
+    # -- Update property status to occupied -----------------------------------
+    try:
+        supabase_admin.table("properties").update({
+            "status": "occupied",
+            "updated_at": now_iso,
+        }).eq("id", transaction["property_id"]).execute()
+    except Exception as e:
+        logger.warning(f"[PAY] Manual confirm could not update property status: {e}")
+
+    # -- Send payment confirmed notifications (non-fatal) ----------------------
+    try:
+        from app.services.notification_service import notification_service
+
+        # Fetch tenant details
+        tenant_name = "Tenant"
+        tenant_email = None
+        tenant_phone = None
+        try:
+            t_resp = supabase_admin.table("users").select(
+                "full_name, email, phone_number"
+            ).eq("id", transaction["tenant_id"]).single().execute()
+            if t_resp.data:
+                tenant_name = t_resp.data.get("full_name", "Tenant")
+                tenant_email = t_resp.data.get("email")
+                tenant_phone = t_resp.data.get("phone_number")
+        except Exception:
+            pass
+
+        # Fetch landlord details
+        landlord_name = "Landlord"
+        landlord_email = None
+        landlord_phone = None
+        try:
+            ll_resp = supabase_admin.table("users").select(
+                "full_name, email, phone_number"
+            ).eq("id", transaction["landlord_id"]).single().execute()
+            if ll_resp.data:
+                landlord_name = ll_resp.data.get("full_name", "Landlord")
+                landlord_email = ll_resp.data.get("email")
+                landlord_phone = ll_resp.data.get("phone_number")
+        except Exception:
+            pass
+
+        # Fetch property title
+        property_title = "Property"
+        try:
+            p_resp = supabase_admin.table("properties").select("title").eq(
+                "id", transaction["property_id"]
+            ).single().execute()
+            if p_resp.data:
+                property_title = p_resp.data.get("title", "Property")
+        except Exception:
+            pass
+
+        await notification_service.notify_payment_confirmed(
+            transaction_id=transaction["id"],
+            property_title=property_title,
+            amount_ngn=int(transaction.get("amount", 0)),
+            tenant_id=transaction["tenant_id"],
+            tenant_name=tenant_name,
+            tenant_email=tenant_email,
+            tenant_phone=tenant_phone,
+            landlord_id=transaction["landlord_id"],
+            landlord_name=landlord_name,
+            landlord_email=landlord_email,
+            landlord_phone=landlord_phone,
+        )
+    except Exception as e:
+        logger.warning(f"[PAY] Manual confirm notify_payment_confirmed failed (non-fatal): {e}")
 
     logger.info(f"[PAY] Payment manually confirmed - transaction {transaction['id']}, ref {reference}")
 
