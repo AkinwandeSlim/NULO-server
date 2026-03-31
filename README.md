@@ -1,152 +1,241 @@
-# 🐍 Nulo Africa - FastAPI Backend
+# � NuloAfrica Backend
 
-## Python Backend with Supabase Integration
+> High-performance FastAPI backend for Nigeria's zero-agency rental platform.  
+> Production-ready with real-time messaging, secure payments, and admin controls.
 
 ---
 
-## 🚀 **Quick Start**
+## ⚡ Quick Start (3 minutes)
 
 ```bash
 # 1. Create virtual environment
 python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# 2. Activate virtual environment
-venv\Scripts\activate  # Windows
-source venv/bin/activate  # Mac/Linux
-
-# 3. Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment
-copy .env.example .env  # Edit with your credentials
+# 3. Configure
+cp .env.example .env
+# Add: SUPABASE_URL, SUPABASE_KEY, PAYSTACK_SECRET, TWILIO_ACCOUNT_SID
 
-# 5. Run server
-uvicorn app.main:app --reload --port 8000
+# 4. Run server
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# → Open http://localhost:8000/docs (API playground)
 ```
 
-**Server will be available at:**
-- API: http://localhost:8000
-- Swagger Docs: http://localhost:8000/api/docs
-- ReDoc: http://localhost:8000/api/redoc
+## 🛠️ Tech Stack
 
----
+| Layer | Technology |
+|-------|------------|
+| **Framework** | FastAPI (Python async) |
+| **Language** | Python 3.9+ |
+| **Database** | PostgreSQL via Supabase |
+| **Auth** | JWT + Supabase Auth |
+| **Payments** | Paystack (NGN) with HMAC verification |
+| **Notifications** | Email (SMTP) + SMS (Twilio) |
+| **Validation** | Pydantic v2 |
+| **Async** | asyncio + concurrent.futures |
+| **Production** | Uvicorn + Gunicorn ready |
 
-## 📁 **Project Structure**
+## ✨ Core Features
+
+### Authentication
+- 🔐 Email/Password signup + Google OAuth
+- 👤 Role-based access (Tenant, Landlord, Admin)
+- 📧 Email verification workflow
+- 🔑 JWT token-based auth
+
+### Properties Service
+- 🏠 CRUD for property listings
+- 🔍 Advanced search + filtering
+- ✅ Admin verification workflow
+- 📊 View tracking & analytics
+
+### Viewing Requests
+- 📅 Schedule physical/virtual/live video viewings
+- 📧 Automatic SMS/Email reminders
+- 📜 Status tracking (pending, confirmed, completed, cancelled)
+- 🔔 Real-time notifications
+
+### Applications
+- 📋 Tenant rental applications
+- 👤 Employment + income verification
+- 📊 Admin approval workflow
+- 🔐 Unique constraint (one app per tenant per property)
+
+### Lease Agreements
+- 📄 Auto-generated Nigerian-compliant agreements
+- ✍️ Digital signature tracking
+- 📅 Lease term management
+- 💾 Version history
+
+### Payments
+- 💳 Paystack integration (NGN native)
+- 🔒 HMAC-verified webhooks (SHA512)
+- 🏦 Escrow payment holds
+- 📊 Transaction tracking
+
+### Messaging
+- 💬 Real-time tenant-landlord chat
+- 📱 Supabase Realtime subscriptions
+- 🔔 Message notifications
+- 📜 Conversation history
+
+### Admin Dashboard
+- 📊 Platform metrics (users, properties, revenue)
+- 👤 User management & moderation
+- ✅ Property verification queue
+- 🔍 Dispute resolution
+
+## 📁 Structure
 
 ```
-server/
-├── app/
-│   ├── routes/              # API endpoints
-│   │   ├── auth.py         # Authentication
-│   │   ├── properties.py   # Property management
-│   │   ├── applications.py # Tenant applications
-│   │   ├── tenants.py      # Tenant profiles
-│   │   ├── favorites.py    # Saved properties
-│   │   └── messages.py     # Messaging system
-│   │
-│   ├── models/              # Pydantic models
-│   │   ├── user.py         # User models
-│   │   └── property.py     # Property models
-│   │
-│   ├── middleware/          # Middleware
-│   │   └── auth.py         # JWT authentication
-│   │
-│   ├── main.py             # FastAPI app
-│   ├── config.py           # Configuration
-│   └── database.py         # Supabase client
-│
-├── requirements.txt         # Python dependencies
-├── .env.example            # Environment template
-└── README.md               # This file
+app/
+├── main.py              # FastAPI app init
+├── routes/              # API endpoints
+│   ├── auth.py          # Authentication
+│   ├── properties.py    # Property CRUD + search
+│   ├── applications.py  # Rental applications
+│   ├── viewing_requests.py  # Viewing coordination
+│   ├── agreements.py    # Lease agreements
+│   ├── payments.py      # Payment processing
+│   ├── messages.py      # Direct messaging
+│   ├── notifications.py # Notification triggers
+│   ├── admin_*.py       # Admin endpoints
+│   └── landlord_*.py    # Landlord endpoints
+├── models.py            # Pydantic schemas
+├── database.py          # Supabase setup
+├── middleware/          # Auth & RLS
+└── services/            # Business logic
+
+requirements.txt        # Python dependencies
+.env.example           # Environment template
 ```
 
----
+## 🔧 Environment Setup
 
-## 🔑 **Environment Variables**
-
-Required in `.env`:
-
-```bash
+```env
+# .env
 # Supabase
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your_supabase_anon_key
-SUPABASE_SERVICE_KEY=your_service_role_key
+SUPABASE_KEY=eyJhbGci...
+SUPABASE_ADMIN_KEY=eyJhbGci...
 
-# JWT
-JWT_SECRET_KEY=your_secret_key
-JWT_ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
+# Payments
+PAYSTACK_SECRET=sk_live_xxxxx
+
+# Notifications
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+
+TWILIO_ACCOUNT_SID=ACxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxx
+TWILIO_PHONE_NUMBER=+1234567890
 
 # Server
-HOST=0.0.0.0
-PORT=8000
-DEBUG=True
-
-# CORS
-ALLOWED_ORIGINS=http://localhost:3000
+SECRET_KEY=your-super-secret-key
+DEBUG=False
 ```
 
----
+## 📊 Key API Endpoints
 
-## 📡 **API Endpoints**
+```
+Authentication
+POST   /auth/signup           POST   /auth/login
 
-### **Authentication** (`/api/v1/auth`)
-- `POST /register` - Register new user
-- `POST /login` - Login user
-- `GET /me` - Get current user
-- `POST /logout` - Logout user
+Properties
+GET    /properties            GET    /properties/{id}
+POST   /properties            PUT    /properties/{id}
+DELETE /properties/{id}
 
-### **Properties** (`/api/v1/properties`)
-- `GET /search` - Search properties
-- `POST /` - Create property (landlord only)
-- `GET /{id}` - Get property details
-- `PATCH /{id}` - Update property (landlord only)
-- `DELETE /{id}` - Delete property (landlord only)
+Viewing Requests
+POST   /viewing-requests      GET    /viewing-requests
+PATCH  /viewing-requests/{id}/confirm
 
-### **Applications** (`/api/v1/applications`)
-- `POST /` - Submit application (tenant only)
-- `GET /` - Get user applications
-- `PATCH /{id}/approve` - Approve application (landlord only)
-- `PATCH /{id}/reject` - Reject application (landlord only)
+Applications
+POST   /applications          GET    /applications
+PATCH  /applications/{id}/approve
 
-### **Tenants** (`/api/v1/tenants`)
-- `GET /profile` - Get tenant profile
-- `POST /complete-profile` - Complete profile (deferred KYC)
-- `PATCH /profile` - Update profile
+Payments
+POST   /payments/initiate     POST   /webhooks/paystack
+GET    /payments/status/{ref}
 
-### **Favorites** (`/api/v1/favorites`)
-- `GET /` - Get saved properties
-- `POST /` - Add to favorites
-- `DELETE /{property_id}` - Remove from favorites
+Messaging
+GET    /messages/conversations  POST   /messages
+```
 
-### **Messages** (`/api/v1/messages`)
-- `GET /conversations` - Get conversations
-- `GET /{user_id}` - Get messages with user
-- `POST /` - Send message
+**Full API docs:** `http://localhost:8000/docs` (when running)
 
----
+## 🔒 Security Features
 
-## 🔐 **Authentication**
+- ✅ Supabase Row-Level Security (RLS)
+- ✅ Service-role auth for admin operations
+- ✅ JWT validation on all endpoints
+- ✅ HMAC webhook verification (Paystack)
+- ✅ SQL injection prevention
+- ✅ Rate limiting on endpoints
+- ✅ Audit logging
 
-All protected endpoints require JWT token in header:
+## 🚀 Deployment
+
+### Production Build
+```bash
+pip install gunicorn
+gunicorn -w 4 -b 0.0.0.0:8000 app.main:app
+```
+
+### Docker (Optional)
+```bash
+docker build -t nulo-backend .
+docker run -p 8000:8000 --env-file .env nulo-backend
+```
+
+## 🧪 Testing
 
 ```bash
-Authorization: Bearer <your_jwt_token>
+pytest tests/ -v                    # Run all tests
+pytest tests/test_properties.py -v  # Run specific test
+pytest tests/ --cov=app            # Coverage report
 ```
 
-**Example:**
-```python
-import requests
+## 🐛 Troubleshooting
 
-headers = {
-    "Authorization": f"Bearer {access_token}"
-}
+| Error | Fix |
+|-------|-----|
+| Supabase connection refused | Check SUPABASE_URL and key |
+| "401 Unauthorized" | Verify JWT token format/expiry |
+| Paystack webhook failing | Check PAYSTACK_SECRET matches |
+| Email not sending | Verify SMTP credentials |
+| FastAPI not starting | Check port 8000 availability |
 
-response = requests.get(
-    "http://localhost:8000/api/v1/auth/me",
-    headers=headers
-)
-```
+## 📌 Design Highlights
+
+- **FastAPI** — Modern, async-native Python framework
+- **Supabase** — Managed PostgreSQL + Auth
+- **Pydantic v2** — Runtime data validation
+- **Service-role auth** — Elevated admin permissions
+- **Paystack HMAC** — Webhook authenticity verification
+- **Async I/O** — Non-blocking for scale
+
+## 📚 Documentation
+
+- **API Playground:** http://localhost:8000/docs
+- **Alternative:** http://localhost:8000/redoc
+- **Database:** Supabase dashboard
+- **Detailed Guide:** See README_SERVER.md
+
+---
+
+**Next Steps:**
+1. Copy `.env.example` → `.env` and fill credentials
+2. Run `uvicorn app.main:app --reload`
+3. Visit http://localhost:8000/docs to explore API
+4. Start frontend from [client repository](https://github.com/your-org/nulo-africa-client)
+
+**Questions?** Check README_SERVER.md for comprehensive backend guide.
 
 ---
 
