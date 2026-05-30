@@ -29,6 +29,50 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/onboarding", tags=["landlord-onboarding"])
 
 
+@router.get("/status", response_model=dict)
+async def check_onboarding_status(current_user = Depends(get_current_user)):
+    """Check current onboarding status for the logged-in landlord"""
+    print(f"\n🔍 [ONBOARDING/status] Checking status for user: {current_user['id']}")
+    
+    try:
+        onboarding_check = supabase.table("landlord_onboarding").select("*").eq(
+            "landlord_id", current_user['id']
+        ).execute()
+        
+        if not onboarding_check.data:
+            return {
+                "onboarding_started": False,
+                "current_step": 0,
+                "steps_completed": {
+                    "profile_step_completed": False,
+                    "property_step_completed": False,
+                    "payment_step_completed": False,
+                    "protection_step_completed": False,
+                },
+                "all_steps_completed": False,
+                "submitted_for_review": False
+            }
+        
+        onboarding = onboarding_check.data[0]
+        
+        return {
+            "onboarding_started": True,
+            "current_step": onboarding.get("current_step", 0),
+            "steps_completed": {
+                "profile_step_completed": onboarding.get("profile_step_completed", False),
+                "property_step_completed": onboarding.get("property_step_completed", False),
+                "payment_step_completed": onboarding.get("payment_step_completed", False),
+                "protection_step_completed": onboarding.get("protection_step_completed", False),
+            },
+            "all_steps_completed": onboarding.get("all_steps_completed", False),
+            "submitted_for_review": onboarding.get("submitted_for_review", False),
+            "admin_review_status": onboarding.get("admin_review_status", None),
+        }
+    except Exception as e:
+        print(f"❌ [ONBOARDING/status] Error checking status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/start", response_model=LandlordOnboardingResponse)
 async def start_onboarding(
     onboarding_data: LandlordOnboardingCreate,
@@ -316,6 +360,22 @@ async def submit_complete_onboarding(
             request_data = await request.json()
         except Exception:
             request_data = {}
+
+        # ── 0. CHECK EXISTING ONBOARDING RECORD ───────────────────────────────
+        onboarding_check = supabase_admin.table("landlord_onboarding").select("*").eq(
+            "landlord_id", current_user["id"]
+        ).execute()
+
+        onboarding = onboarding_check.data[0] if onboarding_check.data else None
+
+        if onboarding is None:
+            print(f"ℹ️ [ONBOARDING/submit] No existing onboarding record found for {current_user['id']}. Creating one on submit.")
+        else:
+            print(f"ℹ️ [ONBOARDING/submit] Existing onboarding record found for {current_user['id']} (id={onboarding['id']}). Completing final submission.")
+
+        # NOTE: Final submit is allowed even if the existing onboarding record
+        # is incomplete, because the frontend validates all steps locally and
+        # sends a complete onboarding payload at once.
 
         # ── 1. Ensure landlord_profiles row exists ────────────────────────────
         profile_check = supabase_admin.table("landlord_profiles").select("id").eq(

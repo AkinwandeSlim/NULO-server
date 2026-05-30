@@ -1,45 +1,44 @@
 # FastAPI Core
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
 
 # Supabase
-supabase==2.0.3
-postgrest==0.13.0
+supabase>=2.10.0
+postgrest>=0.18.0
 
 # SMS Provider
-twilio==8.10.0
+twilio>=8.10.0
 
 # Email Provider
-sendgrid==6.11.0
+sendgrid>=6.11.0
 
 # Pydantic
-# pydantic==2.5.0
-pydantic-settings==2.1.0
-email-validator==2.1.0
+pydantic-settings>=2.1.0
+email-validator>=2.1.0
 
 # Authentication & Security
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-python-dotenv==1.0.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-dotenv>=1.0.0
 
 # HTTP Client
-httpx==0.24.1
+httpx>=0.28.1
 requests>=2.28.0
 
-# Note: Redis not required for simple optimization
-# redis==5.0.1  # Uncomment if you want to upgrade to full Redis version
-
-
 # Testing
-pytest==7.4.3
-pytest-asyncio==0.21.1
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
 reportlab
 
+
+# AI Setup
+google-generativeai>=0.8.0
+google-genai>=1.0.0
+groq>=0.9.0
+
 # Development
-black==23.12.0
-flake8==6.1.0
-mypy==1.7.1
+black>=23.12.0
+flake8>=6.1.0
+mypy>=1.7.1
 jinja2>=3.1.0
-
-

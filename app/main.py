@@ -14,8 +14,11 @@ from app.routes import (
     tenant_verification, admin_signup,admin_management,
     landlord_onboarding, landlord_dashboard, tenant_dashboard, notifications, admin_dashboard,
     admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health,
-    engagement,payments,
+    engagement,payments, license, groq_agreement,
 )
+from app.api.test import generate_agreement as test_agreement
+from app.api.test import generate_agreement_simple as test_agreement_simple
+from app.middleware.license_middleware import LicenseVerificationMiddleware
 
 import logging
 from dotenv import load_dotenv
@@ -43,6 +46,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# License Middleware - Check if app license is valid on every request
+app.add_middleware(LicenseVerificationMiddleware)
 
 # Request logging middleware
 @app.middleware("http")
@@ -141,6 +147,10 @@ app.include_router(agreements.router, prefix="/api/v1", tags=["Agreements"])
 app.include_router(maintenance.router, prefix="/api/v1", tags=["Maintenance"])
 app.include_router(engagement.router, prefix="/api/v1", tags=["Engagement"])
 app.include_router(payments.router, prefix="/api/v1",tags=["Payment"])
+app.include_router(license.router, prefix="/api/v1", tags=["License Management"])
+app.include_router(groq_agreement.router, tags=["Groq AI Agreement"])
+app.include_router(test_agreement.router, prefix="/api/test", tags=["Test Agreement Generation"])
+app.include_router(test_agreement_simple.router, prefix="/api/test", tags=["Test Agreement Generation (No Auth)"])
 
 
 # Startup event
@@ -150,6 +160,16 @@ async def startup_event():
     logger.info(f"📍 Environment: {settings.ENVIRONMENT}")
     logger.info(f"🔗 Supabase URL: {settings.SUPABASE_URL}")
     logger.info(f"🌐 CORS Origins: {settings.cors_origins}")
+    
+    # Check license status
+    from app.license import LicenseService
+    is_valid, message = LicenseService.check_license_valid()
+    if is_valid:
+        logger.info(f"✅ License Status: {message}")
+        status_info = LicenseService.get_status_info()
+        logger.info(f"📅 License expires: {status_info.get('expiry_date', 'N/A')}")
+    else:
+        logger.warning(f"⚠️ License Status: {message}")
     
  
 # Shutdown event

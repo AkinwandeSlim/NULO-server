@@ -649,17 +649,18 @@ async def get_my_payments(
 
 @router.get("/received")
 async def get_received_payments(
+    limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(get_current_landlord),
 ):
     """Landlord's received payments with tenant and property info - OPTIMIZED with batch loading."""
     try:
-        # Get transactions for this landlord
+        # Get the most recent transactions for this landlord and avoid a full-table scan
         resp = supabase_admin.table("transactions").select(
             "id, tenant_id, landlord_id, property_id, agreement_id, application_id, "
             "amount, currency, status, transaction_type, payment_gateway, "
             "paystack_ref, paystack_access_code, held_at, released_at, refunded_at, "
             "notes, created_at, updated_at"
-        ).eq("landlord_id", current_user["id"]).order("created_at", desc=True).execute()
+        ).eq("landlord_id", current_user["id"]).order("created_at", desc=True).limit(limit).execute()
 
         transactions = resp.data or []
         

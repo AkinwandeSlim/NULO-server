@@ -205,7 +205,7 @@ async def search_properties(
     furnished: Optional[bool] = Query(None),
     pet_friendly: Optional[bool] = Query(None),
     parking_required: Optional[bool] = Query(None),
-    sort: str = Query("newest", regex="^(newest|price_low|price_high|featured)$"),
+    sort: str = Query("newest", pattern="^(newest|price_low|price_high|featured)$"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     current_user: Optional[dict] = Depends(get_optional_current_user)

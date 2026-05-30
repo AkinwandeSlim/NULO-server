@@ -312,17 +312,44 @@ async def get_recent_activity(
             logger.warning(f"⚠️ [DASHBOARD] Failed to fetch recent tenants: {str(e)}")
             tenants_result_data = []
         
-        # Recent landlord signups - with timeout handling
+        # Recent landlord signups - OPTION B: Show landlords who completed all 4 steps
+        # ✅ Query landlord_profiles where all_steps_completed = true (ready for review/submitted)
         try:
-            landlords_result = supabase_admin.table('users')\
-                .select('id, email, full_name, created_at, verification_status, user_type, onboarding_completed')\
-                .eq('user_type', 'landlord')\
-                .gte('created_at', cutoff_iso)\
-                .order('created_at', desc=True)\
-                .limit(10)\
-                .execute()
-            landlords_result_data = landlords_result.data or []
-            logger.info(f"✅ [DASHBOARD] Fetched {len(landlords_result_data)} recent landlord signups")
+            # Step 1: Get landlord IDs from landlord_profiles where all steps are completed
+            landlord_profiles = supabase_admin.table('landlord_profiles')\
+                .select('id, onboarding_completed_at')\
+                .eq('profile_step_completed', True)\
+                .eq('property_step_completed', True)\
+                .eq('payment_step_completed', True)\
+                .eq('protection_step_completed', True)\
+                .gte('onboarding_completed_at', cutoff_iso)\
+                .order('onboarding_completed_at', desc=True)\
+                .limit(50)\
+                .execute()  # Get extra to account for any filtering
+            
+            landlord_ids = [r['id'] for r in landlord_profiles.data or []]
+            logger.info(f"🔍 [DASHBOARD] Found {len(landlord_ids)} landlord profile IDs with all steps completed")
+            if landlord_ids:
+                logger.info(f"   Landlord IDs: {landlord_ids}")
+            
+            # Step 2: Fetch user details for these landlord IDs
+            if landlord_ids:
+                landlords_result = supabase_admin.table('users')\
+                    .select('id, email, full_name, created_at, verification_status, user_type, onboarding_completed')\
+                    .in_('id', landlord_ids)\
+                    .eq('user_type', 'landlord')\
+                    .order('created_at', desc=True)\
+                    .limit(10)\
+                    .execute()
+                landlords_result_data = landlords_result.data or []
+                logger.info(f"📊 [DASHBOARD] Fetched {len(landlords_result_data)} user records")
+                for landlord in landlords_result_data:
+                    logger.info(f"   - {landlord.get('email')}: {landlord.get('full_name')} (type: {landlord.get('user_type')})")
+            else:
+                landlords_result_data = []
+                logger.info(f"⚠️ [DASHBOARD] No landlord profiles found with all steps completed")
+                
+            logger.info(f"✅ [DASHBOARD] Fetched {len(landlords_result_data)} recent landlord signups (all steps completed)")
         except Exception as e:
             logger.warning(f"⚠️ [DASHBOARD] Failed to fetch recent landlords: {str(e)}")
             landlords_result_data = []
