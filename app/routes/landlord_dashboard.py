@@ -462,12 +462,14 @@ async def get_landlord_dashboard(
 ):
     """Get comprehensive landlord dashboard data"""
     print(f"\n✅ [LANDLORD DASHBOARD] Fetching dashboard for user: {current_user['id']}")
+    logger.info(f"🔄 [LANDLORD DASHBOARD] Starting dashboard fetch for user: {current_user['id']}")
     
     try:
         landlord_id = current_user['id']
         
         # Verify user is a landlord
         if current_user.get('user_type') != 'landlord':
+            logger.error(f"❌ [LANDLORD DASHBOARD] Access denied - user not landlord, user_type: {current_user.get('user_type')}")
             raise HTTPException(status_code=403, detail="Access denied. Landlord access required.")
         
         # 🚀 OPTIMIZATION: Check cache first
@@ -476,12 +478,14 @@ async def get_landlord_dashboard(
             cached_data, cache_time = _dashboard_cache[cache_key]
             if datetime.now().timestamp() - cache_time < CACHE_TTL:
                 print(f"💾 [LANDLORD DASHBOARD] Cache hit - returning cached data")
+                logger.info(f"✅ [LANDLORD DASHBOARD] Cache hit for user {landlord_id}")
                 return cached_data
             else:
                 # Cache expired, remove it
                 del _dashboard_cache[cache_key]
         
         print(f"🔄 [LANDLORD DASHBOARD] Cache miss or expired - fetching fresh data")
+        logger.info(f"🔄 [LANDLORD DASHBOARD] Cache miss for user {landlord_id} - fetching fresh data")
         
         # 🚀 PARALLEL FETCH: Run all Supabase calls concurrently via thread pool.
         # Previously sequential → 10+ round trips × 500-1500ms each = 10-15s total.
@@ -787,12 +791,16 @@ async def get_landlord_dashboard(
             print(f"⚠️ [LANDLORD DASHBOARD] Stats fetch had failures -- skipping cache so next request retries")
 
         print(f"✅ [LANDLORD DASHBOARD] Dashboard data retrieved successfully")
+        logger.info(f"✅ [LANDLORD DASHBOARD] Dashboard fetch complete for user {landlord_id}, returning response")
         return dashboard_data
         
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"❌ [LANDLORD DASHBOARD] Error fetching dashboard: {str(e)}", exc_info=True)
         print(f"❌ [LANDLORD DASHBOARD] Error fetching dashboard: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 

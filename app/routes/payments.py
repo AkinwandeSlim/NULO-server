@@ -608,6 +608,16 @@ async def get_my_payments(
                 property_data = properties_map.get(txn.get("property_id"))
                 landlord_data = landlords_map.get(txn.get("landlord_id"))
                 
+                # Helper to convert datetime to ISO string
+                def to_iso_string(val):
+                    if val is None:
+                        return None
+                    if isinstance(val, str):
+                        return val
+                    if hasattr(val, 'isoformat'):  # datetime object
+                        return val.isoformat()
+                    return str(val)
+                
                 enriched_txn = {
                     "id": txn.get("id"),
                     "tenant_id": txn.get("tenant_id"),
@@ -622,12 +632,12 @@ async def get_my_payments(
                     "payment_gateway": txn.get("payment_gateway"),
                     "paystack_ref": txn.get("paystack_ref"),
                     "paystack_access_code": txn.get("paystack_access_code"),
-                    "held_at": txn.get("held_at"),
-                    "released_at": txn.get("released_at"),
-                    "refunded_at": txn.get("refunded_at"),
+                    "held_at": to_iso_string(txn.get("held_at")),
+                    "released_at": to_iso_string(txn.get("released_at")),
+                    "refunded_at": to_iso_string(txn.get("refunded_at")),
                     "notes": txn.get("notes"),
-                    "created_at": txn.get("created_at"),
-                    "updated_at": txn.get("updated_at"),
+                    "created_at": to_iso_string(txn.get("created_at")),
+                    "updated_at": to_iso_string(txn.get("updated_at")),
                     "property": property_data,
                     "landlord": landlord_data
                 }
@@ -636,8 +646,27 @@ async def get_my_payments(
             return {"success": True, "payments": enriched_transactions}
         except Exception as batch_err:
             logger.error(f"[PAY] Batch enrichment failed: {batch_err}")
-            # Fallback: return transactions without enrichment
-            return {"success": True, "payments": transactions}
+            # Fallback: return transactions without enrichment but still convert dates
+            def to_iso_string(val):
+                if val is None:
+                    return None
+                if isinstance(val, str):
+                    return val
+                if hasattr(val, 'isoformat'):  # datetime object
+                    return val.isoformat()
+                return str(val)
+            
+            fallback_transactions = []
+            for txn in transactions:
+                txn_copy = dict(txn)
+                txn_copy["held_at"] = to_iso_string(txn_copy.get("held_at"))
+                txn_copy["released_at"] = to_iso_string(txn_copy.get("released_at"))
+                txn_copy["refunded_at"] = to_iso_string(txn_copy.get("refunded_at"))
+                txn_copy["created_at"] = to_iso_string(txn_copy.get("created_at"))
+                txn_copy["updated_at"] = to_iso_string(txn_copy.get("updated_at"))
+                fallback_transactions.append(txn_copy)
+            
+            return {"success": True, "payments": fallback_transactions}
     except Exception as e:
         logger.error(f"[PAY] get_my_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch payment history")
@@ -701,6 +730,16 @@ async def get_received_payments(
                 property_data = properties_map.get(txn.get("property_id"))
                 tenant_data = tenants_map.get(txn.get("tenant_id"))
                 
+                # Helper to convert datetime to ISO string
+                def to_iso_string(val):
+                    if val is None:
+                        return None
+                    if isinstance(val, str):
+                        return val
+                    if hasattr(val, 'isoformat'):  # datetime object
+                        return val.isoformat()
+                    return str(val)
+                
                 enriched_txn = {
                     "id": txn.get("id"),
                     "tenant_id": txn.get("tenant_id"),
@@ -715,12 +754,12 @@ async def get_received_payments(
                     "payment_gateway": txn.get("payment_gateway"),
                     "paystack_ref": txn.get("paystack_ref"),
                     "paystack_access_code": txn.get("paystack_access_code"),
-                    "held_at": txn.get("held_at"),
-                    "released_at": txn.get("released_at"),
-                    "refunded_at": txn.get("refunded_at"),
+                    "held_at": to_iso_string(txn.get("held_at")),
+                    "released_at": to_iso_string(txn.get("released_at")),
+                    "refunded_at": to_iso_string(txn.get("refunded_at")),
                     "notes": txn.get("notes"),
-                    "created_at": txn.get("created_at"),
-                    "updated_at": txn.get("updated_at"),
+                    "created_at": to_iso_string(txn.get("created_at")),
+                    "updated_at": to_iso_string(txn.get("updated_at")),
                     "property": property_data,
                     "tenant": tenant_data
                 }
@@ -729,8 +768,27 @@ async def get_received_payments(
             return {"success": True, "payments": enriched_transactions}
         except Exception as batch_err:
             logger.error(f"[PAY] Batch enrichment failed: {batch_err}")
-            # Fallback: return transactions without enrichment
-            return {"success": True, "payments": transactions}
+            # Fallback: return transactions without enrichment but still convert dates
+            def to_iso_string(val):
+                if val is None:
+                    return None
+                if isinstance(val, str):
+                    return val
+                if hasattr(val, 'isoformat'):  # datetime object
+                    return val.isoformat()
+                return str(val)
+            
+            fallback_transactions = []
+            for txn in transactions:
+                txn_copy = dict(txn)
+                txn_copy["held_at"] = to_iso_string(txn_copy.get("held_at"))
+                txn_copy["released_at"] = to_iso_string(txn_copy.get("released_at"))
+                txn_copy["refunded_at"] = to_iso_string(txn_copy.get("refunded_at"))
+                txn_copy["created_at"] = to_iso_string(txn_copy.get("created_at"))
+                txn_copy["updated_at"] = to_iso_string(txn_copy.get("updated_at"))
+                fallback_transactions.append(txn_copy)
+            
+            return {"success": True, "payments": fallback_transactions}
     except Exception as e:
         logger.error(f"[PAY] get_received_payments error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch received payments")
@@ -764,6 +822,22 @@ async def get_payment_status_by_reference(
     # Verify caller is the tenant or landlord on this transaction
     if transaction.get("tenant_id") != user_id and transaction.get("landlord_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    # Helper to convert datetime to ISO string
+    def to_iso_string(val):
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return val
+        if hasattr(val, 'isoformat'):  # datetime object
+            return val.isoformat()
+        return str(val)
+
+    # Convert date fields
+    transaction["created_at"] = to_iso_string(transaction.get("created_at"))
+    transaction["released_at"] = to_iso_string(transaction.get("released_at"))
+    transaction["held_at"] = to_iso_string(transaction.get("held_at"))
+    transaction["refunded_at"] = to_iso_string(transaction.get("refunded_at"))
 
     # -- Fetch property details for better response --------------------------------
     property_data = None
@@ -801,6 +875,23 @@ async def get_payment(
 
     if transaction.get("tenant_id") != user_id and transaction.get("landlord_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    # Helper to convert datetime to ISO string
+    def to_iso_string(val):
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return val
+        if hasattr(val, 'isoformat'):  # datetime object
+            return val.isoformat()
+        return str(val)
+
+    # Convert date fields
+    transaction["created_at"] = to_iso_string(transaction.get("created_at"))
+    transaction["updated_at"] = to_iso_string(transaction.get("updated_at"))
+    transaction["released_at"] = to_iso_string(transaction.get("released_at"))
+    transaction["held_at"] = to_iso_string(transaction.get("held_at"))
+    transaction["refunded_at"] = to_iso_string(transaction.get("refunded_at"))
 
     return {"success": True, "payment": transaction}
 
