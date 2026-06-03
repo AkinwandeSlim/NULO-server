@@ -1,5 +1,5 @@
 """
-Tenant routes
+Tenant api routes
 """
 from fastapi import APIRouter, HTTPException, Depends, status
 from app.database import supabase_admin
