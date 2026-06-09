@@ -1,7 +1,7 @@
 """
 NuloAfrica License & Expiry System
 Protects app from unauthorized use by investors/co-founders
-Uses Supabase for persistent storage
+Uses Supabase for persistent storage and secure license management
 """
 
 from datetime import datetime, timedelta
