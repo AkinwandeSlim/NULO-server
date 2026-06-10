@@ -83,10 +83,11 @@ async def delete_user_by_email(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [ADMIN API] Unexpected error: {e}")
+        error_msg = str(e)
+        print(f"❌ [ADMIN API] Unexpected error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Server error: {str(e)}"
+            detail="An unexpected error occurred. Please try again."
         )
 
 @router.get("/users/all")

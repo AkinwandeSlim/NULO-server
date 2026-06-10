@@ -209,10 +209,11 @@ async def list_landlords(
         return result
         
     except Exception as e:
-        print(f"❌ [LANDLORD-USERS] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [LANDLORD-USERS] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch landlords: {str(e)}"
+            detail="Unable to load landlords. Please try again."
         )
 
 
@@ -314,10 +315,11 @@ async def get_landlord_stats(
         return result
         
     except Exception as e:
-        print(f"❌ [LANDLORD-STATS] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [LANDLORD-STATS] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch landlord stats: {str(e)}"
+            detail="Unable to load landlord statistics. Please try again."
         )
 
 
@@ -405,10 +407,11 @@ async def get_landlord_detail(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [LANDLORD-DETAIL] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [LANDLORD-DETAIL] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch landlord details: {str(e)}"
+            detail="Unable to load landlord details. Please try again."
         )
 
 
@@ -494,10 +497,11 @@ async def update_landlord(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [LANDLORD-UPDATE] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [LANDLORD-UPDATE] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update landlord: {str(e)}"
+            detail="Unable to update landlord. Please try again."
         )
 
 
@@ -551,8 +555,9 @@ async def delete_landlord(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [LANDLORD-DELETE] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [LANDLORD-DELETE] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete landlord: {str(e)}"
+            detail="Unable to delete landlord. Please try again."
         )

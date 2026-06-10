@@ -52,18 +52,9 @@ async def get_pending_properties(
         
         offset = (page - 1) * limit
         
-        # Get pending properties with landlord info
-        # Note: Supabase range includes both start and end, so we use offset + limit (not offset + limit - 1)
+        # Query pending properties without nested select (FK relationship may not exist)
         result = supabase_admin.table('properties')\
-            .select('''
-                *,
-                landlord:users!landlord_id(
-                    id,
-                    email,
-                    full_name,
-                    verification_status
-                )
-            ''')\
+            .select('*', count='exact')\
             .eq('verification_status', 'pending')\
             .order('created_at', desc=True)\
             .range(offset, offset + limit)\
@@ -71,32 +62,31 @@ async def get_pending_properties(
         
         logger.info(f"✅ [PROPERTIES] Found {len(result.data or [])} pending properties")
         
-        # If landlord join didn't work, manually fetch and join
+        # Always manually fetch and join landlord data
         if result.data and len(result.data) > 0:
-            if not result.data[0].get('landlord'):
-                logger.warning("⚠️ [PROPERTIES/PENDING] Nested select didn't work, doing manual join...")
+            logger.info(f"🔍 [PROPERTIES/PENDING] Fetching landlord data for {len(result.data)} properties...")
+            
+            # Collect unique landlord IDs
+            landlord_ids = list(set(p.get('landlord_id') for p in (result.data or []) if p.get('landlord_id')))
+            
+            if landlord_ids:
+                # Fetch landlord data
+                landlords_result = supabase_admin.table('users')\
+                    .select('id, email, full_name, verification_status')\
+                    .in_('id', landlord_ids)\
+                    .execute()
                 
-                # Collect unique landlord IDs
-                landlord_ids = list(set(p.get('landlord_id') for p in (result.data or []) if p.get('landlord_id')))
+                # Create lookup dict
+                landlords = {l['id']: l for l in (landlords_result.data or [])}
                 
-                if landlord_ids:
-                    # Fetch landlord data
-                    landlords_result = supabase_admin.table('users')\
-                        .select('id, email, full_name, verification_status')\
-                        .in_('id', landlord_ids)\
-                        .execute()
-                    
-                    # Create lookup dict
-                    landlords = {l['id']: l for l in (landlords_result.data or [])}
-                    
-                    # Add landlord data to properties
-                    for prop in (result.data or []):
-                        if prop.get('landlord_id') in landlords:
-                            prop['landlord'] = landlords[prop['landlord_id']]
-                        else:
-                            prop['landlord'] = None
-                    
-                    logger.info(f"✅ [PROPERTIES/PENDING] Manual join completed")
+                # Add landlord data to properties
+                for prop in (result.data or []):
+                    if prop.get('landlord_id') in landlords:
+                        prop['landlord'] = landlords[prop['landlord_id']]
+                    else:
+                        prop['landlord'] = None
+                
+                logger.info(f"✅ [PROPERTIES/PENDING] Manual join completed")
         
         # Get total count
         count_result = supabase_admin.table('properties')\
@@ -115,10 +105,13 @@ async def get_pending_properties(
         }
         
     except Exception as e:
-        logger.error(f"❌ [PROPERTIES] Failed to fetch pending: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to fetch pending: {error_msg}", exc_info=True)
+        
+        # Return user-friendly error message (don't expose Supabase internals)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch pending properties: {str(e)}"
+            detail="Unable to load pending properties. Please try again."
         )
 
 
@@ -138,17 +131,9 @@ async def get_all_properties(
         
         offset = (page - 1) * limit
         
-        # Build query - Try the nested select first
+        # Query properties without nested select (FK relationship may not exist)
         query = supabase_admin.table('properties')\
-            .select('''
-                *,
-                landlord:users!landlord_id(
-                    id,
-                    email,
-                    full_name,
-                    verification_status
-                )
-            ''', count='exact')
+            .select('*', count='exact')
         
         # Add filter if specified
         if verification_status:
@@ -162,36 +147,33 @@ async def get_all_properties(
         
         logger.info(f"✅ [PROPERTIES] Found {len(result.data or [])} properties")
         
-        # Debug: Log first property structure
+        # Always manually fetch and join landlord data
         if result.data and len(result.data) > 0:
-            logger.info(f"🔍 [PROPERTIES] First property keys: {list(result.data[0].keys())}")
-            logger.info(f"🔍 [PROPERTIES] First property landlord field: {result.data[0].get('landlord', 'MISSING')}")
+            logger.info(f"🔍 [PROPERTIES] Fetching landlord data for {len(result.data)} properties...")
             
-            # If landlord join didn't work, manually fetch and join
-            if not result.data[0].get('landlord'):
-                logger.warning("⚠️ [PROPERTIES] Nested select didn't work, doing manual join...")
+            # Collect unique landlord IDs
+            landlord_ids = list(set(p.get('landlord_id') for p in (result.data or []) if p.get('landlord_id')))
+            
+            logger.info(f"🔍 [PROPERTIES] Found {len(landlord_ids)} unique landlords")
+            
+            if landlord_ids:
+                # Fetch landlord data
+                landlords_result = supabase_admin.table('users')\
+                    .select('id, email, full_name, verification_status')\
+                    .in_('id', landlord_ids)\
+                    .execute()
                 
-                # Collect unique landlord IDs
-                landlord_ids = list(set(p.get('landlord_id') for p in (result.data or []) if p.get('landlord_id')))
+                # Create lookup dict
+                landlords = {l['id']: l for l in (landlords_result.data or [])}
                 
-                if landlord_ids:
-                    # Fetch landlord data
-                    landlords_result = supabase_admin.table('users')\
-                        .select('id, email, full_name, verification_status')\
-                        .in_('id', landlord_ids)\
-                        .execute()
-                    
-                    # Create lookup dict
-                    landlords = {l['id']: l for l in (landlords_result.data or [])}
-                    
-                    # Add landlord data to properties
-                    for prop in (result.data or []):
-                        if prop.get('landlord_id') in landlords:
-                            prop['landlord'] = landlords[prop['landlord_id']]
-                        else:
-                            prop['landlord'] = None
-                    
-                    logger.info(f"✅ [PROPERTIES] Manual join completed, added landlord data to {len(result.data or [])} properties")
+                # Add landlord data to properties
+                for prop in (result.data or []):
+                    if prop.get('landlord_id') in landlords:
+                        prop['landlord'] = landlords[prop['landlord_id']]
+                    else:
+                        prop['landlord'] = None
+                
+                logger.info(f"✅ [PROPERTIES] Manual join completed, added landlord data to {len(result.data or [])} properties")
         
         return {
             'properties': result.data or [],
@@ -202,10 +184,13 @@ async def get_all_properties(
         }
         
     except Exception as e:
-        logger.error(f"❌ [PROPERTIES] Failed to fetch all: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to fetch all: {error_msg}", exc_info=True)
+        
+        # Return user-friendly error message (don't expose Supabase internals)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch properties: {str(e)}"
+            detail="Unable to load properties. Please try again."
         )
 
 
@@ -245,10 +230,11 @@ async def get_property_stats(
         return stats
         
     except Exception as e:
-        logger.error(f"❌ [PROPERTIES] Failed to fetch stats: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to fetch stats: {error_msg}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch property stats: {str(e)}"
+            detail="Unable to load property statistics. Please try again."
         )
 
 
@@ -271,19 +257,9 @@ async def get_property_details(
         user_email = current_user.get('email') if isinstance(current_user, dict) else getattr(current_user, 'email', 'Unknown')
         logger.info(f"🏠 [PROPERTIES] Admin {user_email} fetching property {property_id}")
         
-        # Get property with landlord info
+        # Get property without nested select
         result = supabase_admin.table('properties')\
-            .select('''
-                *,
-                landlord:users!landlord_id(
-                    id,
-                    email,
-                    full_name,
-                    phone_number,
-                    verification_status,
-                    created_at
-                )
-            ''')\
+            .select('*')\
             .eq('id', property_id)\
             .single()\
             .execute()
@@ -296,15 +272,35 @@ async def get_property_details(
         
         logger.info(f"✅ [PROPERTIES] Found property: {result.data.get('title', 'Unknown')}")
         
-        return result.data
+        # Fetch landlord data manually
+        property_data = result.data
+        landlord_id = property_data.get('landlord_id')
+        
+        if landlord_id:
+            logger.info(f"🔍 [PROPERTIES] Fetching landlord data for property...")
+            landlord_result = supabase_admin.table('users')\
+                .select('id, email, full_name, phone_number, verification_status, created_at')\
+                .eq('id', landlord_id)\
+                .single()\
+                .execute()
+            
+            if landlord_result.data:
+                property_data['landlord'] = landlord_result.data
+            else:
+                property_data['landlord'] = None
+        else:
+            property_data['landlord'] = None
+        
+        return property_data
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ [PROPERTIES] Failed to fetch property {property_id}: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to fetch property {property_id}: {error_msg}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch property details: {str(e)}"
+            detail="Unable to load property details. Please try again."
         )
 
 

@@ -152,10 +152,11 @@ async def get_tenant_stats(
         return result
         
     except Exception as e:
-        print(f"❌ [TENANT-STATS] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [TENANT-STATS] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch tenant stats: {str(e)}"
+            detail="Unable to load tenant statistics. Please try again."
         )
 
 
@@ -300,15 +301,15 @@ async def list_tenants(
                 for item in (favs_result.data or []):
                     favorites_count[item['user_id']] = item['count']
             except:
-                # Fallback
+                # Fallback - use correct column name 'tenant_id' not 'user_id'
                 favs_result = supabase_admin.table('favorites')\
-                    .select('user_id')\
-                    .in_('user_id', user_ids)\
+                    .select('tenant_id')\
+                    .in_('tenant_id', user_ids)\
                     .execute()
                 
                 for fav in (favs_result.data or []):
-                    user_id = fav['user_id']
-                    favorites_count[user_id] = favorites_count.get(user_id, 0) + 1
+                    tenant_id = fav['tenant_id']
+                    favorites_count[tenant_id] = favorites_count.get(tenant_id, 0) + 1
         
         # Enrich user data
         enriched_users = []
@@ -394,10 +395,11 @@ async def list_tenants(
         return result
         
     except Exception as e:
-        print(f"❌ [TENANT-USERS] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [TENANT-USERS] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch tenants: {str(e)}"
+            detail="Unable to load tenants. Please try again."
         )
 
 
@@ -477,10 +479,11 @@ async def get_tenant_detail(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [TENANT-DETAIL] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [TENANT-DETAIL] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch tenant details: {str(e)}"
+            detail="Unable to load tenant details. Please try again."
         )
 
 
@@ -539,7 +542,7 @@ async def update_tenant(
         if not update_result.data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to update tenant"
+                detail="Unable to update tenant information. Please check your input and try again."
             )
         
         # Clear caches
@@ -557,10 +560,11 @@ async def update_tenant(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [TENANT-UPDATE] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [TENANT-UPDATE] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update tenant: {str(e)}"
+            detail="Unable to update tenant. Please try again."
         )
 
 
@@ -612,8 +616,9 @@ async def delete_tenant(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [TENANT-DELETE] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ [TENANT-DELETE] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete tenant: {str(e)}"
+            detail="Unable to delete tenant. Please try again."
         )

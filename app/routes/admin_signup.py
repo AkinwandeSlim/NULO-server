@@ -95,10 +95,11 @@ async def create_admin_profile(
         }
         
     except Exception as e:
-        print(f"❌ [ADMIN SIGNUP] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [ADMIN SIGNUP] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create admin profile: {str(e)}"
+            detail="Unable to create admin profile. Please try again."
         )
 
 @router.post("/create-profile-dev")
@@ -171,8 +172,9 @@ async def create_admin_profile_dev(
         }
         
     except Exception as e:
-        print(f"❌ [ADMIN SIGNUP DEV] Error: {str(e)}")
+        error_msg = str(e)
+        print(f"\u274c [ADMIN SIGNUP DEV] Error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create admin profile: {str(e)}"
+            detail="Unable to create admin profile. Please try again."
         )
