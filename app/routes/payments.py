@@ -26,17 +26,49 @@ import logging
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
+from typing import List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from app.database import supabase_admin
-from app.middleware.auth import get_current_landlord, get_current_tenant, get_current_user
+from app.middleware.auth import get_current_landlord, get_current_tenant, get_current_user, get_current_admin
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments")
+
+# ========================================
+# Webhook Testing Log (in-memory for QA)
+# ========================================
+# Stores last 50 webhook attempts for debugging
+webhook_test_log: List[dict] = []
+
+def log_webhook_attempt(
+    signature_header: str,
+    signature_valid: bool,
+    event_type: str,
+    paystack_ref: str,
+    reason: str = None
+):
+    """Log webhook attempt for QA testing."""
+    global webhook_test_log
+    
+    attempt = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "signature_header_received": signature_header[:20] + "..." if signature_header else "(none)",
+        "signature_valid": signature_valid,
+        "event_type": event_type,
+        "paystack_ref": paystack_ref,
+        "reason": reason,
+    }
+    
+    webhook_test_log.append(attempt)
+    
+    # Keep only last 50 attempts
+    if len(webhook_test_log) > 50:
+        webhook_test_log.pop(0)
 
 
 # -----------------------------------------------------------------------------
@@ -382,6 +414,8 @@ async def paystack_webhook(request: Request):
 
     # -- HMAC verification -----------------------------------------------------
     secret = _paystack_secret()
+    signature_valid = False
+    
     if secret:
         expected = hmac.new(
             secret.encode("utf-8"),
@@ -389,24 +423,58 @@ async def paystack_webhook(request: Request):
             hashlib.sha512,
         ).hexdigest()
 
-        if not hmac.compare_digest(expected, signature_header):
+        signature_valid = hmac.compare_digest(expected, signature_header)
+        
+        if not signature_valid:
             logger.warning("[PAY][WEBHOOK] Invalid signature -- ignoring request")
+            # Log this for QA testing
+            log_webhook_attempt(
+                signature_header=signature_header,
+                signature_valid=False,
+                event_type="unknown",
+                paystack_ref="",
+                reason="Invalid HMAC signature"
+            )
             # Return 200 so Paystack does not retry (it's not a transient error)
             return {"status": "ok"}
     else:
         logger.warning("[PAY][WEBHOOK] PAYSTACK_SECRET_KEY not set -- skipping HMAC check")
+        log_webhook_attempt(
+            signature_header=signature_header,
+            signature_valid=False,
+            event_type="unknown",
+            paystack_ref="",
+            reason="PAYSTACK_SECRET_KEY not configured"
+        )
 
     # -- Parse event -----------------------------------------------------------
     try:
         event = json.loads(body_bytes)
     except Exception:
         logger.warning("[PAY][WEBHOOK] Could not parse body as JSON")
+        log_webhook_attempt(
+            signature_header=signature_header,
+            signature_valid=signature_valid,
+            event_type="unknown",
+            paystack_ref="",
+            reason="Could not parse JSON body"
+        )
         return {"status": "ok"}
 
     event_type = event.get("event", "")
     data = event.get("data", {})
 
     logger.info(f"[PAY][WEBHOOK] Received event: {event_type}")
+    
+    # Log valid signatures for successful processing
+    if signature_valid:
+        log_webhook_attempt(
+            signature_header=signature_header,
+            signature_valid=True,
+            event_type=event_type,
+            paystack_ref=data.get("reference", ""),
+            reason="HMAC verified successfully"
+        )
 
     # Only handle successful charges
     if event_type != "charge.success":
@@ -850,6 +918,56 @@ async def get_payment_status_by_reference(
 
 
 # -----------------------------------------------------------------------------
+# GET/DELETE /payments/webhook-logs  (QA Debug - must be BEFORE catch-all)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/webhook-logs")
+async def get_webhook_logs(
+    current_user: dict = Depends(get_current_admin),
+):
+    """
+    QA Debug Endpoint: View recent webhook attempts (last 50).
+    
+    Shows:
+    - Timestamp of each attempt
+    - Whether HMAC signature was valid
+    - Event type that was processed
+    - Paystack reference
+    - Reason for rejection (if any)
+    
+    Usage:
+    GET /payments/webhook-logs
+    Headers:
+        Authorization: Bearer <admin-token>
+    """
+    return {
+        "success": True,
+        "total_attempts": len(webhook_test_log),
+        "logs": webhook_test_log
+    }
+
+
+@router.delete("/webhook-logs")
+async def clear_webhook_logs(
+    current_user: dict = Depends(get_current_admin),
+):
+    """
+    Clear webhook test logs (admin only).
+    
+    Usage:
+    DELETE /payments/webhook-logs
+    Headers:
+        Authorization: Bearer <admin-token>
+    """
+    global webhook_test_log
+    webhook_test_log = []
+    
+    logger.info("[PAY] Admin cleared webhook test logs")
+    
+    return {"success": True, "message": "Webhook logs cleared"}
+
+
+# -----------------------------------------------------------------------------
 # GET /payments/{transaction_id}  -- must be LAST (wildcard)
 # -----------------------------------------------------------------------------
 
@@ -1050,3 +1168,133 @@ async def confirm_payment_manually(
     logger.info(f"[PAY] Payment manually confirmed - transaction {transaction['id']}, ref {reference}")
 
     return {"success": True, "message": "Payment confirmed successfully"}
+
+
+# ============================================================================
+# QA TEST ENDPOINTS (for webhook signature verification testing)
+# ============================================================================
+
+@router.post("/test-webhook")
+async def test_webhook_signature(
+    request: Request,
+    current_user: dict = Depends(get_current_admin),
+    test_type: str = "invalid",  # 🆕 NEW: "invalid" or "valid"
+):
+    """
+    QA Test Endpoint: Send test webhook requests to verify signature verification.
+    
+    Supports testing both valid and invalid HMAC-SHA512 signatures.
+    
+    Usage:
+    POST /payments/test-webhook?test_type=invalid
+    POST /payments/test-webhook?test_type=valid
+    Headers:
+        Authorization: Bearer <admin-token>
+    Body:
+        {
+            "event": "charge.success",
+            "data": {
+                "reference": "NULO-TEST-12345",
+                "status": "success",
+                "amount": 50000
+            }
+        }
+    
+    Parameters:
+    - test_type: "invalid" (default) = test rejection of bad signature
+                 "valid" = test acceptance of correct signature
+    
+    Returns:
+    - 200 with webhook processing result
+    - Logs signature validation attempt
+    """
+    body_bytes = await request.body()
+    secret = _paystack_secret()
+    
+    if not secret:
+        logger.warning("[PAY][TEST] PAYSTACK_SECRET_KEY not set")
+        return {
+            "success": False,
+            "message": "Cannot test signature verification - PAYSTACK_SECRET_KEY not configured"
+        }
+
+    # 🆕 Compute the expected signature
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha512,
+    ).hexdigest()
+
+    # 🆕 Determine which signature to use based on test_type
+    if test_type.lower() == "valid":
+        # Use the correct signature
+        signature_header = expected_signature
+        logger.info("[PAY][TEST] QA testing VALID signature")
+    else:
+        # Use an invalid signature
+        signature_header = "FAKE_INVALID_SIGNATURE_FOR_QA_TESTING"
+        logger.info("[PAY][TEST] QA testing INVALID signature")
+
+    # -- HMAC verification (same as production webhook) ---------------------
+    signature_valid = hmac.compare_digest(expected_signature, signature_header)
+    
+    logger.info(f"[PAY][TEST] Signature validation result: {signature_valid}")
+    logger.info(f"[PAY][TEST] Expected: {expected_signature[:30]}...")
+    logger.info(f"[PAY][TEST] Received: {signature_header[:30]}...")
+
+    if not signature_valid:
+        logger.warning("[PAY][TEST] QA test: Signature INVALID (as expected for invalid test)")
+        log_webhook_attempt(
+            signature_header=signature_header,
+            signature_valid=False,
+            event_type="charge.success",
+            paystack_ref="TEST",
+            reason=f"QA Test: Invalid signature ({test_type} mode)"
+        )
+        return {
+            "success": False,
+            "message": "Webhook rejected - Invalid HMAC signature",
+            "details": {
+                "signature_header_received": signature_header,
+                "expected": expected_signature,
+                "match": signature_valid,
+                "test_type": test_type
+            }
+        }
+
+    # Parse and process the test event
+    try:
+        event = json.loads(body_bytes)
+    except Exception as e:
+        logger.warning(f"[PAY][TEST] Could not parse body as JSON: {e}")
+        return {"success": False, "message": f"Invalid JSON body: {e}"}
+
+    event_type = event.get("event", "")
+    data = event.get("data", {})
+    paystack_ref = data.get("reference", "")
+
+    logger.info(f"[PAY][TEST] Signature VALID - Processing event: {event_type}")
+    log_webhook_attempt(
+        signature_header=signature_header,
+        signature_valid=True,
+        event_type=event_type,
+        paystack_ref=paystack_ref,
+        reason=f"QA Test: Valid signature ({test_type} mode)"
+    )
+
+    return {
+        "success": True,
+        "message": "Webhook signature verified successfully",
+        "details": {
+            "signature_header_received": signature_header,
+            "expected": expected_signature,
+            "match": True,
+            "test_type": test_type,
+            "event_type": event_type,
+            "paystack_ref": paystack_ref
+        }
+    }
+
+
+# ============================================================================
+

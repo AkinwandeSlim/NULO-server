@@ -176,15 +176,17 @@ async def sync_verification_status(landlord_id: str, onboarding_id: str, new_sta
 @router.get("")
 async def list_verifications(
     current_admin: UserResponse = Depends(get_current_admin),
-    status_filter: Optional[Literal["pending", "in_review", "approved", "rejected", "needs_correction"]] = None,
+    status_filter: Optional[Literal["partial", "pending", "in_review", "approved", "rejected", "needs_correction"]] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100)
 ) -> Dict[str, Any]:
     """
     Get landlord verification queue
-    Uses v_admin_onboarding_queue view for optimized queries
+    FIXED: Now queries from users table first (like management endpoint)
+    Then enriches with landlord_onboarding details
+    This ensures we capture pending_onboarding (partial) landlords too
     
-    ✅ UNCHANGED: This endpoint remains exactly the same
+    ✅ SAME SOURCE as landlord management endpoint for consistency
     """
     try:
         start_time = time.time()
@@ -195,60 +197,106 @@ async def list_verifications(
         if cached_result:
             return cached_result
         
-        print(f"🔍 [VERIFICATION] Fetching verifications...")
+        print(f"🔍 [VERIFICATION] Fetching verifications from users table...")
         
-        # ── Query landlord_onboarding directly, NOT the queue view ──────────
-        # v_admin_onboarding_queue only returns pending/actionable records.
-        # After approval, landlords disappear from the view and the list
-        # appears empty. We need ALL submitted records so admin can see
-        # approved, rejected, and pending history.
-        query = supabase_admin.table('landlord_onboarding').select('*')
-
-        # Only show records actually submitted for review
-        # (excludes landlords who started but never finished onboarding)
-        query = query.eq('submitted_for_review', True)
-
-        if status_filter:
-            query = query.eq('admin_review_status', status_filter)
-
-        query = query.order('submitted_for_review_at', desc=True)
-
-        # Execute
+        # FIXED: Query ALL landlords FIRST (don't filter yet!)
+        # We must apply smart status detection BEFORE filtering
+        query = supabase_admin.table('users').select('*').eq('user_type', 'landlord')
+        
+        # ❌ DO NOT filter here - we need to apply smart detection logic first
+        # if status_filter:
+        #     query = query.eq('verification_status', status_filter)
+        
+        # Execute - get all landlords
         result = query.execute()
-        all_verifications = result.data or []
-
-        print(f"✅ [VERIFICATION] Found {len(all_verifications)} verifications")
-
-        # Enrich with landlord details from users table
-        if all_verifications:
-            landlord_ids = [v['landlord_id'] for v in all_verifications if v.get('landlord_id')]
-
-            users_result = supabase_admin.table('users')\
-                .select('id, email, full_name, avatar_url, trust_score, phone_number, verification_status')\
-                .in_('id', landlord_ids)\
+        all_users = result.data or []
+        
+        print(f"✅ [VERIFICATION] Found {len(all_users)} total landlords in users table")
+        
+        # Get all onboarding records for enrichment
+        user_ids = [u['id'] for u in all_users]
+        onboarding_map = {}
+        
+        if user_ids:
+            onboarding_result = supabase_admin.table('landlord_onboarding')\
+                .select('*')\
+                .in_('landlord_id', user_ids)\
+                .order('created_at', desc=True)\
                 .execute()
-
-            user_map = {u['id']: u for u in (users_result.data or [])}
-
-            for verification in all_verifications:
-                landlord_id = verification['landlord_id']
-                user = user_map.get(landlord_id, {})
-
-                # Create nested landlord object as expected by frontend
-                verification['landlord'] = {
-                    'id': landlord_id,
+            
+            # Create map of landlord_id -> latest onboarding
+            for ob in (onboarding_result.data or []):
+                landlord_id = ob['landlord_id']
+                if landlord_id not in onboarding_map:
+                    onboarding_map[landlord_id] = ob
+            
+            print(f"✅ [VERIFICATION] Fetched {len(onboarding_map)} onboarding records")
+        
+        # IMPORTANT: Convert users to verification format with proper status distinction FIRST
+        # This must happen BEFORE filtering so we can filter on the SMART status, not raw status
+        # Key distinction:
+        # - submitted_for_review=False → "awaiting_submission" (partial)
+        # - submitted_for_review=True → "pending_review" (pending)
+        all_verifications = []
+        for user in all_users:
+            user_id = user['id']
+            onboarding = onboarding_map.get(user_id, {})
+            
+            # Determine true status based on onboarding submission
+            true_status = user.get('verification_status')
+            
+            if onboarding:
+                # If onboarding record exists, check if they submitted
+                if not onboarding.get('submitted_for_review'):
+                    true_status = 'partial'  # Awaiting submission
+                elif onboarding.get('admin_review_status') == 'pending':
+                    true_status = 'pending'  # Pending review
+                else:
+                    # Use the admin_review_status as truth source if submitted
+                    true_status = onboarding.get('admin_review_status', true_status)
+            else:
+                # No onboarding record = just signed up = awaiting submission
+                if user.get('verification_status') == 'pending':
+                    true_status = 'partial'
+            
+            verification = {
+                'id': f"verification_{user_id}",
+                'landlord_id': user_id,
+                'admin_review_status': true_status,  # Use corrected status
+                'submitted_for_review': onboarding.get('submitted_for_review', False),
+                'created_at': user.get('created_at'),
+                'updated_at': user.get('updated_at'),
+                'landlord': {
+                    'id': user_id,
                     'email': user.get('email'),
                     'full_name': user.get('full_name'),
                     'avatar_url': user.get('avatar_url'),
                     'trust_score': user.get('trust_score', 50),
                     'verification_status': user.get('verification_status'),
+                },
+                'phone_number': user.get('phone_number') or onboarding.get('phone'),
+                'account_type': onboarding.get('landlord_type') or 'individual',
+                'company_name': onboarding.get('company_name'),
+                'submitted_for_review_at': onboarding.get('submitted_for_review_at'),
+                'submitted_at': onboarding.get('submitted_for_review_at'),
+                'verification_submitted_at': onboarding.get('submitted_for_review_at'),
+                # Debug info (optional, remove in production)
+                'debug': {
+                    'user_status': user.get('verification_status'),
+                    'onboarding_exists': bool(onboarding),
+                    'submitted_for_review': onboarding.get('submitted_for_review', False),
                 }
-
-                # phone: users table first, fall back to onboarding record
-                verification['phone_number'] = user.get('phone_number') or verification.get('phone')
-
-                # Always set account_type (landlord_type may be null for older records)
-                verification['account_type'] = verification.get('landlord_type') or 'individual'
+            }
+            
+            all_verifications.append(verification)
+        
+        # NOW apply status filter on the SMART status, not raw user status
+        # This ensures we filter by true_status (which includes submitted_for_review logic)
+        if status_filter:
+            # Map UI status to smart status
+            smart_filter_status = 'partial' if status_filter == 'awaiting_submission' else status_filter
+            all_verifications = [v for v in all_verifications if v.get('admin_review_status') == smart_filter_status]
+            print(f"✅ [VERIFICATION] Filtered to {len(all_verifications)} with smart status '{smart_filter_status}'")
         
         # Paginate
         total = len(all_verifications)
@@ -289,8 +337,11 @@ async def get_verification_stats(
 ) -> Dict[str, Any]:
     """
     Get verification statistics (cached for 60s)
+    FIXED: Now properly distinguishes:
+    - partial (awaiting_submission): verified_status='partial' OR onboarding.submitted_for_review=False
+    - pending (pending_review): onboarding.submitted_for_review=True AND admin_review_status='pending'
     
-    ✅ UNCHANGED: This endpoint remains exactly the same
+    Key insight: Use landlord_onboarding.submitted_for_review as truth source
     """
     try:
         cache_key = "verification_stats"
@@ -301,23 +352,72 @@ async def get_verification_stats(
         print(f"📊 [VERIFICATION-STATS] Calculating stats...")
         start_time = time.time()
         
-        # Get all onboarding records
-        result = supabase_admin.table('landlord_onboarding')\
-            .select('admin_review_status, submitted_for_review')\
+        # Query all landlords from users table
+        result = supabase_admin.table('users')\
+            .select('id, verification_status')\
+            .eq('user_type', 'landlord')\
             .execute()
         
-        verifications = result.data or []
+        all_landlords = result.data or []
         
-        # Calculate stats
+        # Get all onboarding records for status differentiation
+        user_ids = [u['id'] for u in all_landlords]
+        onboarding_map = {}
+        
+        if user_ids:
+            onboarding_result = supabase_admin.table('landlord_onboarding')\
+                .select('landlord_id, submitted_for_review, admin_review_status')\
+                .in_('landlord_id', user_ids)\
+                .execute()
+            
+            for ob in (onboarding_result.data or []):
+                landlord_id = ob['landlord_id']
+                if landlord_id not in onboarding_map:
+                    onboarding_map[landlord_id] = ob
+        
+        # Categorize by true status (using submitted_for_review as key differentiator)
         stats = {
-            "total": len(verifications),
-            "pending": len([v for v in verifications if v.get('admin_review_status') == 'pending']),
-            "in_review": len([v for v in verifications if v.get('admin_review_status') == 'in_review']),
-            "approved": len([v for v in verifications if v.get('admin_review_status') == 'approved']),
-            "rejected": len([v for v in verifications if v.get('admin_review_status') == 'rejected']),
-            "needs_correction": len([v for v in verifications if v.get('admin_review_status') == 'needs_correction']),
-            "not_submitted": len([v for v in verifications if not v.get('submitted_for_review')])
+            "total": len(all_landlords),
+            "partial": 0,      # Not submitted for review yet (awaiting submission)
+            "pending": 0,      # Submitted but pending review
+            "approved": 0,
+            "rejected": 0,
+            # Keep these for backward compatibility
+            "in_review": 0,
+            "needs_correction": 0,
+            "not_submitted": 0,
+            "awaiting_submission": 0
         }
+        
+        for user in all_landlords:
+            user_id = user['id']
+            user_status = user.get('verification_status')
+            onboarding = onboarding_map.get(user_id)
+            
+            # Determine true status
+            if onboarding:
+                if not onboarding.get('submitted_for_review'):
+                    # Has onboarding record but hasn't submitted = partial/awaiting
+                    stats["partial"] += 1
+                    stats["awaiting_submission"] += 1
+                elif onboarding.get('admin_review_status') == 'pending':
+                    # Submitted but not yet reviewed = pending
+                    stats["pending"] += 1
+                elif onboarding.get('admin_review_status') == 'approved':
+                    stats["approved"] += 1
+                elif onboarding.get('admin_review_status') == 'rejected':
+                    stats["rejected"] += 1
+                elif onboarding.get('admin_review_status') == 'needs_correction':
+                    stats["needs_correction"] += 1
+            else:
+                # No onboarding record = just signed up = partial
+                if user_status == 'pending':
+                    stats["partial"] += 1
+                    stats["awaiting_submission"] += 1
+                elif user_status == 'approved':
+                    stats["approved"] += 1
+                elif user_status == 'rejected':
+                    stats["rejected"] += 1
         
         # Cache result
         set_cached(cache_key, stats, ttl_seconds=60)
@@ -332,6 +432,90 @@ async def get_verification_stats(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch stats: {str(e)}"
+        )
+
+
+@router.get("/awaiting-submission")
+async def get_awaiting_submission_landlords(
+    current_admin: UserResponse = Depends(get_current_admin),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100)
+) -> Dict[str, Any]:
+    """
+    Get landlords awaiting submission (in onboarding, haven't submitted docs yet)
+    These are landlords with verification_status = 'pending_onboarding'
+    Shows them with admin_review_status = 'awaiting_submission' for UI consistency
+    """
+    try:
+        start_time = time.time()
+        
+        cache_key = f"awaiting_submission_p{page}_l{limit}"
+        cached_result = get_cached(cache_key, ttl_seconds=30)
+        if cached_result:
+            return cached_result
+        
+        print(f"🔍 [AWAITING-SUBMISSION] Fetching landlords in onboarding...")
+        
+        # Get all landlords in pending_onboarding status (just signed up, not completed onboarding)
+        users_result = supabase_admin.table('users')\
+            .select('id, email, full_name, avatar_url, trust_score, phone_number, created_at')\
+            .eq('verification_status', 'pending_onboarding')\
+            .eq('user_type', 'landlord')\
+            .order('created_at', desc=True)\
+            .execute()
+        
+        all_landlords = users_result.data or []
+        print(f"✅ [AWAITING-SUBMISSION] Found {len(all_landlords)} landlords awaiting submission")
+        
+        # Format response to match verification format
+        formatted_landlords = []
+        for idx, landlord in enumerate(all_landlords):
+            formatted_landlords.append({
+                'id': f"awaiting_{landlord['id']}_{idx}",
+                'landlord_id': landlord['id'],
+                'admin_review_status': 'awaiting_submission',
+                'submitted_for_review': False,
+                'created_at': landlord['created_at'],
+                'landlord': {
+                    'id': landlord['id'],
+                    'email': landlord['email'],
+                    'full_name': landlord['full_name'],
+                    'avatar_url': landlord['avatar_url'],
+                    'trust_score': landlord['trust_score'],
+                    'verification_status': 'pending_onboarding'
+                },
+                'phone_number': landlord.get('phone_number'),
+                'account_type': 'individual'
+            })
+        
+        # Paginate
+        total = len(all_landlords)
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        paginated = formatted_landlords[start_idx:end_idx]
+        
+        response = {
+            "success": True,
+            "verifications": paginated,
+            "pagination": {
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "total_pages": (total + limit - 1) // limit
+            }
+        }
+        
+        set_cached(cache_key, response, ttl_seconds=30)
+        elapsed = time.time() - start_time
+        print(f"✅ [AWAITING-SUBMISSION] Total time: {elapsed:.2f}s")
+        
+        return response
+        
+    except Exception as e:
+        print(f"❌ [AWAITING-SUBMISSION] Error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch awaiting submission landlords: {str(e)}"
         )
 
 

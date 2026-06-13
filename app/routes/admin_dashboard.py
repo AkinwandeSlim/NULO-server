@@ -186,36 +186,46 @@ async def get_dashboard_stats(
         # ONBOARDING STATS (uses CORRECT column: landlord_id!)
         # ============================================================================
         try:
-            # Query landlord_onboarding with correct column name
+            # Query all landlord onboarding records
             onboarding_result = supabase_admin.table('landlord_onboarding')\
-                .select('landlord_id, onboarding_completed_at, admin_review_status')\
-                .not_.is_('onboarding_completed_at', 'null')\
+                .select('landlord_id, submitted_for_review, admin_review_status, onboarding_completed_at')\
                 .execute()
             
-            completed_onboarding = onboarding_result.data or []
-            completed_onboarding_ids = {o['landlord_id'] for o in completed_onboarding}
+            all_onboarding = onboarding_result.data or []
+            onboarding_map = {o['landlord_id']: o for o in all_onboarding}
             
-            # Landlords who completed onboarding but verification is still pending
-            pending_onboarding = sum(
-                1 for l in landlords 
-                if l['id'] in completed_onboarding_ids and 
-                l.get('verification_status') == 'pending'
-            )
+            logger.info(f"📊 [DASHBOARD] Found {len(all_onboarding)} onboarding records")
             
-            # Count by admin review status
-            pending_admin_review = sum(1 for o in completed_onboarding if o.get('admin_review_status') == 'pending')
-            in_review = sum(1 for o in completed_onboarding if o.get('admin_review_status') == 'in_review')
-            approved_onboarding = sum(1 for o in completed_onboarding if o.get('admin_review_status') == 'approved')
+            # FIXED: Apply smart status detection to distinguish:
+            # - awaiting_submission (partial): submitted_for_review = False
+            # - pending_review (pending): submitted_for_review = True AND admin_review_status = 'pending'
             
-            logger.info(f"📊 [DASHBOARD] Onboarding - Completed: {len(completed_onboarding)}, Pending review: {pending_admin_review}")
+            pending_verification = 0  # Submitted for review (pending admin approval)
+            pending_onboarding = 0    # NOT yet submitted (awaiting_submission)
+            
+            for landlord in landlords:
+                landlord_id = landlord['id']
+                onboarding = onboarding_map.get(landlord_id)
+                
+                # Determine true status based on submitted_for_review flag
+                if onboarding:
+                    if not onboarding.get('submitted_for_review'):
+                        # Has onboarding record but hasn't submitted = awaiting_submission
+                        pending_onboarding += 1
+                    elif onboarding.get('admin_review_status') == 'pending':
+                        # Submitted and pending admin review = pending_verification
+                        pending_verification += 1
+                else:
+                    # No onboarding record but verification_status='pending' = awaiting_submission
+                    if landlord.get('verification_status') == 'pending':
+                        pending_onboarding += 1
+            
+            logger.info(f"📊 [DASHBOARD] Landlords - Pending verification: {pending_verification}, Awaiting submission: {pending_onboarding}")
             
         except Exception as e:
             logger.warning(f"⚠️ [DASHBOARD] Onboarding query failed: {str(e)}")
+            pending_verification = landlord_pending  # Fallback to old logic
             pending_onboarding = 0
-            pending_admin_review = 0
-            in_review = 0
-            approved_onboarding = 0
-            completed_onboarding = []
         
         # ============================================================================
         # BUILD RESPONSE
@@ -223,10 +233,10 @@ async def get_dashboard_stats(
         stats = {
             "landlords": {
                 "total": len(landlords),
-                "pending_verification": landlord_pending,
+                "pending_verification": pending_verification,  # ✅ FIXED: Uses submitted_for_review logic
                 "verified": landlord_verified,
                 "rejected": landlord_rejected,
-                "pending_onboarding": pending_onboarding
+                "pending_onboarding": pending_onboarding       # ✅ FIXED: Uses submitted_for_review logic
             },
             "tenants": {
                 "total": len(tenants),
@@ -245,17 +255,11 @@ async def get_dashboard_stats(
                 "available": property_available,
                 "rented": property_rented
             },
-            "onboarding": {
-                "completed_submissions": len(completed_onboarding),
-                "pending_admin_review": pending_admin_review,
-                "in_review": in_review,
-                "approved": approved_onboarding
-            },
             "recent_activity": {
                 "new_landlord_signups_today": new_landlords_today,
                 "new_tenant_signups_today": new_tenants_today,
                 "new_properties_today": new_properties_today,
-                "pending_landlord_verifications": landlord_pending,
+                "pending_landlord_verifications": pending_verification,  # ✅ FIXED
                 "pending_tenant_verifications": tenant_pending,
                 "pending_property_verifications": property_pending_verification
             }

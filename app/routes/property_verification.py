@@ -395,10 +395,11 @@ async def verify_property(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ [PROPERTIES] Failed to {action.action} property {property_id}: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to {action.action} property {property_id}: {error_msg}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to {action.action} property: {str(e)}"
+            detail=f"Unable to {action.action} property. Please try again."
         )
 
 
