@@ -122,12 +122,6 @@ async def get_all_users(
         
         result = query.execute()
         
-        if result.error:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to fetch users"
-            )
-        
         return {
             "success": True,
             "users": result.data or [],
@@ -209,4 +203,245 @@ async def unverify_user(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to unverify user"
+        )
+
+
+# ============================================================================
+# ROLE-BASED ADMIN MANAGEMENT (Using existing admins table)
+# ============================================================================
+
+# Role levels (must match DB constraint)
+ROLE_LEVELS = {
+    "super_admin": 1,
+    "admin": 2,
+    "limited_admin": 3
+}
+
+class AdminRoleUpdate(BaseModel):
+    """Update admin role level"""
+    role_level: int  # 1=super_admin, 2=admin, 3=limited_admin
+    reason: Optional[str] = None
+
+def get_admin_role_level(admin_id: str) -> Optional[int]:
+    """Get admin's role level from admins table"""
+    try:
+        result = supabase_admin.table("admins").select("role_level").eq("id", admin_id).execute()
+        if result.data and len(result.data) > 0:
+            # data is a list, get first item
+            admin_record = result.data[0]
+            if isinstance(admin_record, dict):
+                return admin_record.get("role_level")
+        return None
+    except Exception as e:
+        print(f"❌ [get_admin_role_level] Error: {e}")
+        return None
+
+def check_super_admin(current_admin: UserResponse) -> bool:
+    """Verify current user is super admin (role_level = 1)"""
+    # Handle both dict and object formats for current_admin
+    admin_id = current_admin.get("id") if isinstance(current_admin, dict) else current_admin.id
+    admin_role = get_admin_role_level(admin_id)
+    return admin_role == 1
+
+@router.get("/role-accounts")
+async def get_admin_accounts(
+    current_admin: UserResponse = Depends(get_current_admin),
+    limit: int = 50,
+    offset: int = 0
+):
+    """
+    Get list of all admin accounts with their details
+    Only Super Admins can view all admins
+    Uses admins table joined with users table
+    """
+    try:
+        # Handle both dict and object formats for current_admin
+        admin_id = current_admin.get("id") if isinstance(current_admin, dict) else current_admin.id
+        print(f"🔍 [GET_ADMIN_ACCOUNTS] Starting - current_admin type: {type(current_admin)}, admin_id: {admin_id}")
+        
+        if not check_super_admin(current_admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only Super Admins can view admin accounts"
+            )
+        
+        print(f"✅ [GET_ADMIN_ACCOUNTS] Super admin check passed")
+        
+        # Fetch admins with user details - use try-except for error handling (not .error attribute)
+        result = supabase_admin.table("admins").select(
+            "id, role_level, permissions, last_action_at, created_at, updated_at, "
+            "users(email, full_name, avatar_url)"
+        ).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        
+        print(f"✅ [GET_ADMIN_ACCOUNTS] Query executed - result type: {type(result)}")
+        print(f"📊 [GET_ADMIN_ACCOUNTS] Result data type: {type(result.data)}, length: {len(result.data) if result.data else 0}")
+        
+        # Transform response to include user data
+        admins_with_users = []
+        for idx, admin in enumerate(result.data or []):
+            print(f"📝 [GET_ADMIN_ACCOUNTS] Processing admin {idx} - type: {type(admin)}")
+            print(f"📝 [GET_ADMIN_ACCOUNTS] Admin data: {admin}")
+            
+            try:
+                # Make sure admin is a dict
+                if not isinstance(admin, dict):
+                    print(f"⚠️ [GET_ADMIN_ACCOUNTS] Admin is not dict! Type: {type(admin)}")
+                    admin = dict(admin) if hasattr(admin, '__dict__') else {}
+                
+                user = admin.get("users", {})
+                print(f"👤 [GET_ADMIN_ACCOUNTS] User data type: {type(user)}, value: {user}")
+                
+                admin_obj = {
+                    "id": admin.get("id"),
+                    "email": user.get("email") if isinstance(user, dict) else (user.email if hasattr(user, 'email') else None),
+                    "full_name": user.get("full_name") if isinstance(user, dict) else (user.full_name if hasattr(user, 'full_name') else None),
+                    "avatar_url": user.get("avatar_url") if isinstance(user, dict) else (user.avatar_url if hasattr(user, 'avatar_url') else None),
+                    "role_level": admin.get("role_level"),
+                    "permissions": admin.get("permissions", {}),
+                    "last_action_at": admin.get("last_action_at"),
+                    "created_at": admin.get("created_at"),
+                    "updated_at": admin.get("updated_at")
+                }
+                admins_with_users.append(admin_obj)
+                print(f"✅ [GET_ADMIN_ACCOUNTS] Added admin: {admin_obj['id']}")
+                
+            except Exception as e:
+                print(f"❌ [GET_ADMIN_ACCOUNTS] Error processing admin {idx}: {str(e)}")
+                print(f"❌ [GET_ADMIN_ACCOUNTS] Admin object: {admin}")
+                raise
+        
+        print(f"✅ [GET_ADMIN_ACCOUNTS] Completed - returning {len(admins_with_users)} admins")
+        
+        return {
+            "success": True,
+            "admins": admins_with_users,
+            "total": len(admins_with_users)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ [ADMIN API] Error fetching admin accounts: {e}")
+        print(f"❌ [ADMIN API] Error type: {type(e)}")
+        import traceback
+        print(f"❌ [ADMIN API] Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch admin accounts: {str(e)}"
+        )
+
+@router.post("/admin-accounts/{admin_id}/role")
+async def update_admin_role(
+    admin_id: str,
+    role_update: AdminRoleUpdate,
+    current_admin: UserResponse = Depends(get_current_admin)
+):
+    """
+    Update admin role level in admins table
+    Only Super Admins can change admin roles
+    role_level: 1=super_admin, 2=admin, 3=limited_admin
+    """
+    try:
+        if not check_super_admin(current_admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only Super Admins can update admin roles"
+            )
+        
+        # Handle both dict and object formats for current_admin
+        current_admin_id = current_admin.get("id") if isinstance(current_admin, dict) else current_admin.id
+        
+        if admin_id == current_admin_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot modify your own admin role"
+            )
+        
+        # Validate role_level
+        if role_update.role_level not in [1, 2, 3]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid role_level. Must be 1 (super_admin), 2 (admin), or 3 (limited_admin)"
+            )
+        
+        # Update admin role in admins table
+        result = supabase_admin.table("admins").update(
+            {
+                "role_level": role_update.role_level,
+                "updated_at": datetime.now().isoformat()
+            }
+        ).eq("id", admin_id).execute()
+        
+        if not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update admin role"
+            )
+        
+        role_names = {1: "super_admin", 2: "admin", 3: "limited_admin"}
+        
+        return {
+            "success": True,
+            "message": f"Admin role updated to {role_names.get(role_update.role_level)}",
+            "admin_id": admin_id,
+            "role_level": role_update.role_level
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ [ADMIN API] Error updating admin role: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update admin role"
+        )
+
+@router.delete("/admin-accounts/{admin_id}")
+async def delete_admin_account(
+    admin_id: str,
+    current_admin: UserResponse = Depends(get_current_admin)
+):
+    """
+    Delete admin account (soft delete from admins table)
+    Only Super Admins can delete admins
+    Cannot delete yourself
+    """
+    try:
+        if not check_super_admin(current_admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only Super Admins can delete admin accounts"
+            )
+        
+        # Handle both dict and object formats for current_admin
+        current_admin_id = current_admin.get("id") if isinstance(current_admin, dict) else current_admin.id
+        
+        if admin_id == current_admin_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete your own admin account"
+            )
+        
+        # Soft delete: remove from admins table (user account remains in users table)
+        result = supabase_admin.table("admins").delete().eq("id", admin_id).execute()
+        
+        if not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete admin account"
+            )
+        
+        return {
+            "success": True,
+            "message": "Admin account deleted. User account remains in system.",
+            "admin_id": admin_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ [ADMIN API] Error deleting admin account: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete admin account"
         )
