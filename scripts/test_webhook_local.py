@@ -336,7 +336,7 @@ def main():
     print(f"signature    : {signature[:40]}...{signature[-12:]}")
     print(f"\nPOST {args.url}")
     try:
-        resp = requests.post(args.url, data=body, headers=headers, timeout=30)
+        resp = requests.post(args.url, data=body, headers=headers, timeout=60)
     except requests.RequestException as exc:
         print(f"\nERROR: request failed -- {exc}")
         sys.exit(2)

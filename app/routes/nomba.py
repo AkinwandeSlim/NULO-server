@@ -112,9 +112,17 @@ async def provision_nomba(
     else:
         raw_name = landlord_name
 
+    # Sanitize: only allow ASCII alphanumeric, spaces, hyphens
+    # Remove any Unicode characters that might cause Nomba validation errors
+    sanitized = []
+    for char in raw_name.strip():
+        if char.isascii() and (char.isalnum() or char in " -"):
+            sanitized.append(char)
+    clean_name = "".join(sanitized).strip()
+
     # Nomba spec: accountName must be 8-64 chars.
     # Strip whitespace, pad short names, truncate long names.
-    account_name = raw_name.strip()[:64]
+    account_name = clean_name[:64]
     if len(account_name) < 8:
         # Pad to satisfy the 8-char minimum (e.g. "Adaeze Okafor" -> "Adaeze Okafor NuloAfrica")
         account_name = (account_name + " NuloAfrica")[:64]
