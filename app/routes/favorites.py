@@ -6,6 +6,7 @@ from app.database import supabase_admin
 from app.middleware.auth import get_current_tenant, get_current_user
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Dict
 
 router = APIRouter(prefix="/favorites")
 
@@ -26,56 +27,80 @@ async def get_favorites(current_user: dict = Depends(get_current_user)):
 
     try:
         tenant_id = current_user["id"]
-        
-        # Fetch favorites (simplified query without complex joins)
+
+        # ── Fetch favorites (1 query) ────────────────────────────────────────
         favorites_response = supabase_admin.table("favorites").select(
             "*"
         ).eq("tenant_id", tenant_id).order("created_at", desc=True).execute()
-        
-        # Format response
+
+        favorites_data = favorites_response.data or []
+        if not favorites_data:
+            return {
+                "success": True,
+                "favorites": [],
+                "total": 0,
+                "count": 0
+            }
+
+        # ── Batch fetch all properties in one query (was N queries) ──────────
+        property_ids = list({fav["property_id"] for fav in favorites_data if fav.get("property_id")})
+        properties_by_id: Dict[str, dict] = {}
+        if property_ids:
+            props_resp = supabase_admin.table("properties").select(
+                "*"
+            ).in_("id", property_ids).execute()
+            properties_by_id = {p["id"]: p for p in (props_resp.data or [])}
+
+        # ── Batch fetch all landlords in one query (was N queries) ───────────
+        landlord_ids = list({
+            p["landlord_id"]
+            for p in properties_by_id.values()
+            if p.get("landlord_id")
+        })
+        landlords_by_id: Dict[str, dict] = {}
+        if landlord_ids:
+            landlords_resp = supabase_admin.table("users").select(
+                "id, full_name, avatar_url, trust_score, verification_status"
+            ).in_("id", landlord_ids).execute()
+            landlords_by_id = {u["id"]: u for u in (landlords_resp.data or [])}
+
+        # ── Assemble response using lookup dictionaries ──────────────────────
         favorites = []
-        for fav in favorites_response.data:
+        current_year = datetime.now().year
+        for fav in favorites_data:
             try:
-                # Fetch property details separately
-                property_response = supabase_admin.table("properties").select("*").eq(
-                    "id", fav["property_id"]
-                ).execute()
-                
-                if property_response.data and len(property_response.data) > 0:
-                    property_data = property_response.data[0]
-                    
-                    # Fetch landlord details separately
-                    landlord_response = supabase_admin.table("users").select(
-                        "id, full_name, avatar_url, trust_score, verification_status"
-                    ).eq("id", property_data["landlord_id"]).execute()
-                    
-                    if landlord_response.data and len(landlord_response.data) > 0:
-                        landlord_data = landlord_response.data[0]
-                        property_data['landlord'] = {
-                            'id': landlord_data['id'],
-                            'name': landlord_data.get('full_name'),
-                            'avatar_url': landlord_data.get('avatar_url'),
-                            'trust_score': landlord_data.get('trust_score', 50),
-                            'verified': landlord_data.get('verification_status') == 'approved',
-                            'properties_count': 0,
-                            'joined_year': datetime.now().year,
-                            'guarantee_joined': False
-                        }
-                    
-                    property_data['is_favorited'] = True
-                    favorites.append(property_data)
+                prop = properties_by_id.get(fav.get("property_id"))
+                if not prop:
+                    # Property was deleted/unavailable — skip gracefully
+                    continue
+
+                landlord_row = landlords_by_id.get(prop.get("landlord_id"))
+                if landlord_row:
+                    prop['landlord'] = {
+                        'id': landlord_row['id'],
+                        'name': landlord_row.get('full_name'),
+                        'avatar_url': landlord_row.get('avatar_url'),
+                        'trust_score': landlord_row.get('trust_score', 50),
+                        'verified': landlord_row.get('verification_status') == 'approved',
+                        'properties_count': 0,
+                        'joined_year': current_year,
+                        'guarantee_joined': False
+                    }
+
+                prop['is_favorited'] = True
+                favorites.append(prop)
             except Exception as fav_error:
                 # Log error but continue processing other favorites
                 print(f"Error processing favorite {fav.get('id')}: {str(fav_error)}")
                 continue
-        
+
         return {
             "success": True,
             "favorites": favorites,
             "total": len(favorites),
             "count": len(favorites)  # Keep for backward compatibility
         }
-        
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -1,14 +1,55 @@
 """
 Tenant api routes
 """
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, File, UploadFile
 from app.database import supabase_admin
 from app.middleware.auth import get_current_tenant
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 router = APIRouter(prefix="/tenants")
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+async def upload_document_with_timeout(file_content: bytes, file_name: str, content_type: str, timeout: int = 30) -> Optional[str]:
+    """
+    Upload document to Supabase storage with timeout handling.
+    Returns public URL on success, None on failure.
+    """
+    try:
+        def do_upload():
+            return supabase_admin.storage.from_("application-documents").upload(
+                path=file_name,
+                file=file_content,
+                file_options={"content-type": content_type}
+            )
+        
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(executor, do_upload),
+            timeout=timeout
+        )
+        
+        def get_url():
+            return supabase_admin.storage.from_("application-documents").get_public_url(file_name)
+        
+        public_url = await asyncio.wait_for(
+            loop.run_in_executor(executor, get_url),
+            timeout=10
+        )
+        
+        print(f"✅ Document uploaded: {public_url}")
+        return public_url
+        
+    except asyncio.TimeoutError:
+        print(f"⚠️ Document upload timed out after {timeout}s: {file_name}")
+        return None
+    except Exception as e:
+        print(f"⚠️ Document upload failed: {type(e).__name__}: {str(e)}")
+        return None
 
 
 class TenantProfileUpdate(BaseModel):
@@ -299,3 +340,47 @@ def calculate_profile_completion(tenant_data: dict) -> int:
         completion = 100
     
     return completion
+
+
+@router.post("/upload-document")
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_tenant)
+):
+    """
+    Upload tenant document to Supabase storage
+    """
+    try:
+        # Read file content
+        file_content = await file.read()
+        
+        # Generate unique file name with tenant ID prefix
+        import uuid
+        file_extension = file.filename.split(".")[-1] if "." in file.filename else "pdf"
+        unique_file_name = f"tenant-docs/{current_user['id']}/{uuid.uuid4()}.{file_extension}"
+        
+        # Upload to storage
+        document_url = await upload_document_with_timeout(
+            file_content=file_content,
+            file_name=unique_file_name,
+            content_type=file.content_type or "application/pdf"
+        )
+        
+        if not document_url:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to upload document"
+            )
+        
+        return {
+            "success": True,
+            "url": document_url
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload document: {str(e)}"
+        )

@@ -218,29 +218,79 @@ async def get_optional_current_user(
         return None
 
     token = credentials.credentials
+    print(f"🔍 [get_optional_current_user] Received token (first 20): {token[:20]}...{token[-10:] if len(token) > 30 else ''}")
+
+    # Check cache first
+    cached_user = await token_cache.get(token)
+    if cached_user:
+        print(f"✅ [get_optional_current_user] Token found in cache, returning cached user")
+        return cached_user
 
     try:
+        # Try Supabase token validation first
         user_response = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
                 None, lambda: supabase_admin.auth.get_user(token)
             ),
-            timeout=10.0
+            timeout=5.0
         )
-        if not user_response or not user_response.user:
-            return None
-
-        user_id = user_response.user.id
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: supabase_admin.table("users").select(
-                "id, email, full_name, user_type, trust_score, verification_status, avatar_url"
-            ).eq("id", user_id).single().execute()
-        )
-        return response.data if response.data else None
-
+        if user_response and user_response.user:
+            user_id = user_response.user.id
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: supabase_admin.table("users").select(
+                    "id, email, full_name, user_type, trust_score, verification_status, avatar_url"
+                ).eq("id", user_id).single().execute()
+            )
+            if response.data:
+                await token_cache.set(token, response.data)
+                print(f"✅ [get_optional_current_user] Supabase validation successful")
+                return response.data
+            print("⚠️ [get_optional_current_user] User profile not found in database")
+    except asyncio.TimeoutError:
+        print("⚠️ [get_optional_current_user] Supabase auth timed out (>5s)")
+    except ExpiredSignatureError:
+        print("⚠️ [get_optional_current_user] Token expired")
     except Exception as e:
-        print(f"Optional auth error (non-critical): {e}")
-        return None
+        print(f"⚠️ [get_optional_current_user] Supabase validation failed: {e}")
+
+    # Try JWT fallback
+    try:
+        try:
+            payload = jwt.decode(
+                token, 
+                settings.JWT_SECRET_KEY, 
+                algorithms=[settings.JWT_ALGORITHM],
+                options={"verify_signature": True}
+            )
+        except JWTError:
+            payload = jwt.decode(
+                token,
+                key="",
+                options={"verify_signature": False}
+            )
+        
+        user_id = payload.get("sub") or payload.get("user_id")
+        if user_id:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: supabase_admin.table("users").select(
+                    "id, email, full_name, user_type, trust_score, verification_status, avatar_url"
+                ).eq("id", user_id).single().execute()
+            )
+            if response.data:
+                await token_cache.set(token, response.data)
+                print(f"✅ [get_optional_current_user] JWT validation successful")
+                return response.data
+    except ExpiredSignatureError:
+        print("⚠️ [get_optional_current_user] JWT expired")
+    except JWTError as jwt_err:
+        print(f"⚠️ [get_optional_current_user] JWT decode error: {jwt_err}")
+    except Exception as e:
+        print(f"⚠️ [get_optional_current_user] JWT lookup failed: {e}")
+
+    # If all else fails, return None
+    return None
 
 
 

@@ -57,7 +57,10 @@ NotifType = Literal[
     'message',
     'onboarding_approved',
     'onboarding_rejected',
-    'onboarding_needs_correction'
+    'onboarding_needs_correction',
+    'maintenance_created',
+    'maintenance_resolved',
+    'maintenance_updated'
 ]
 
 

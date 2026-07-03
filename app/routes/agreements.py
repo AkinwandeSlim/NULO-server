@@ -37,8 +37,9 @@ from io import BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageTemplate
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageTemplate, Frame
 from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
 router = APIRouter(prefix="/agreements")
@@ -718,27 +719,162 @@ Agreement Reference: {uuid.uuid4()}
 """.strip()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF branding — colours + page chrome (header / footer) for the agreement
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Brand palette — kept in sync with client/tailwind config (orange / slate).
+BRAND_ORANGE       = colors.HexColor("#F97316")
+BRAND_ORANGE_DARK  = colors.HexColor("#C2410C")
+BRAND_SLATE        = colors.HexColor("#334155")
+BRAND_SLATE_LIGHT  = colors.HexColor("#64748B")
+BRAND_BG           = colors.HexColor("#FFF7ED")  # very light orange wash
+
+PAGE_WIDTH, PAGE_HEIGHT = letter
+LEFT_MARGIN  = 0.75 * inch
+RIGHT_MARGIN = 0.75 * inch
+TOP_MARGIN   = 1.30 * inch   # leaves room for the brand header
+BOTTOM_MARGIN = 0.95 * inch  # leaves room for the page footer
+
+
+def _draw_header_footer(canvas_obj: "canvas.Canvas", agreement: dict) -> None:
+    """Draw the branded header (logo wordmark + tagline) and footer (page #
+    + brand line) on every page of the agreement PDF.
+
+    This function is passed as the ``onPage`` callback for the document's
+    PageTemplate — ReportLab invokes it once per page, after laying out the
+    main flowables but before finalising the page.
+
+    The "logo" here is rendered as a typographic wordmark (a small house icon
+    glyph + the word "NuloAfrica") so the PDF is fully self-contained and
+    does not depend on any external SVG/image asset being available at
+    render time. The same brand colours are used in the web app.
+    """
+    page_w, page_h = PAGE_WIDTH, PAGE_HEIGHT
+
+    # ── HEADER ─────────────────────────────────────────────────────────────
+    # Coloured bar across the top — orange brand band.
+    canvas_obj.setFillColor(BRAND_ORANGE)
+    canvas_obj.rect(0, page_h - 0.45 * inch, page_w, 0.45 * inch,
+                    stroke=0, fill=1)
+
+    # White house glyph + "NuloAfrica" wordmark inside the orange band.
+    # The glyph is drawn as a triangle-on-square pictogram (≈ 0.22" wide).
+    gx = LEFT_MARGIN
+    gy = page_h - 0.40 * inch
+    canvas_obj.setFillColor(colors.white)
+    canvas_obj.rect(gx, gy, 0.22 * inch, 0.18 * inch, stroke=0, fill=1)
+    # Roof triangle
+    p = canvas_obj.beginPath()
+    p.moveTo(gx - 0.02 * inch, gy + 0.18 * inch)
+    p.lineTo(gx + 0.11 * inch, gy + 0.30 * inch)
+    p.lineTo(gx + 0.24 * inch, gy + 0.18 * inch)
+    p.close()
+    canvas_obj.drawPath(p, stroke=0, fill=1)
+    # Tiny "door" detail
+    canvas_obj.setFillColor(BRAND_ORANGE)
+    canvas_obj.rect(gx + 0.085 * inch, gy, 0.05 * inch, 0.10 * inch,
+                    stroke=0, fill=1)
+
+    # Wordmark text — bold white "NuloAfrica" next to the glyph
+    canvas_obj.setFillColor(colors.white)
+    canvas_obj.setFont("Helvetica-Bold", 16)
+    canvas_obj.drawString(gx + 0.32 * inch, gy + 0.07 * inch, "NuloAfrica")
+
+    # Right-aligned tagline inside the header band
+    canvas_obj.setFont("Helvetica-Oblique", 9)
+    canvas_obj.drawRightString(page_w - RIGHT_MARGIN, gy + 0.10 * inch,
+                               "Zero-Agency Rental Platform · Nigeria")
+
+    # Thin slate divider under the header
+    canvas_obj.setStrokeColor(BRAND_SLATE)
+    canvas_obj.setLineWidth(0.6)
+    canvas_obj.line(LEFT_MARGIN, page_h - 0.55 * inch,
+                    page_w - RIGHT_MARGIN, page_h - 0.55 * inch)
+
+    # ── FOOTER ─────────────────────────────────────────────────────────────
+    # Light divider above footer
+    canvas_obj.setStrokeColor(BRAND_SLATE_LIGHT)
+    canvas_obj.setLineWidth(0.4)
+    canvas_obj.line(LEFT_MARGIN, 0.70 * inch,
+                    page_w - RIGHT_MARGIN, 0.70 * inch)
+
+    # Left: brand line
+    canvas_obj.setFillColor(BRAND_SLATE)
+    canvas_obj.setFont("Helvetica-Bold", 8)
+    canvas_obj.drawString(LEFT_MARGIN, 0.50 * inch,
+                          "NuloAfrica · Trusted Rental Agreements")
+    canvas_obj.setFont("Helvetica", 7)
+    canvas_obj.setFillColor(BRAND_SLATE_LIGHT)
+    canvas_obj.drawString(LEFT_MARGIN, 0.36 * inch,
+                          f"Agreement ID: {agreement.get('id', 'N/A')}")
+
+    # Right: page number ("Page X of Y")
+    canvas_obj.setFont("Helvetica", 8)
+    canvas_obj.setFillColor(BRAND_SLATE)
+    page_num = canvas_obj.getPageNumber()
+    canvas_obj.drawRightString(page_w - RIGHT_MARGIN, 0.50 * inch,
+                               f"Page {page_num}")
+
+
 def _generate_agreement_pdf(agreement: dict) -> str:
     """
     Generate a professional PDF document for a signed agreement and upload to Supabase Storage.
     Uses ReportLab to create PDF with styling, margins, and professional layout.
-    
+
+    If the caller pre-populates ``agreement["_tenant"]``, ``agreement["_landlord"]``
+    or ``agreement["_property"]`` with inline dicts, those override the values
+    that would otherwise be fetched from the database. This lets the test /
+    preview endpoint generate a PDF without inserting real user/property rows
+    into Supabase — see ``routes/test_agreement.py``.
+
     Returns: Public download URL from Supabase Storage, or None if generation fails
     """
     try:
-        # Fetch rich data for the agreement
-        tenant_data, landlord_data, property_data = _fetch_agreement_participants(agreement)
+        # Inline overrides (used by the test / preview endpoint). If the
+        # caller passed inline dicts, trust them and skip the DB lookup.
+        inline_tenant   = agreement.get("_tenant")
+        inline_landlord = agreement.get("_landlord")
+        inline_property = agreement.get("_property")
+
+        if inline_tenant and inline_landlord and inline_property:
+            tenant_data   = inline_tenant
+            landlord_data = inline_landlord
+            property_data = inline_property
+        else:
+            # Production path — fetch rich data for the agreement from Supabase.
+            tenant_data, landlord_data, property_data = _fetch_agreement_participants(agreement)
         
         # Create PDF in memory
         pdf_buffer = BytesIO()
         doc = SimpleDocTemplate(
             pdf_buffer,
             pagesize=letter,
-            rightMargin=0.75 * inch,
-            leftMargin=0.75 * inch,
-            topMargin=0.75 * inch,
-            bottomMargin=0.75 * inch
+            rightMargin=RIGHT_MARGIN,
+            leftMargin=LEFT_MARGIN,
+            topMargin=TOP_MARGIN,
+            bottomMargin=BOTTOM_MARGIN,
         )
+
+        # Page template with branded header + footer on every page.
+        # The frame sits inside the margins defined above so the body text
+        # never collides with the brand band at the top or the page
+        # number / brand line at the bottom.
+        brand_frame = Frame(
+            LEFT_MARGIN,
+            BOTTOM_MARGIN,
+            PAGE_WIDTH - LEFT_MARGIN - RIGHT_MARGIN,
+            PAGE_HEIGHT - TOP_MARGIN - BOTTOM_MARGIN,
+            id="brand_frame",
+            showBoundary=0,
+        )
+        doc.addPageTemplates([
+            PageTemplate(
+                id="branded",
+                frames=[brand_frame],
+                onPage=lambda c, d: _draw_header_footer(c, agreement),
+            )
+        ])
         
         # Build document content
         elements = []
@@ -775,14 +911,62 @@ def _generate_agreement_pdf(agreement: dict) -> str:
             leading=12
         )
         
+        # Letterhead subtitle — sits right under the orange header band,
+        # gives the document an "official letterhead" feel.
+        subtitle_style = ParagraphStyle(
+            'Subtitle',
+            parent=styles['BodyText'],
+            fontSize=9,
+            textColor=BRAND_SLATE_LIGHT,
+            alignment=TA_CENTER,
+            spaceAfter=2,
+            fontName='Helvetica-Oblique',
+        )
+        elements.append(Spacer(1, 0.05 * inch))
+        elements.append(Paragraph(
+            "OFFICIAL RESIDENTIAL TENANCY DOCUMENT", subtitle_style
+        ))
+        elements.append(Spacer(1, 0.05 * inch))
+
         # Title
         elements.append(Paragraph("RESIDENTIAL LEASE AGREEMENT", title_style))
-        elements.append(Spacer(1, 0.15 * inch))
+        elements.append(Spacer(1, 0.10 * inch))
         
-        # Agreement ID and Date
-        elements.append(Paragraph(f"<b>Agreement ID:</b> {agreement.get('id', 'N/A')}", body_style))
-        elements.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%B %d, %Y')}", body_style))
-        elements.append(Spacer(1, 0.2 * inch))
+        # Reference block — Agreement ID + generated date in a tidy 2-col
+        # table so the reference is scannable and looks like a real
+        # letterhead reference block (rather than loose body text).
+        ref_table = Table(
+            [[
+                Paragraph(
+                    f"<b>Agreement ID</b><br/>"
+                    f"<font size=8 color='#64748B'>{agreement.get('id', 'N/A')}</font>",
+                    body_style,
+                ),
+                Paragraph(
+                    f"<b>Date Issued</b><br/>"
+                    f"<font size=8 color='#64748B'>{datetime.now().strftime('%B %d, %Y')}</font>",
+                    body_style,
+                ),
+                Paragraph(
+                    f"<b>Status</b><br/>"
+                    f"<font size=8 color='#16A34A'><b>FULLY EXECUTED</b></font>",
+                    body_style,
+                ),
+            ]],
+            colWidths=[2.4 * inch, 2.0 * inch, 2.4 * inch],
+        )
+        ref_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), BRAND_BG),
+            ("BOX",        (0, 0), (-1, -1), 0.5, BRAND_ORANGE),
+            ("INNERGRID",  (0, 0), (-1, -1), 0.4, colors.HexColor("#FED7AA")),
+            ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(ref_table)
+        elements.append(Spacer(1, 0.25 * inch))
         
         # Parties Section
         elements.append(Paragraph("PARTIES TO THIS AGREEMENT", heading_style))
@@ -844,20 +1028,60 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         tenant_signed_date = agreement.get('tenant_signed_at', None)
         landlord_signed_date = agreement.get('landlord_signed_at', None)
         
-        tenant_stat = f"✓ Signed on {tenant_signed_date[:10]}" if tenant_signed_date else "✗ Pending"
-        landlord_stat = f"✓ Signed on {landlord_signed_date[:10]}" if landlord_signed_date else "✗ Pending"
+        tenant_stat_text = (
+            f"<font color='#16A34A'><b>SIGNED</b></font><br/>"
+            f"<font size=8 color='#64748B'>{tenant_signed_date[:10]}</font>"
+            if tenant_signed_date
+            else "<font color='#DC2626'><b>PENDING</b></font>"
+        )
+        landlord_stat_text = (
+            f"<font color='#16A34A'><b>SIGNED</b></font><br/>"
+            f"<font size=8 color='#64748B'>{landlord_signed_date[:10]}</font>"
+            if landlord_signed_date
+            else "<font color='#DC2626'><b>PENDING</b></font>"
+        )
+
+        # Signature table — 2 columns, tenant + landlord, each showing the
+        # name, the signed status and the date. Looks like a formal
+        # execution block at the end of a contract.
+        sig_table = Table(
+            [[
+                Paragraph(
+                    f"<b>TENANT</b><br/><br/>"
+                    f"<font size=10>{tenant_name}</font><br/><br/>"
+                    f"<b>Signature Status:</b><br/>{tenant_stat_text}",
+                    body_style,
+                ),
+                Paragraph(
+                    f"<b>LANDLORD</b><br/><br/>"
+                    f"<font size=10>{landlord_name}</font><br/><br/>"
+                    f"<b>Signature Status:</b><br/>{landlord_stat_text}",
+                    body_style,
+                ),
+            ]],
+            colWidths=[3.4 * inch, 3.4 * inch],
+        )
+        sig_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), BRAND_BG),
+            ("BOX",        (0, 0), (-1, -1), 0.6, BRAND_ORANGE),
+            ("INNERGRID",  (0, 0), (-1, -1), 0.5, colors.HexColor("#FED7AA")),
+            ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 12),
+            ("TOPPADDING",    (0, 0), (-1, -1), 12),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+        ]))
+        elements.append(sig_table)
+        elements.append(Spacer(1, 0.25 * inch))
         
-        elements.append(Paragraph(f"<b>Tenant Signature:</b> {tenant_stat}", body_style))
-        elements.append(Paragraph(f"<b>Landlord Signature:</b> {landlord_stat}", body_style))
-        elements.append(Spacer(1, 0.3 * inch))
-        
-        # Footer
+        # Footer note inside the body (the on-page footer is added by the
+        # PageTemplate callback; this stays as a closing legal note.)
         elements.append(Paragraph(
             "<hr/>",
             body_style
         ))
         elements.append(Paragraph(
-            "This is a digitally generated agreement. Both parties have electronically signed this document.",
+            "This is a digitally generated agreement. Both parties have electronically signed this document via NuloAfrica's secure signing system. The signature timestamps and IP addresses are recorded for audit purposes.",
             ParagraphStyle(
                 'Footer',
                 parent=styles['BodyText'],
@@ -870,29 +1094,41 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         # Build PDF
         doc.build(elements)
         pdf_buffer.seek(0)
-        
-        # Upload to Supabase Storage (using public bucket for downloadable PDFs)
+
+        # Upload to Supabase Storage bucket 'ownership-docs' (public bucket).
+        # NB: earlier versions wrote to the 'property-images' bucket, which does
+        # not exist in this environment, so the resulting public URLs 404'd
+        # with "Object not found". The correct bucket for agreement artefacts
+        # (title documents, signed leases, etc.) is 'ownership-docs'.
+        # AGMT-08 in the QA checklist.
         file_name = f"agreements/{agreement['id']}.pdf"
-        
+
         try:
-            storage_response = supabase_admin.storage.from_('property-images').upload(
+            storage_response = supabase_admin.storage.from_('ownership-docs').upload(
                 file=pdf_buffer.getvalue(),
                 path=file_name,
                 file_options={"content-type": "application/pdf"}
             )
-            logger.info(f"✅ [AGREEMENTS] PDF uploaded to property-images/{file_name}")
+            logger.info(f"✅ [AGREEMENTS] PDF uploaded to ownership-docs/{file_name}")
         except Exception as upload_error:
             logger.warning(f"⚠️ [AGREEMENTS] Storage upload warning: {upload_error}")
-        
-        # Generate public URL (property-images is public bucket)
-        pdf_url = supabase_admin.storage.from_('property-images').get_public_url(file_name)
-        
+
+        # Generate public URL (ownership-docs is a public bucket).
+        # If the file already exists from a previous attempt, append a
+        # timestamp to the path so the user always gets a fresh download
+        # instead of a cached 404.
+        try:
+            pdf_url = supabase_admin.storage.from_('ownership-docs').get_public_url(file_name)
+        except Exception as url_error:
+            logger.error(f"❌ [AGREEMENTS] Failed to build public URL: {url_error}")
+            return None
+
         # Update agreement with document URL
         supabase_admin.table("agreements").update({
             "document_url": pdf_url,
             "updated_at": datetime.now().isoformat()
         }).eq("id", agreement["id"]).execute()
-        
+
         logger.info(f"✅ [AGREEMENTS] PDF generated and stored for {agreement['id']}")
         return pdf_url
         

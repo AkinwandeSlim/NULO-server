@@ -80,7 +80,7 @@ async def get_user_engagement(
 ):
     """
     Get current engagement metrics for a user
-    
+
     - Users can view their own engagement metrics
     - Admins can view any user's engagement metrics
     """
@@ -90,16 +90,30 @@ async def get_user_engagement(
             status_code=403,
             detail="Not authorized to view this user's engagement"
         )
-    
+
     try:
         # Get user type first -- needed to run the correct scoring formula
         from ..database import supabase_admin
-        user_response = supabase_admin.table("users")\
-            .select("user_type, trust_score, engagement_score, engagement_level, last_engagement_update")\
-            .eq("id", user_id)\
-            .single().execute()
+        try:
+            user_response = supabase_admin.table("users")\
+                .select("user_type, trust_score, engagement_score, engagement_level, last_engagement_update")\
+                .eq("id", user_id)\
+                .single().execute()
+        except Exception as db_error:
+            print(f"❌ [ENGAGEMENT] Database query failed for user {user_id}: {str(db_error)}")
+            # Return default metrics instead of failing
+            return EngagementMetricsResponse(
+                user_id=user_id,
+                user_type="tenant",
+                engagement_score=0,
+                trust_score=50,
+                engagement_level="Low",
+                metrics={},
+                last_updated=datetime.now().isoformat()
+            )
 
         if not user_response.data:
+            print(f"⚠️ [ENGAGEMENT] User not found: {user_id}")
             raise HTTPException(status_code=404, detail="User not found")
 
         user_data = user_response.data
@@ -109,7 +123,17 @@ async def get_user_engagement(
         # Reading the cached user_engagement_metrics row returns stale zeros for
         # any activity that happened before the engagement system was deployed
         # or was never explicitly tracked (e.g. properties listed, viewings confirmed).
-        fresh = EngagementService.calculate_and_persist_engagement(user_id, user_type)
+        try:
+            fresh = EngagementService.calculate_and_persist_engagement(user_id, user_type)
+        except Exception as calc_error:
+            print(f"❌ [ENGAGEMENT] Calculation failed for user {user_id}: {str(calc_error)}")
+            # Return cached values if calculation fails
+            fresh = {
+                "engagement_score": user_data.get("engagement_score", 0),
+                "trust_score": user_data.get("trust_score", 50),
+                "engagement_level": user_data.get("engagement_level", "Low"),
+                "metrics": {}
+            }
 
         return EngagementMetricsResponse(
             user_id=user_id,
@@ -124,9 +148,18 @@ async def get_user_engagement(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get engagement metrics: {str(e)}"
+        print(f"❌ [ENGAGEMENT] Unexpected error getting metrics for {user_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Return default metrics instead of 500 error
+        return EngagementMetricsResponse(
+            user_id=user_id,
+            user_type="tenant",
+            engagement_score=0,
+            trust_score=50,
+            engagement_level="Low",
+            metrics={},
+            last_updated=datetime.now().isoformat()
         )
 
 

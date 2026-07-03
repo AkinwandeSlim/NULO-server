@@ -2,6 +2,16 @@
 PaymentScheduler - Generate payment schedules for different frequencies
 Purpose: Create payment calendars for ANNUAL, SEMI_ANNUAL, QUARTERLY, MONTHLY frequencies
 Reference: MASTER_PRD_NOMBA_INTEGRATION.md Section 6.2
+
+⚠️  IMPLEMENTATION STATUS: ACTIVE — DEFERRED START
+─────────────────────────────────────────────────
+Status:        Active development, NOT YET INTEGRATED into main routes
+Target Start:  June 24, 2026
+Prerequisites:
+  1. `nomba_client.py` integration completed first
+  2. Wire scheduler into agreement creation flow
+  3. Connect to reconciliation engine for payment matching
+Do NOT delete — needed for upcoming hackathon integration.
 """
 
 from datetime import datetime, timedelta

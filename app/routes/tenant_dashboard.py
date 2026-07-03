@@ -7,17 +7,18 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional, List
 from uuid import UUID
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 from ..database import supabase, supabase_admin
 from ..middleware.auth import get_current_user
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tenant", tags=["tenant-dashboard"])
 
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 60  # 1 minute (faster updates)
+dashboard_cache = {}  # key: tenant_id, value: (data, timestamp)
 
 
 # ============================================================================
@@ -26,105 +27,256 @@ CACHE_TTL = 300  # 5 minutes
 # ============================================================================
 
 class TenantStats(BaseModel):
-    totalFavorites: int
-    pendingViewings: int
-    confirmedViewings: int
-    completedViewings: int
-    propertiesContacted: int
-    totalConversations: int
-    unreadMessages: int
-    applicationsSubmitted: int
-    pendingApplications: int
-    approvedApplications: int
-    rejectedApplications: int
-    activeAgreements: int
-    pendingSignatures: int
-    paymentsDue: int
-    totalPayments: int
-    completedPayments: int
-    engagementScore: int
-    trustScore: int
-    engagementLevel: str
+    totalFavorites: int = Field(0, description="Total number of favorite properties")
+    pendingViewings: int = Field(0, description="Number of pending viewing requests")
+    confirmedViewings: int = Field(0, description="Number of confirmed viewing requests")
+    completedViewings: int = Field(0, description="Number of completed viewings")
+    propertiesContacted: int = Field(0, description="Number of unique properties contacted")
+    totalConversations: int = Field(0, description="Total number of conversations")
+    unreadMessages: int = Field(0, description="Number of unread messages")
+    applicationsSubmitted: int = Field(0, description="Total applications submitted")
+    pendingApplications: int = Field(0, description="Pending applications")
+    approvedApplications: int = Field(0, description="Approved applications")
+    rejectedApplications: int = Field(0, description="Rejected applications")
+    withdrawnApplications: int = Field(0, description="Withdrawn applications")
+    activeAgreements: int = Field(0, description="Active lease agreements")
+    pendingSignatures: int = Field(0, description="Agreements pending signature")
+    paymentsDue: int = Field(0, description="Pending payments")
+    totalPayments: int = Field(0, description="Total payments made")
+    completedPayments: int = Field(0, description="Completed payments")
+    engagementScore: int = Field(0, description="Tenant engagement score 0-100")
+    trustScore: int = Field(50, description="Tenant trust score 0-100")
+    engagementLevel: str = Field("low", description="Engagement level (low/medium/high)")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "totalFavorites": 5,
+                "pendingViewings": 2,
+                "confirmedViewings": 1,
+                "completedViewings": 3,
+                "propertiesContacted": 8,
+                "totalConversations": 6,
+                "unreadMessages": 2,
+                "applicationsSubmitted": 3,
+                "pendingApplications": 1,
+                "approvedApplications": 1,
+                "rejectedApplications": 1,
+                "activeAgreements": 1,
+                "pendingSignatures": 0,
+                "paymentsDue": 0,
+                "totalPayments": 12,
+                "completedPayments": 12,
+                "engagementScore": 75,
+                "trustScore": 85,
+                "engagementLevel": "high"
+            }]
+        }
+    }
 
 
 class TenantFavorite(BaseModel):
-    id: str
-    property_id: str
-    property_title: Optional[str]
-    property_address: Optional[str]
-    property_city: Optional[str]
-    property_image: Optional[str]
-    price: Optional[int]
-    beds: Optional[int]
-    baths: Optional[int]
-    created_at: str
+    id: str = Field(..., description="Favorite ID")
+    property_id: str = Field(..., description="Property ID")
+    property_title: Optional[str] = Field(None, description="Property title")
+    property_address: Optional[str] = Field(None, description="Property address")
+    property_city: Optional[str] = Field(None, description="Property city")
+    property_image: Optional[str] = Field(None, description="Property image URL")
+    price: Optional[int] = Field(None, description="Property price in NGN")
+    beds: Optional[int] = Field(None, description="Number of bedrooms")
+    baths: Optional[int] = Field(None, description="Number of bathrooms")
+    created_at: str = Field(..., description="Creation timestamp")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+                "property_title": "Modern 3-Bedroom Apartment",
+                "property_address": "123 Main St, Lagos",
+                "property_city": "Lagos",
+                "property_image": "https://example.com/image.jpg",
+                "price": 800000,
+                "beds": 3,
+                "baths": 2,
+                "created_at": "2024-01-01T00:00:00Z"
+            }]
+        }
+    }
 
 
 class TenantViewingRequest(BaseModel):
-    id: str
-    property_id: str
-    property_title: str
-    property_address: str
-    landlord_id: str
-    landlord_name: str
-    status: str
-    preferred_date: Optional[str]
-    confirmed_date: Optional[str]
-    time_slot: Optional[str]
-    confirmed_time: Optional[str]
-    viewing_type: str
-    created_at: str
-    updated_at: str
+    id: str = Field(..., description="Viewing request ID")
+    property_id: str = Field(..., description="Property ID")
+    property_title: str = Field(..., description="Property title")
+    property_address: str = Field(..., description="Property address")
+    landlord_id: str = Field(..., description="Landlord user ID")
+    landlord_name: str = Field(..., description="Landlord full name")
+    status: str = Field(..., description="Viewing status (pending/confirmed/completed/cancelled)")
+    preferred_date: Optional[str] = Field(None, description="Preferred viewing date")
+    confirmed_date: Optional[str] = Field(None, description="Confirmed viewing date")
+    time_slot: Optional[str] = Field(None, description="Preferred time slot")
+    confirmed_time: Optional[str] = Field(None, description="Confirmed viewing time")
+    viewing_type: str = Field(..., description="Type of viewing (in-person/virtual)")
+    created_at: str = Field(..., description="Creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "id": "550e8400-e29b-41d4-a716-446655440001",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+                "property_title": "Cozy 2-Bedroom Flat",
+                "property_address": "456 Oak Ave, Abuja",
+                "landlord_id": "landlord-123",
+                "landlord_name": "John Doe",
+                "status": "confirmed",
+                "preferred_date": "2024-02-15",
+                "confirmed_date": "2024-02-15",
+                "time_slot": "10:00 AM",
+                "confirmed_time": "10:00 AM",
+                "viewing_type": "in-person",
+                "created_at": "2024-02-10T10:00:00Z",
+                "updated_at": "2024-02-12T14:30:00Z"
+            }]
+        }
+    }
 
 
 class TenantConversation(BaseModel):
-    id: str
-    property_id: Optional[str]
-    property_title: Optional[str]
-    other_user_id: str
-    other_user_name: str
-    other_user_avatar: Optional[str]
-    last_message: Optional[str]
-    last_message_time: str
-    unread_count: int
-    created_at: str
-    updated_at: str
+    id: str = Field(..., description="Conversation ID")
+    property_id: Optional[str] = Field(None, description="Property ID")
+    property_title: Optional[str] = Field(None, description="Property title")
+    other_user_id: str = Field(..., description="Other user's ID")
+    other_user_name: str = Field(..., description="Other user's name")
+    other_user_avatar: Optional[str] = Field(None, description="Other user's avatar URL")
+    last_message: Optional[str] = Field(None, description="Last message content")
+    last_message_time: str = Field(..., description="Last message timestamp")
+    unread_count: int = Field(..., description="Number of unread messages")
+    created_at: str = Field(..., description="Conversation creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "id": "conv-123",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+                "property_title": "Luxury Studio",
+                "other_user_id": "landlord-456",
+                "other_user_name": "Jane Smith",
+                "other_user_avatar": "https://example.com/avatar.jpg",
+                "last_message": "Thanks for your interest!",
+                "last_message_time": "2024-02-15T16:45:00Z",
+                "unread_count": 2,
+                "created_at": "2024-02-10T09:00:00Z",
+                "updated_at": "2024-02-15T16:45:00Z"
+            }]
+        }
+    }
 
 
 class TenantApplication(BaseModel):
-    id: str
-    property_id: str
-    property_title: Optional[str]
-    property_location: Optional[str]
-    property_price: Optional[int]
-    status: str
-    move_in_date: Optional[str]
-    created_at: str
-    viewed_by_landlord: bool
+    id: str = Field(..., description="Application ID")
+    property_id: str = Field(..., description="Property ID")
+    property_title: Optional[str] = Field(None, description="Property title")
+    property_location: Optional[str] = Field(None, description="Property location")
+    property_price: Optional[int] = Field(None, description="Property price in NGN")
+    status: str = Field(..., description="Application status (pending/approved/rejected)")
+    move_in_date: Optional[str] = Field(None, description="Proposed move-in date")
+    created_at: str = Field(..., description="Application submission timestamp")
+    viewed_by_landlord: bool = Field(..., description="Whether landlord viewed application")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "id": "app-789",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+                "property_title": "Spacious 1-Bedroom",
+                "property_location": "Victoria Island, Lagos",
+                "property_price": 600000,
+                "status": "pending",
+                "move_in_date": "2024-03-01",
+                "created_at": "2024-02-12T10:30:00Z",
+                "viewed_by_landlord": False
+            }]
+        }
+    }
 
 
 class TenantAgreement(BaseModel):
-    id: str
-    property_id: str
-    property_title: Optional[str]
-    landlord_id: str
-    landlord_name: str
-    rent_amount: int
-    deposit_amount: int
-    status: str
-    lease_start_date: Optional[str]
-    lease_end_date: Optional[str]
-    created_at: str
-    updated_at: str
+    id: str = Field(..., description="Agreement ID")
+    property_id: str = Field(..., description="Property ID")
+    property_title: Optional[str] = Field(None, description="Property title")
+    landlord_id: str = Field(..., description="Landlord user ID")
+    landlord_name: str = Field(..., description="Landlord full name")
+    rent_amount: int = Field(..., description="Monthly rent in NGN")
+    deposit_amount: int = Field(..., description="Security deposit in NGN")
+    status: str = Field(..., description="Agreement status (pending/active/terminated)")
+    lease_start_date: Optional[str] = Field(None, description="Lease start date")
+    lease_end_date: Optional[str] = Field(None, description="Lease end date")
+    created_at: str = Field(..., description="Agreement creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "id": "agree-456",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+                "property_title": "Modern 3-Bedroom",
+                "landlord_id": "landlord-123",
+                "landlord_name": "John Doe",
+                "rent_amount": 800000,
+                "deposit_amount": 1600000,
+                "status": "active",
+                "lease_start_date": "2024-03-01",
+                "lease_end_date": "2025-02-28",
+                "created_at": "2024-02-18T12:00:00Z",
+                "updated_at": "2024-02-20T14:00:00Z"
+            }]
+        }
+    }
 
 
 class TenantDashboardResponse(BaseModel):
-    stats: TenantStats
-    favorites: List[TenantFavorite] = []
-    viewing_requests: List[TenantViewingRequest] = []
-    conversations: List[TenantConversation] = []
-    applications: List[TenantApplication] = []
-    agreements: List[TenantAgreement] = []
+    stats: TenantStats = Field(..., description="Tenant dashboard statistics")
+    favorites: List[TenantFavorite] = Field(default_factory=list, description="List of favorite properties")
+    viewing_requests: List[TenantViewingRequest] = Field(default_factory=list, description="List of viewing requests")
+    conversations: List[TenantConversation] = Field(default_factory=list, description="List of conversations")
+    applications: List[TenantApplication] = Field(default_factory=list, description="List of rental applications")
+    agreements: List[TenantAgreement] = Field(default_factory=list, description="List of lease agreements")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "stats": {
+                    "totalFavorites": 5,
+                    "pendingViewings": 2,
+                    "confirmedViewings": 1,
+                    "completedViewings": 3,
+                    "propertiesContacted": 8,
+                    "totalConversations": 6,
+                    "unreadMessages": 2,
+                    "applicationsSubmitted": 3,
+                    "pendingApplications": 1,
+                    "approvedApplications": 1,
+                    "rejectedApplications": 1,
+                    "activeAgreements": 1,
+                    "pendingSignatures": 0,
+                    "paymentsDue": 0,
+                    "totalPayments": 12,
+                    "completedPayments": 12,
+                    "engagementScore": 75,
+                    "trustScore": 85,
+                    "engagementLevel": "high"
+                },
+                "favorites": [],
+                "viewing_requests": [],
+                "conversations": [],
+                "applications": [],
+                "agreements": []
+            }]
+        }
+    }
 
 
 # ============================================================================
@@ -132,11 +284,12 @@ class TenantDashboardResponse(BaseModel):
 # ============================================================================
 
 def calculate_tenant_stats(tenant_id: str) -> dict:
-    """Calculate tenant statistics with per-query fault isolation"""
+    """Calculate tenant statistics with optimized queries"""
     stats = {
         "totalFavorites": 0,
         "pendingViewings": 0,
         "confirmedViewings": 0,
+        "completedViewings": 0,
         "propertiesContacted": 0,
         "totalConversations": 0,
         "unreadMessages": 0,
@@ -144,6 +297,7 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
         "pendingApplications": 0,
         "approvedApplications": 0,
         "rejectedApplications": 0,
+        "withdrawnApplications": 0,
         "activeAgreements": 0,
         "pendingSignatures": 0,
         "paymentsDue": 0,
@@ -151,249 +305,129 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
         "completedPayments": 0,
         "engagementScore": 0,
         "trustScore": 50,
-        "engagementLevel": "none",
+        "engagementLevel": "low",
         "_fetch_failed": False,
     }
 
     try:
-        result = supabase_admin.table("favorites") \
-            .select("id") \
-            .eq("tenant_id", tenant_id).execute()
-        stats["totalFavorites"] = len(result.data or [])
-        logger.info(f"Total favorites for {tenant_id}: {stats['totalFavorites']}")
-    except Exception as e:
-        logger.error(f"Stats query failed (favorites): {e}")
-        stats["_fetch_failed"] = True
+        # Fetch all data we need in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all queries
+            fav_future = executor.submit(
+                lambda: supabase_admin.table("favorites").select("id, property_id").eq("tenant_id", tenant_id).execute()
+            )
+            viewing_future = executor.submit(
+                lambda: supabase_admin.table("viewing_requests").select("id, property_id, status").eq("tenant_id", tenant_id).execute()
+            )
+            conv_future = executor.submit(
+                lambda: supabase_admin.table("conversations").select("id, property_id").eq("tenant_id", tenant_id).execute()
+            )
+            unread_future = executor.submit(
+                lambda: supabase_admin.table("messages").select("id").eq("recipient_id", tenant_id).eq("read", False).execute()
+            )
+            apps_future = executor.submit(
+                lambda: supabase_admin.table("applications").select("id, status, property_id").eq("user_id", tenant_id).execute()
+            )
+            agreements_future = executor.submit(
+                lambda: supabase_admin.table("agreements").select("id, status").eq("tenant_id", tenant_id).execute()
+            )
+            transactions_future = executor.submit(
+                lambda: supabase_admin.table("transactions").select("id, status").eq("tenant_id", tenant_id).execute()
+            )
+            user_future = executor.submit(
+                lambda: supabase_admin.table("users").select("trust_score").eq("id", tenant_id).single().execute()
+            )
+            messages_sent_future = executor.submit(
+                lambda: supabase_admin.table("messages").select("id").eq("sender_id", tenant_id).execute()
+            )
 
-    try:
-        pending = supabase_admin.table("viewing_requests") \
-            .select("id") \
-            .eq("tenant_id", tenant_id) \
-            .eq("status", "pending").execute()
-        stats["pendingViewings"] = len(pending.data or [])
-    except Exception as e:
-        logger.error(f"Stats query failed (pending viewings): {e}")
-        stats["_fetch_failed"] = True
+            # Get results
+            fav_result = fav_future.result()
+            viewing_result = viewing_future.result()
+            conv_result = conv_future.result()
+            unread_result = unread_future.result()
+            apps_result = apps_future.result()
+            agreements_result = agreements_future.result()
+            transactions_result = transactions_future.result()
+            user_result = user_future.result()
+            messages_sent_result = messages_sent_future.result()
 
-    try:
-        confirmed = supabase_admin.table("viewing_requests") \
-            .select("id") \
-            .eq("tenant_id", tenant_id) \
-            .eq("status", "confirmed").execute()
-        stats["confirmedViewings"] = len(confirmed.data or [])
-    except Exception as e:
-        logger.error(f"Stats query failed (confirmed viewings): {e}")
-        stats["_fetch_failed"] = True
-
-    try:
-        completed = supabase_admin.table("viewing_requests") \
-            .select("id") \
-            .eq("tenant_id", tenant_id) \
-            .eq("status", "completed").execute()
-        stats["completedViewings"] = len(completed.data or [])
-    except Exception as e:
-        logger.error(f"Stats query failed (completed viewings): {e}")
-        stats["completedViewings"] = 0  # Default value on error
-        stats["_fetch_failed"] = True
-
-    try:
-        conversations = supabase_admin.table("conversations") \
-            .select("id, property_id") \
-            .eq("tenant_id", tenant_id).execute()
-        stats["totalConversations"] = len(conversations.data or [])
+        # Process results
+        # Favorites
+        favorites = fav_result.data or []
+        stats["totalFavorites"] = len(favorites)
         
-        # Calculate propertiesContacted as unique properties from all forms of engagement:
-        # Conversations (messages with landlord) + Viewing Requests (viewed/scheduled viewings) + Applications (applied to lease)
+        # Viewings
+        viewings = viewing_result.data or []
+        stats["pendingViewings"] = sum(1 for v in viewings if v.get("status") == "pending")
+        stats["confirmedViewings"] = sum(1 for v in viewings if v.get("status") == "confirmed")
+        stats["completedViewings"] = sum(1 for v in viewings if v.get("status") == "completed")
+        
+        # Conversations
+        conversations = conv_result.data or []
+        stats["totalConversations"] = len(conversations)
+        
+        # Properties Contacted
         properties_contacted = set()
-        
-        # Add properties from conversations
-        for conv in (conversations.data or []):
-            if conv.get("property_id"):
-                properties_contacted.add(conv.get("property_id"))
-        
-        # Add properties from viewing requests
-        viewing_reqs = supabase_admin.table("viewing_requests") \
-            .select("property_id") \
-            .eq("tenant_id", tenant_id).execute()
-        for vr in (viewing_reqs.data or []):
-            if vr.get("property_id"):
-                properties_contacted.add(vr.get("property_id"))
-        
-        # Add properties from applications (strongest engagement - actual applications)
-        applications = supabase_admin.table("applications") \
-            .select("property_id") \
-            .eq("user_id", tenant_id).execute()
-        for app in (applications.data or []):
-            if app.get("property_id"):
-                properties_contacted.add(app.get("property_id"))
-        
+        for conv in conversations:
+            if conv.get("property_id"): properties_contacted.add(conv["property_id"])
+        for v in viewings:
+            if v.get("property_id"): properties_contacted.add(v["property_id"])
+        apps = apps_result.data or []
+        for app in apps:
+            if app.get("property_id"): properties_contacted.add(app["property_id"])
         stats["propertiesContacted"] = len(properties_contacted)
-        logger.info(f"Properties contacted: {stats['propertiesContacted']} (from conversations + viewing requests + applications)")
-    except Exception as e:
-        logger.error(f"Stats query failed (conversations/properties contacted): {e}")
-        stats["_fetch_failed"] = True
-
-    try:
-        unread = supabase_admin.table("messages") \
-            .select("id") \
-            .eq("recipient_id", tenant_id) \
-            .eq("read", False).execute()
-        stats["unreadMessages"] = len(unread.data or [])
-    except Exception as e:
-        logger.error(f"Stats query failed (unread messages): {e}")
-        stats["_fetch_failed"] = True
-
-    try:
-        apps = supabase_admin.table("applications") \
-            .select("id, status") \
-            .eq("user_id", tenant_id).execute()
-        stats["applicationsSubmitted"] = len(apps.data or [])
-        for app in (apps.data or []):
-            if app.get("status") == "pending":
-                stats["pendingApplications"] += 1
-            elif app.get("status") == "approved":
-                stats["approvedApplications"] += 1
-            elif app.get("status") == "rejected":
-                stats["rejectedApplications"] += 1
-    except Exception as e:
-        logger.error(f"Stats query failed (applications): {e}")
-        stats["_fetch_failed"] = True
-
-    try:
-        agreements = supabase_admin.table("agreements") \
-            .select("id, status") \
-            .eq("tenant_id", tenant_id).execute()
-        for agreement in (agreements.data or []):
-            if agreement.get("status") in ["ACTIVE", "SIGNED"]:
-                stats["activeAgreements"] += 1
-            elif agreement.get("status") == "PENDING_TENANT":
-                stats["pendingSignatures"] += 1
-    except Exception as e:
-        logger.error(f"Stats query failed (agreements): {e}")
-        stats["_fetch_failed"] = True
-
-    # Calculate payment statistics from transactions table (rent payments)
-    try:
-        from datetime import date, timedelta
-        import datetime as dt
-        current_year = dt.datetime.now().year
         
-        # Query all transactions for this tenant in current year
-        transactions = supabase_admin.table("transactions") \
-            .select("id, amount, status, created_at") \
-            .eq("tenant_id", tenant_id) \
-            .gte("created_at", f"{current_year}-01-01") \
-            .lte("created_at", f"{current_year}-12-31").execute()
+        # Unread messages
+        stats["unreadMessages"] = len(unread_result.data or [])
         
-        if transactions.data:
-            stats["totalPayments"] = len(transactions.data)
-            completed = [t for t in transactions.data if t.get("status") == "completed"]
-            stats["completedPayments"] = len(completed)
-            stats["paymentsDue"] = len([t for t in transactions.data if t.get("status") in ["pending", "processing"]])
-    except Exception as e:
-        logger.error(f"Stats query failed (payments): {e}")
-        # Don't set _fetch_failed for payments - it's optional data
-        pass
-
-    try:
-        user = supabase_admin.table("users") \
-            .select("trust_score") \
-            .eq("id", tenant_id).single().execute()
-        if user.data:
-            stats["trustScore"] = user.data.get("trust_score", 50)
-    except Exception as e:
-        logger.error(f"Stats query failed (trust score): {e}")
-
-    # Calculate engagement score from actual user activity
-    # The user_engagement_metrics table is initialized with zeros and never updated,
-    # so we compute engagement from actual activity tables
-    try:
-        activity_score = 0
+        # Applications
+        stats["applicationsSubmitted"] = len(apps)
+        for app in apps:
+            if app.get("status") in ("submitted", "pending"): stats["pendingApplications"] +=1
+            elif app.get("status") == "approved": stats["approvedApplications"] +=1
+            elif app.get("status") == "rejected": stats["rejectedApplications"] +=1
+            elif app.get("status") == "withdrawn": stats["withdrawnApplications"] +=1
+            
+        # Agreements
+        agreements = agreements_result.data or []
+        for agr in agreements:
+            if agr.get("status") in ["ACTIVE", "SIGNED"]: stats["activeAgreements"] +=1
+            elif agr.get("status") == "PENDING_TENANT": stats["pendingSignatures"] +=1
+            
+        # Payments
+        transactions = transactions_result.data or []
+        stats["totalPayments"] = len(transactions)
+        stats["completedPayments"] = sum(1 for t in transactions if t.get("status") == "completed")
+        stats["paymentsDue"] = sum(1 for t in transactions if t.get("status") in ["pending", "processing"])
         
-        # Count favorites (saved properties) - indicates interest
-        try:
-            favs = supabase_admin.table("favorites") \
-                .select("id") \
-                .eq("tenant_id", tenant_id).execute()
-            favorites_count = len(favs.data or [])
-            activity_score += favorites_count * 3  # High weight
-            logger.info(f"📌 Favorites: {favorites_count}")
-        except Exception as e:
-            logger.error(f"Failed to count favorites: {e}")
-            favorites_count = 0
-        
-        # Count viewing requests confirmed/pending
-        try:
-            viewings = supabase_admin.table("viewing_requests") \
-                .select("id") \
-                .eq("tenant_id", tenant_id).execute()
-            viewings_count = len(viewings.data or [])
-            activity_score += viewings_count * 4  # Highest weight - shows active interest
-            logger.info(f"👁️ Viewing Requests: {viewings_count}")
-        except Exception as e:
-            logger.error(f"Failed to count viewings: {e}")
-            viewings_count = 0
-        
-        # Count messages sent by tenant
-        try:
-            messages = supabase_admin.table("messages") \
-                .select("id") \
-                .eq("sender_id", tenant_id).execute()
-            messages_count = len(messages.data or [])
-            activity_score += messages_count * 2  # Medium weight
-            logger.info(f"💬 Messages Sent: {messages_count}")
-        except Exception as e:
-            logger.error(f"Failed to count messages: {e}")
-            messages_count = 0
-        
-        # Count conversations initiated/active
-        try:
-            conversations = supabase_admin.table("conversations") \
-                .select("id") \
-                .eq("tenant_id", tenant_id).execute()
-            conversations_count = len(conversations.data or [])
-            activity_score += conversations_count * 2
-            logger.info(f"🗨️ Conversations: {conversations_count}")
-        except Exception as e:
-            logger.error(f"Failed to count conversations: {e}")
-            conversations_count = 0
-        
-        # Count applications submitted
-        try:
-            applications = supabase_admin.table("applications") \
-                .select("id") \
-                .eq("user_id", tenant_id).execute()
-            applications_count = len(applications.data or [])
-            activity_score += applications_count * 3  # High weight - shows commitment
-            logger.info(f"📄 Applications: {applications_count}")
-        except Exception as e:
-            logger.error(f"Failed to count applications: {e}")
-            applications_count = 0
-        
-        # Normalize engagement score to 0-100 with natural scaling
-        # activity_score can be: 
-        #   0 (no activity) = 0/100
-        #   5-10 (some interest) = 25-50/100
-        #   15+ (active) = 70-100/100
+        # Trust Score
+        if user_result.data:
+            stats["trustScore"] = user_result.data.get("trust_score", 50)
+            
+        # Engagement Score
+        messages_sent = len(messages_sent_result.data or [])
+        activity_score = (
+            stats["totalFavorites"] * 3 +
+            len(viewings) * 4 +
+            messages_sent * 2 +
+            stats["totalConversations"] * 2 +
+            stats["applicationsSubmitted"] * 3
+        )
         stats["engagementScore"] = min(100, max(0, activity_score * 2))
-        logger.info(f"📊 Engagement Score Calculation: activity_score={activity_score}, final_score={stats['engagementScore']}")
         
-        # Determine engagement level based on calculated score
-        if stats["engagementScore"] >= 70:
+        # Engagement Level
+        if stats["engagementScore"] >=70:
             stats["engagementLevel"] = "high"
-        elif stats["engagementScore"] >= 40:
+        elif stats["engagementScore"] >=40:
             stats["engagementLevel"] = "medium"
         else:
             stats["engagementLevel"] = "low"
-        
-        logger.info(f"✅ Engagement Level: {stats['engagementLevel']} (Score: {stats['engagementScore']}/100)")
+            
     except Exception as e:
-        logger.error(f"Stats query failed (engagement): {e}")
-        logger.error(f"Full error details: {str(e)}")
-        stats["engagementScore"] = 0
-        stats["engagementLevel"] = "low"
-        # Don't mark as failed - engagement metrics are derived, not critical
-
+        logger.error(f"Error calculating tenant stats: {e}")
+        stats["_fetch_failed"] = True
+        
     return stats
 
 
@@ -676,13 +710,21 @@ def fetch_agreements(tenant_id: str) -> List[dict]:
 
 @router.get("/dashboard", response_model=TenantDashboardResponse)
 async def get_tenant_dashboard(current_user = Depends(get_current_user)):
-    """Get comprehensive tenant dashboard data with bundled fetching"""
+    """Get comprehensive tenant dashboard data with bundled fetching and caching"""
     
     try:
         tenant_id = current_user['id']
         
         if current_user.get('user_type') != 'tenant':
             raise HTTPException(status_code=403, detail="Access denied. Tenant access required.")
+        
+        # Check cache
+        now = datetime.utcnow()
+        if tenant_id in dashboard_cache:
+            cached_data, cached_time = dashboard_cache[tenant_id]
+            if (now - cached_time).total_seconds() < CACHE_TTL:
+                logger.info(f"[TENANT DASHBOARD] Using cached data for user {tenant_id}")
+                return cached_data
         
         print(f"[TENANT DASHBOARD] Fetching dashboard for user: {tenant_id}")
         
@@ -697,7 +739,7 @@ async def get_tenant_dashboard(current_user = Depends(get_current_user)):
             stats = stats_future.result()
             fetch_failed = stats.pop("_fetch_failed", False)
             
-            return TenantDashboardResponse(
+            response = TenantDashboardResponse(
                 stats=TenantStats(**stats),
                 favorites=favorites_future.result(),
                 viewing_requests=viewings_future.result(),
@@ -705,6 +747,11 @@ async def get_tenant_dashboard(current_user = Depends(get_current_user)):
                 applications=applications_future.result(),
                 agreements=agreements_future.result()
             )
+            
+            # Save to cache
+            dashboard_cache[tenant_id] = (response, now)
+            
+            return response
     
     except HTTPException:
         raise

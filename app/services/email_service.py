@@ -33,9 +33,9 @@ class EmailService:
         self.use_brevo = bool(self.brevo_api_key)
         
         if self.use_brevo:
-            print(f"📧 [EMAIL] Using Brevo API")
+            logger.info("[EMAIL] Using Brevo API")
         else:
-            print(f"📧 [EMAIL] Using SMTP fallback: {self.smtp_server}:{self.smtp_port}")
+            logger.info(f"[EMAIL] Using SMTP fallback: {self.smtp_server}:{self.smtp_port}")
 
     def send_landlord_onboarding_notification(
         self,
@@ -76,7 +76,7 @@ class EmailService:
             return True
 
         except Exception as e:
-            print(f"❌ [EMAIL] Error: {str(e)}")
+            logger.error(f"[EMAIL] Error: {str(e)}")
             return False
 
     def send_viewing_confirmation_email(
@@ -349,8 +349,8 @@ NuloAfrica - Zero Agency Fee Rental Platform
     def _send_via_smtp(self, to_email: str, subject: str, html_content: str, text_content: str = None):
         """Send email via SMTP (fallback method)"""
         try:
-            print(f"📧 [SMTP] Sending to {to_email}: {subject}")
-            logger.info(f"🔧 [SMTP CONFIG] Server: {self.smtp_server}:{self.smtp_port}, From: {self.from_email}")
+            logger.info(f"[SMTP] Sending to {to_email}: {subject}")
+            logger.info(f"[SMTP CONFIG] Server: {self.smtp_server}:{self.smtp_port}, From: {self.from_email}")
 
             msg = MIMEMultipart('alternative')
             msg['Subject'] = subject
@@ -362,44 +362,41 @@ NuloAfrica - Zero Agency Fee Rental Platform
 
             msg.attach(MIMEText(html_content, 'html'))
 
-            logger.info(f"🔐 [SMTP] Attempting SMTP connection to {self.smtp_server}:{self.smtp_port}")
+            logger.info(f"[SMTP] Attempting SMTP connection to {self.smtp_server}:{self.smtp_port}")
 
             try:
                 from email.utils import make_msgid
                 msgid = make_msgid()
                 msg['Message-ID'] = msgid
-                logger.info(f"🔎 [SMTP] Message-ID: {msgid}")
+                logger.info(f"[SMTP] Message-ID: {msgid}")
             except Exception:
                 msgid = None
 
             with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10) as server:
-                logger.info(f"✅ [SMTP] SMTP connection established")
+                logger.info(f"[SMTP] SMTP connection established")
                 server.starttls()
-                logger.info(f"🔒 [SMTP] TLS enabled")
+                logger.info(f"[SMTP] TLS enabled")
                 server.login(self.smtp_username, self.smtp_password)
-                logger.info(f"✅ [SMTP] Authentication successful")
+                logger.info(f"[SMTP] Authentication successful")
                 server.send_message(msg)
-                logger.info(f"✅ [SMTP] Message sent successfully")
+                logger.info(f"[SMTP] Message sent successfully")
                 if msgid:
-                    logger.info(f"📥 [SMTP] Sent Message-ID {msgid} to {to_email}")
+                    logger.info(f"[SMTP] Sent Message-ID {msgid} to {to_email}")
 
-            print(f"✅ [SMTP] Successfully sent to {to_email}")
+            logger.info(f"[SMTP] Successfully sent to {to_email}")
             return {"success": True, "message_id": msgid}
 
         except smtplib.SMTPAuthenticationError as auth_err:
-            error_msg = f"❌ [SMTP] Authentication failed: Check SMTP_USER and SMTP_PASSWORD in .env - {str(auth_err)}"
+            error_msg = f"[SMTP] Authentication failed: Check SMTP_USER and SMTP_PASSWORD in .env - {str(auth_err)}"
             logger.error(error_msg)
-            print(error_msg)
             return {"success": False, "error": str(auth_err)}
         except smtplib.SMTPException as smtp_err:
-            error_msg = f"❌ [SMTP] SMTP Error: {str(smtp_err)}"
+            error_msg = f"[SMTP] SMTP Error: {str(smtp_err)}"
             logger.error(error_msg)
-            print(error_msg)
             return {"success": False, "error": str(smtp_err)}
         except Exception as e:
-            error_msg = f"❌ [SMTP] Failed to send: {str(e)}"
+            error_msg = f"[SMTP] Failed to send: {str(e)}"
             logger.error(error_msg)
-            print(error_msg)
             return {"success": False, "error": str(e)}
 
 

@@ -17,10 +17,11 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/landlord", tags=["landlord-dashboard"])
 
-# 🚀 OPTIMIZATION: Simple in-memory cache for dashboard data (2 minute TTL)
-# Reduced from 5 minutes to 2 minutes for fresher data but still fast responses
+# 🚀 OPTIMIZATION: Simple in-memory cache for dashboard data (60s TTL)
+# Reduced from 5 minutes to 60s so REG-08 (deletion) and admin actions
+# (approve/reject) reflect in the overview much faster.
 _dashboard_cache = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 60  # 60 seconds
 
 
 # ============================================================================
@@ -51,6 +52,8 @@ class LandlordStats(BaseModel):
     active_listings: int
     pending_viewings: int
     unread_messages: int
+    read_messages: int = 0
+    total_messages: int = 0
     total_conversations: int
     total_views: int
     occupancy_rate: float
@@ -58,8 +61,13 @@ class LandlordStats(BaseModel):
     avg_response_time: str
     applications_pending: int
     applications_approved: int
+    applications_rejected: int
+    applications_withdrawn: int
     properties_vacant: int
     properties_occupied: int
+    properties_pending: int = 0
+    properties_rejected: int = 0
+    deleted_properties: int = 0
 
 class LandlordProperty(BaseModel):
     id: str
@@ -80,6 +88,13 @@ class LandlordProperty(BaseModel):
     view_count: int = 0  # Map from view_count field
     application_count: int = 0  # Map from application_count field
     favorite_count: int = 0  # Will be calculated from favorites table
+    deleted_at: Optional[datetime] = None
+    location: str = ""
+    full_address: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    reviewed_by: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
 class RecentActivity(BaseModel):
     id: str
@@ -146,7 +161,11 @@ def get_landlord_profile(landlord_id: str) -> dict:
             "trust_score": user.get("trust_score", 50),
             "account_type": profile.get("account_type", "individual"),
             "company_name": profile.get("company_name"),
-            "verification_status": "approved" if user.get("verification_status") == "approved" else "pending",
+            # ONBD-09 fix: pass through the actual verification status (e.g. "rejected",
+            # "needs_correction") instead of collapsing everything non-"approved" to
+            # "pending". The frontend now needs to distinguish rejected landlords
+            # so it can show the correct banner and block listing creation.
+            "verification_status": user.get("verification_status", "pending"),
             "verification_fee_paid": profile.get("verification_fee_paid", False),
             "verification_submitted_at": profile.get("verification_submitted_at"),
             "verification_approved_at": profile.get("verification_reviewed_at"),
@@ -221,12 +240,19 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         "total_properties": 0,
         "properties_vacant": 0,
         "properties_occupied": 0,
+        "properties_pending": 0,
+        "properties_rejected": 0,
         "active_listings": 0,
+        "deleted_properties": 0,
         "pending_viewings": 0,
         "unread_messages": 0,
+        "read_messages": 0,
+        "total_messages": 0,
         "total_conversations": 0,
         "applications_pending": 0,
         "applications_approved": 0,
+        "applications_rejected": 0,
+        "applications_withdrawn": 0,
         "total_views": 0,
         "monthly_revenue": 0.0,
         "occupancy_rate": 0.0,
@@ -237,19 +263,44 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     }
 
     # ── Query 1: Properties (most important) ────────────────────────────────
+    # REG-08: Exclude soft-deleted properties from ALL counts so the overview
+    # shows accurate active/vacant/occupied numbers.
+    #
+    # Count breakdown:
+    #   - total_properties  = all non-deleted (pending + approved)
+    #   - properties_pending = verification_status='pending' (awaiting admin)
+    #   - properties_vacant  = verification_status='approved' AND status='vacant'
+    #                          (live inventory available to tenants)
+    #   - properties_occupied = verification_status='approved' AND status='occupied'
     try:
         properties_result = supabase_admin.table("properties") \
-            .select("id, status, view_count, price") \
-            .eq("landlord_id", landlord_id).execute()
+            .select("id, status, verification_status, view_count, price, deleted_at") \
+            .eq("landlord_id", landlord_id) \
+            .is_("deleted_at", "null") \
+            .execute()
         properties = properties_result.data or []
 
         stats["total_properties"] = len(properties)
         for prop in properties:
-            if prop.get("status") == "vacant":
-                stats["properties_vacant"] += 1
-                stats["active_listings"] += 1
-            elif prop.get("status") == "occupied":
-                stats["properties_occupied"] += 1
+            v_status = prop.get("verification_status", "pending")
+            p_status = prop.get("status", "vacant")
+            if v_status == "pending":
+                stats["properties_pending"] += 1
+            elif v_status == "approved":
+                # Newly approved properties count as vacant by default --
+                # they don't get marked "occupied" until a tenant signs
+                # an agreement.
+                if p_status == "vacant":
+                    stats["properties_vacant"] += 1
+                    stats["active_listings"] += 1
+                elif p_status == "occupied":
+                    stats["properties_occupied"] += 1
+            elif v_status == "rejected":
+                # Track rejected properties separately so the overview can
+                # display them as a labelled badge -- the landlord needs
+                # to know how many of their listings were rejected and
+                # can resubmit them after edits.
+                stats["properties_rejected"] += 1
             stats["total_views"] += prop.get("view_count", 0)
             stats["monthly_revenue"] += float(prop.get("price", 0))
 
@@ -257,9 +308,21 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
             stats["occupancy_rate"] = (
                 stats["properties_occupied"] / stats["total_properties"]
             ) * 100
+
+        # ── Separate count: soft-deleted properties ──────────────────────
+        try:
+            deleted_result = supabase_admin.table("properties") \
+                .select("id", count="exact") \
+                .eq("landlord_id", landlord_id) \
+                .not_.is_("deleted_at", "null") \
+                .execute()
+            stats["deleted_properties"] = deleted_result.count or 0
+        except Exception:
+            stats["deleted_properties"] = 0
     except Exception as e:
         logger.error(f"Stats query failed (properties): {e}")
         stats["_fetch_failed"] = True
+        stats["deleted_properties"] = 0
 
     # ── Query 2: Pending viewings ────────────────────────────────────────────
     try:
@@ -272,13 +335,17 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         logger.error(f"Stats query failed (viewings): {e}")
         stats["_fetch_failed"] = True
 
-    # ── Query 3: Unread messages ─────────────────────────────────────────────
+    # ── Query 3: Messages (unread + read + total) ─────────────────────────────
     try:
-        msgs = supabase_admin.table("messages") \
-            .select("id") \
+        # Fetch only the read flag and id (lightweight) for all messages to this landlord
+        all_msgs = supabase_admin.table("messages") \
+            .select("id, read") \
             .eq("recipient_id", landlord_id) \
-            .eq("read", False).execute()
-        stats["unread_messages"] = len(msgs.data or [])
+            .execute()
+        msgs_list = all_msgs.data or []
+        stats["total_messages"] = len(msgs_list)
+        stats["unread_messages"] = sum(1 for m in msgs_list if not m.get("read", False))
+        stats["read_messages"] = sum(1 for m in msgs_list if m.get("read", False))
     except Exception as e:
         logger.error(f"Stats query failed (messages): {e}")
         stats["_fetch_failed"] = True
@@ -286,12 +353,15 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     # ── Query 4: Applications ────────────────────────────────────────────────
     # IMPORTANT: applications table has NO landlord_id column
     # Must get property_ids for this landlord first, then filter by them
+    # REG-08: Exclude soft-deleted properties from this list.
     try:
-        # Step 1: Get landlord's property IDs
+        # Step 1: Get landlord's ACTIVE (non-deleted) property IDs
         props = supabase_admin.table("properties") \
             .select("id") \
-            .eq("landlord_id", landlord_id).execute()
-        
+            .eq("landlord_id", landlord_id) \
+            .is_("deleted_at", "null") \
+            .execute()
+
         property_ids = [p["id"] for p in (props.data or [])]
         
         if property_ids:
@@ -301,10 +371,14 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
                 .in_("property_id", property_ids).execute()
             
             for app in (apps.data or []):
-                if app.get("status") == "pending":
+                if app.get("status") in ("submitted", "pending"):
                     stats["applications_pending"] += 1
                 elif app.get("status") == "approved":
                     stats["applications_approved"] += 1
+                elif app.get("status") == "rejected":
+                    stats["applications_rejected"] += 1
+                elif app.get("status") == "withdrawn":
+                    stats["applications_withdrawn"] += 1
     except Exception as e:
         logger.error(f"Stats query failed (applications): {e}")
         # Non-fatal -- applications table may not have landlord_id column yet
@@ -323,20 +397,39 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
 
     return stats
 
-def get_landlord_properties(landlord_id: str) -> List[dict]:
-    """Get all properties for a landlord with complete data - OPTIMIZED"""
+def get_landlord_properties(landlord_id: str, include_deleted: bool = False) -> List[dict]:
+    """Get all properties for a landlord with complete data - OPTIMIZED.
+
+    By default this EXCLUDES soft-deleted properties (REG-08 fix) so the
+    landlord overview dashboard does not show "Deleted"-labelled tiles.
+    The soft-delete record is preserved in the database — only the landlord
+    view filters them out. Pass ``include_deleted=True`` only for admin /
+    moderation views that explicitly need to inspect deleted rows.
+    """
     try:
         # 🚀 OPTIMIZATION: Get properties in one query
-        result = supabase_admin.table("properties").select("*").eq("landlord_id", landlord_id).order("created_at", desc=True).execute()
+        query = supabase_admin.table("properties") \
+            .select("*") \
+            .eq("landlord_id", landlord_id) \
+            .order("created_at", desc=True)
+
+        # REG-08: exclude soft-deleted from the landlord-facing view by default.
+        # Stats counters (total_properties / active_listings / etc.) already
+        # filter on deleted_at IS NULL, so this keeps the tile count and the
+        # headline numbers in sync.
+        if not include_deleted:
+            query = query.is_("deleted_at", "null")
+
+        result = query.execute()
         properties = result.data or []
-        
+
         if not properties:
             return []
-        
+
         # 🚀 OPTIMIZATION: Get ALL favorite counts in one batch query instead of one per property
         property_ids = [p["id"] for p in properties]
         favorites_result = supabase_admin.table("favorites").select("property_id", count="exact").in_("property_id", property_ids).execute()
-        
+
         # Build favorite count map
         favorite_counts = {}
         if favorites_result.data:
@@ -344,7 +437,7 @@ def get_landlord_properties(landlord_id: str) -> List[dict]:
             for fav in favorites_result.data:
                 prop_id = fav["property_id"]
                 favorite_counts[prop_id] = favorite_counts.get(prop_id, 0) + 1
-        
+
         # Transform properties
         transformed_properties = []
         for prop in properties:
@@ -352,21 +445,33 @@ def get_landlord_properties(landlord_id: str) -> List[dict]:
                 "id": prop.get("id"),
                 "title": prop.get("title", ""),
                 "property_type": prop.get("property_type", ""),
+                # deleted_at is included for transparency and admin-facing views,
+                # but the landlord overview never sees these rows by default.
+                "deleted_at": prop.get("deleted_at"),
+                # Include location (specific address) and full_address alongside
+                # the city/state fields so the overview can match my-properties'
+                # display logic (location || city, state).
                 "address": prop.get("address", ""),
+                "location": prop.get("location", ""),
+                "full_address": prop.get("full_address"),
                 "city": prop.get("city", ""),
                 "state": prop.get("state", ""),
                 "price": prop.get("price", 0),
                 "status": prop.get("status", ""),
                 "verification_status": prop.get("verification_status", "pending"),
+                "rejection_reason": prop.get("rejection_reason"),
+                "reviewed_at": prop.get("reviewed_at"),
+                "reviewed_by": prop.get("reviewed_by"),
                 "beds": prop.get("beds", 0),
                 "baths": prop.get("baths", 0),
                 "sqft": prop.get("sqft"),
                 "images": prop.get("images", []),
                 "amenities": prop.get("amenities", []),
                 "created_at": prop.get("created_at"),
+                "updated_at": prop.get("updated_at"),
                 "view_count": prop.get("view_count", 0),
                 "application_count": prop.get("application_count", 0),
-                "favorite_count": favorite_counts.get(prop["id"], 0)  # Use pre-calculated counts
+                "favorite_count": favorite_counts.get(prop["id"], 0)
             }
             transformed_properties.append(transformed_prop)
         
@@ -550,7 +655,7 @@ async def get_landlord_dashboard(
                         "confirmed_date, confirmed_time, time_slot, viewing_type, created_at"
                     ) \
                     .eq("landlord_id", landlord_id) \
-                    .in_("status", ["pending", "confirmed"]) \
+                    .in_("status", ["pending", "confirmed", "completed"]) \
                     .order("created_at", desc=True) \
                     .limit(50) \
                     .execute()

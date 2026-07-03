@@ -3,10 +3,11 @@ Landlord Onboarding API Routes
 Handles 4Ps verification process and admin tracking
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Path, BackgroundTasks, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, BackgroundTasks, Query, Request, status, File, UploadFile
 from typing import Optional, List
-from uuid import UUID
+from uuid import UUID, uuid4
 import logging
+import re
 
 from ..database import supabase, supabase_admin
 from ..models.landlord_onboarding import (
@@ -27,6 +28,116 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/onboarding", tags=["landlord-onboarding"])
+
+
+# ============================================================================
+# FEATURE FLAGS ENDPOINT
+# ============================================================================
+
+@router.get("/feature-flags")
+async def get_feature_flags():
+    """
+    Get feature flags for onboarding flow
+    Returns configuration that frontend uses to conditionally show/skip steps
+    """
+    return {
+        "success": True,
+        "data": {
+            "enable_property_step": settings.ENABLE_PROPERTY_STEP,
+            "total_steps": 4 if settings.ENABLE_PROPERTY_STEP else 3,
+            "skipped_steps": [3] if not settings.ENABLE_PROPERTY_STEP else [],
+            "active_steps": [1, 2, 3, 4] if settings.ENABLE_PROPERTY_STEP else [1, 2, 4]
+        }
+    }
+
+
+# ============================================================================
+# DOCUMENT UPLOAD ENDPOINT
+# ============================================================================
+
+@router.post("/upload-document")
+async def upload_onboarding_document(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Upload an onboarding document to Supabase Storage
+    Uses 'landlord-verification' bucket
+    """
+    try:
+        user_id = current_user["id"]
+
+        # Validate file type
+        allowed_types = {
+            "application/pdf",
+            "image/jpeg", "image/jpg", "image/png", "image/webp",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
+        if file.content_type and file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported file type: {file.content_type}",
+            )
+
+        # Sanitize filename and build unique storage path
+        original_name = file.filename or "document"
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", original_name)
+        unique_id = uuid4().hex[:12]
+        file_path = f"onboarding/{user_id}/{int(datetime.now().timestamp())}-{unique_id}-{safe_name}"
+
+        # Read file bytes
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Empty file upload",
+            )
+
+        # Upload to Supabase Storage (service-role client bypasses RLS)
+        try:
+            supabase_admin.storage.from_("landlord-verification").upload(
+                path=file_path,
+                file=file_bytes,
+                file_options={
+                    "content-type": file.content_type or "application/octet-stream",
+                    "cache-control": "3600",
+                    "upsert": "false",
+                },
+            )
+        except Exception as upload_error:
+            err_msg = str(upload_error)
+            if hasattr(upload_error, "message"):
+                err_msg = upload_error.message
+            logger.error(f"❌ [ONBOARDING-DOCS] Storage upload failed: {err_msg}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Storage upload failed: {err_msg}",
+            )
+
+        logger.info(f"✅ [ONBOARDING-DOCS] Uploaded {file_path} ({len(file_bytes)} bytes) for user {user_id}")
+
+        return {
+            "success": True,
+            "path": file_path,
+            "filename": safe_name,
+            "size": len(file_bytes),
+            "content_type": file.content_type,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [ONBOARDING-DOCS] Unexpected upload error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload document: {str(e)}",
+        )
+
+
+# ============================================================================
+# ONBOARDING START
+# ============================================================================
 
 
 @router.get("/status", response_model=dict)
@@ -82,6 +193,57 @@ async def start_onboarding(
     print(f"\n✅ [ONBOARDING] Starting onboarding for user: {current_user['id']}")
     
     try:
+        # ── BUG-006 fix: server-side hard gate against unverified emails ──
+        # Previously, the "I have verified my email" button on the client
+        # could be tapped without actually having clicked the link, allowing
+        # unverified landlords to reach this endpoint and start onboarding.
+        # We now verify against Supabase Auth (the source of truth for
+        # email confirmation) before allowing onboarding to start.
+        user_id = current_user["id"]
+        auth_user_id = current_user.get("auth_user_id") or user_id
+
+        try:
+            auth_user_response = supabase_admin.auth.admin.get_user_by_id(
+                auth_user_id
+            )
+            auth_user = getattr(auth_user_response, "user", None) or {}
+            # Different supabase-py versions expose this attribute under
+            # different names — try both.
+            email_confirmed_at = (
+                getattr(auth_user, "email_confirmed_at", None)
+                or (auth_user or {}).get("email_confirmed_at")
+                if isinstance(auth_user, dict)
+                else getattr(auth_user, "email_confirmed_at", None)
+            )
+            confirmed_at = (
+                email_confirmed_at
+                or getattr(auth_user, "confirmed_at", None)
+                or (auth_user or {}).get("confirmed_at")
+                if isinstance(auth_user, dict)
+                else getattr(auth_user, "confirmed_at", None)
+            )
+        except Exception as auth_lookup_err:
+            print(
+                f"⚠️ [ONBOARDING] Could not check email confirmation for "
+                f"{user_id}: {auth_lookup_err}"
+            )
+            confirmed_at = None
+
+        if not confirmed_at:
+            print(
+                f"❌ [ONBOARDING] Blocked: user {user_id} has not confirmed "
+                f"their email address."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Please verify your email address before starting the "
+                    "landlord onboarding process. Check your inbox (and spam "
+                    "folder) for the verification link, or request a new one "
+                    "from the sign-in page."
+                ),
+            )
+
         # Check if user already has onboarding
         existing_check = supabase.table("landlord_onboarding").select("*").eq("landlord_id", current_user['id']).execute()
         
@@ -133,26 +295,45 @@ async def submit_onboarding_step(
 ):
     """Submit onboarding step data"""
     print(f"\n✅ [ONBOARDING] Submitting step {step} for user: {current_user['id']}")
-    
+
     try:
         # Get user's onboarding
         onboarding_check = supabase.table("landlord_onboarding").select("*").eq("landlord_id", current_user['id']).execute()
-        
+
         if not onboarding_check.data:
             raise HTTPException(
                 status_code=404,
                 detail="Onboarding not found. Please start onboarding first."
             )
-        
+
         onboarding = onboarding_check.data[0]
-        
+
+        # ── OPTIONAL STEP HANDLING: Auto-skip Step 3 if disabled ──
+        # If Step 3 is disabled via feature flag AND user is at Step 2,
+        # automatically advance them to Step 4
+        if not settings.ENABLE_PROPERTY_STEP and step == 2 and onboarding['current_step'] == 2:
+            print(f"⏭️ [ONBOARDING] Step 3 disabled - auto-skipping to Step 4 for user {current_user['id']}")
+            # Process step 2 normally, then mark step 3 as skipped
+            result = await _process_step_2(onboarding, step_data or {})
+            if result.success:
+                # Now skip step 3
+                skip_result = await _process_step_3(onboarding, {}, background_tasks)
+                return skip_result
+            return result
+
+        # ── OPTIONAL STEP HANDLING: Allow direct submission of Step 3 even if disabled ──
+        # If user manually submits Step 3 data (shouldn't happen but safe to handle)
+        if not settings.ENABLE_PROPERTY_STEP and step == 3:
+            print(f"⏭️ [ONBOARDING] Step 3 manually submitted but disabled - skipping data save")
+            return await _process_step_3(onboarding, step_data or {}, background_tasks)
+
         # Validate step sequence
         if step != onboarding['current_step']:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot submit step {step}. Current step is {onboarding['current_step']}"
             )
-        
+
         # Process step-specific data
         if step == 1:
             return await _process_step_1(onboarding, step_data or {}, background_tasks)
@@ -161,8 +342,8 @@ async def submit_onboarding_step(
         elif step == 3:
             return await _process_step_3(onboarding, step_data or {}, background_tasks)
         elif step == 4:
-            return await _process_step_4(onboarding, step_data or {}, background_tasks)
-            
+            return await _process_step_4(onboarding, step_data or {})
+
     except HTTPException:
         raise
     except Exception as e:
@@ -222,8 +403,7 @@ async def _process_step_1(
 
 async def _process_step_2(
     onboarding: dict, 
-    step_data: dict,
-    background_tasks: BackgroundTasks
+    step_data: dict
 ) -> OnboardingStepResponse:
     """Process Step 2: Document Upload Phase (MVP - Manual Admin Review)"""
     try:
@@ -232,9 +412,8 @@ async def _process_step_2(
             "document_step_completed": True,
             "current_step": 3,
             "id_document_url": step_data.get("id_document_url"),
-            "proof_of_address_url": step_data.get("proof_of_address_url"),
-            "company_registration_url": step_data.get("company_registration_url"),
-            "selfie_url": step_data.get("selfie_url"),  # Liveness check
+            "selfie_url": step_data.get("selfie_url"),
+            "nin_document_url": step_data.get("nin_document_url"),
             "updated_at": "now()"
         }
         
@@ -262,12 +441,45 @@ async def _process_step_2(
 
 
 async def _process_step_3(
-    onboarding: dict, 
+    onboarding: dict,
     step_data: dict,
     background_tasks: BackgroundTasks
 ) -> OnboardingStepResponse:
-    """Process Step 3: Property Information (MVP - Manual Admin Review)"""
+    """Process Step 3: Property Information (OPTIONAL - can be skipped)
+
+    This step is now optional and can be skipped without errors.
+    Controlled by settings.ENABLE_PROPERTY_STEP feature flag.
+    When disabled, landlords can proceed directly from Step 2 to Step 4.
+    """
     try:
+        # ── OPTIONAL STEP: Check if this step is enabled ──
+        # If ENABLE_PROPERTY_STEP is False, skip processing entirely
+        if not settings.ENABLE_PROPERTY_STEP:
+            print(f"⏭️ [ONBOARDING] Step 3 (Property Information) is disabled via feature flag - skipping")
+
+            # Mark step as completed with null values
+            update_data = {
+                "property_step_completed": True,
+                "current_step": 4,  # Skip to next step
+                "property_address": None,
+                "property_type": None,
+                "property_images": None,
+                "property_ownership_proof": None,
+                "updated_at": "now()"
+            }
+
+            supabase.table("landlord_onboarding").update(update_data).eq("id", onboarding['id']).execute()
+
+            return OnboardingStepResponse(
+                success=True,
+                message="Step 3 skipped (optional). Ready for bank information!",
+                current_step=4,
+                next_step=4,
+                step_completed=True,
+                onboarding_id=onboarding['id']
+            )
+
+        # ── NORMAL FLOW: Process property information ──
         # Update onboarding with step 3 data (property info)
         update_data = {
             "property_step_completed": True,
@@ -278,15 +490,15 @@ async def _process_step_3(
             "property_ownership_proof": step_data.get("property_ownership_proof"),
             "updated_at": "now()"
         }
-        
+
         supabase.table("landlord_onboarding").update(update_data).eq("id", onboarding['id']).execute()
-        
+
         # MVP: Manual admin verification - no automated processing
         # TODO: Future - Implement property address geolocation verification
         # TODO: Future - Implement property ownership document validation
         # TODO: Future - Implement property image analysis
         print(f"✅ [ONBOARDING] Step 3 completed - Property data saved for manual admin review")
-        
+
         return OnboardingStepResponse(
             success=True,
             message="Step 3 completed successfully. Ready for bank information!",
@@ -295,7 +507,7 @@ async def _process_step_3(
             step_completed=True,
             onboarding_id=onboarding['id']
         )
-        
+
     except Exception as e:
         print(f"❌ [ONBOARDING] Error processing step 3: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -303,8 +515,7 @@ async def _process_step_3(
 
 async def _process_step_4(
     onboarding: dict, 
-    step_data: dict,
-    background_tasks: BackgroundTasks
+    step_data: dict
 ) -> OnboardingStepResponse:
     """Process Step 4: Bank Account Information (MVP - Manual Admin Review)"""
     try:
@@ -317,6 +528,8 @@ async def _process_step_4(
             "bank_account_name": step_data.get("bank_account_name"),
             "bank_verification_number": step_data.get("bank_verification_number"),
             "bank_statement_url": step_data.get("bank_statement_url"),
+            "guarantor_id_url": step_data.get("guarantor_id_url"),
+            "insurance_document_url": step_data.get("insurance_document_url"),
             "updated_at": "now()"
         }
         
@@ -424,6 +637,12 @@ async def submit_complete_onboarding(
             "bank_name":     request_data.get("bank_name"),
             "account_number": request_data.get("account_number"),
             "account_name":  request_data.get("account_name"),
+            "id_document_url": request_data.get("id_document_url"),
+            "selfie_url": request_data.get("selfie_url"),
+            "nin_document_url": request_data.get("nin_document_url"),
+            "bank_statement_url": request_data.get("bank_statement_url"),
+            "guarantor_id_url": request_data.get("guarantor_id_url"),
+            "insurance_document_url": request_data.get("insurance_document_url"),
             "profile_step_completed":    True,
             "property_step_completed":   True,
             "payment_step_completed":    True,

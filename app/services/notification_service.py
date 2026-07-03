@@ -1666,6 +1666,199 @@ class NotificationService:
             f"[NOTIF] notify_payment_confirmed done for transaction {transaction_id}"
         )
 
+    async def notify_maintenance_created(
+        self,
+        *,
+        maintenance_request_id: str,
+        property_id: str,
+        property_title: str,
+        tenant_id: str,
+        tenant_name: str,
+        tenant_email: Optional[str],
+        tenant_phone: Optional[str],
+        landlord_id: str,
+        landlord_name: str,
+        landlord_email: Optional[str],
+        landlord_phone: Optional[str],
+        category: str,
+        title: str,
+        urgency: str,
+    ) -> None:
+        """
+        Fire when a tenant submits a new maintenance request.
+        Channels:
+          - Email to landlord -> "New maintenance request"
+          - In-app for landlord -> "New maintenance request"
+          - In-app for tenant -> "Maintenance request submitted"
+        """
+        logger.info(f"📧 [NOTIF] notify_maintenance_created for request {maintenance_request_id}")
+
+        # ── Email to landlord ──────────────────────────────────────────────────
+        if landlord_email:
+            await _run(
+                email_service._send_email,
+                landlord_email,
+                f"🔧 New Maintenance Request — '{property_title}'",
+                _html_maintenance_created(
+                    landlord_name,
+                    tenant_name,
+                    property_title,
+                    category,
+                    title,
+                    urgency,
+                    self.base_url,
+                    self.support_email,
+                ),
+                (
+                    f"Hi {landlord_name}, {tenant_name} has submitted a maintenance request for '{property_title}'. "
+                    f"Please log in to review the request."
+                ),
+            )
+
+        # ── SMS to landlord (if available) ─────────────────────────────────────
+        if landlord_phone:
+            await _run(
+                sms_service.send_sms,
+                landlord_phone,
+                (
+                    f"NuloAfrica: New maintenance request from {tenant_name} for '{property_title}'. "
+                    f"Review at {self.base_url}/landlord/maintenance"
+                ),
+            )
+
+        # ── In-app to landlord ─────────────────────────────────────────────────
+        try:
+            create_notification(
+                user_id=landlord_id,
+                notif_type="maintenance_created",
+                title="🔧 New Maintenance Request",
+                message=(
+                    f"{tenant_name} has submitted a maintenance request for '{property_title}'. "
+                    f"Click to review and take action."
+                ),
+                link=f"/landlord/maintenance/{maintenance_request_id}",
+                data={
+                    "maintenance_request_id": maintenance_request_id,
+                    "property_id": property_id,
+                    "property_title": property_title,
+                    "tenant_name": tenant_name,
+                    "category": category,
+                    "urgency": urgency,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[NOTIF] In-app (landlord) failed for notify_maintenance_created: {e}")
+
+        # ── In-app to tenant ──────────────────────────────────────────────────
+        try:
+            create_notification(
+                user_id=tenant_id,
+                notif_type="maintenance_created",
+                title="Maintenance Request Submitted",
+                message=(
+                    f"Your maintenance request for '{property_title}' has been submitted successfully. "
+                    f"We'll notify you when the landlord responds."
+                ),
+                link=f"/tenant/maintenance/{maintenance_request_id}",
+                data={
+                    "maintenance_request_id": maintenance_request_id,
+                    "property_id": property_id,
+                    "property_title": property_title,
+                    "category": category,
+                    "urgency": urgency,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[NOTIF] In-app (tenant) failed for notify_maintenance_created: {e}")
+
+        logger.info(f"✅ [NOTIF] notify_maintenance_created done for request {maintenance_request_id}")
+
+    async def notify_maintenance_updated(
+        self,
+        *,
+        maintenance_request_id: str,
+        property_id: str,
+        property_title: str,
+        tenant_id: str,
+        tenant_name: str,
+        tenant_email: Optional[str],
+        tenant_phone: Optional[str],
+        landlord_id: str,
+        landlord_name: str,
+        new_status: str,
+    ) -> None:
+        """
+        Fire when a landlord updates a maintenance request's status.
+        Channels:
+          - Email to tenant -> "Maintenance request updated"
+          - In-app for tenant -> "Maintenance request updated"
+        """
+        logger.info(f"📧 [NOTIF] notify_maintenance_updated for request {maintenance_request_id}")
+
+        status_text = ""
+        if new_status == "ACKNOWLEDGED":
+            status_text = "has been acknowledged"
+        elif new_status == "IN_PROGRESS":
+            status_text = "is now in progress"
+        elif new_status == "RESOLVED":
+            status_text = "has been resolved"
+        elif new_status == "CLOSED":
+            status_text = "has been closed"
+
+        # ── Email to tenant ───────────────────────────────────────────────────
+        if tenant_email:
+            await _run(
+                email_service._send_email,
+                tenant_email,
+                f"🔧 Maintenance Request Update — '{property_title}'",
+                _html_maintenance_updated(
+                    tenant_name,
+                    property_title,
+                    landlord_name,
+                    new_status,
+                    self.base_url,
+                    self.support_email,
+                ),
+                (
+                    f"Hi {tenant_name}, your maintenance request for '{property_title}' {status_text} by {landlord_name}. "
+                    f"Please log in to view the update."
+                ),
+            )
+
+        # ── SMS to tenant (if available) ───────────────────────────────────────
+        if tenant_phone:
+            await _run(
+                sms_service.send_sms,
+                tenant_phone,
+                (
+                    f"NuloAfrica: Your maintenance request for '{property_title}' {status_text}. "
+                    f"View at {self.base_url}/tenant/maintenance/{maintenance_request_id}"
+                ),
+            )
+
+        # ── In-app to tenant ───────────────────────────────────────────────────
+        try:
+            create_notification(
+                user_id=tenant_id,
+                notif_type="maintenance_updated",
+                title="Maintenance Request Updated",
+                message=(
+                    f"Your maintenance request for '{property_title}' {status_text} by {landlord_name}."
+                ),
+                link=f"/tenant/maintenance/{maintenance_request_id}",
+                data={
+                    "maintenance_request_id": maintenance_request_id,
+                    "property_id": property_id,
+                    "property_title": property_title,
+                    "landlord_name": landlord_name,
+                    "new_status": new_status,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[NOTIF] In-app (tenant) failed for notify_maintenance_updated: {e}")
+
+        logger.info(f"✅ [NOTIF] notify_maintenance_updated done for request {maintenance_request_id}")
+
 
 
     async def notify_new_message(
@@ -1958,7 +2151,7 @@ def _foot(support_email):
         '<p>Zero Agency Fee Rental Platform</p>'
         '<p>Lagos &bull; Abuja &bull; Port Harcourt</p>'
         f'<p>Questions? <a href="mailto:{support_email}">{support_email}</a></p>'
-        '<p style="margin-top:12px;color:#CBD5E1">&copy; 2025 NuloAfrica. All rights reserved.</p>'
+        '<p style="margin-top:12px;color:#CBD5E1">&copy; 2026 NuloAfrica. All rights reserved.</p>'
         '</div>'
         '</div></div>'  # close .card .wrap
         '</body></html>'
@@ -2290,5 +2483,50 @@ def _html_payment_confirmed_landlord(
         + f'<a href="{base_url}/landlord/payments" class="btn green">View Payments &rarr;</a>'
         + f'<a href="{base_url}/landlord/overview" class="btn grey">Go to Dashboard</a>'
         + '</div>'
+        + _foot(support_email)
+    )
+
+
+def _html_maintenance_created(
+    landlord_name, tenant_name, property_title, category, title, urgency, base_url, support_email
+):
+    """Email to landlord: new maintenance request received."""
+    return (
+        _open("orange", "🔧 New Maintenance Request", "Action Required")
+        + f'<p>Hi <strong>{landlord_name}</strong>,</p>'
+        + f'<p><strong>{tenant_name}</strong> has submitted a maintenance request for <strong>"{property_title}"</strong>.</p>'
+        + '<div class="divider"></div>'
+        + f'<div class="box"><strong>Request Details</strong>'
+        + f'<p><strong>Category:</strong> {category}</p>'
+        + f'<p><strong>Title:</strong> {title}</p>'
+        + f'<p><strong>Urgency:</strong> {urgency}</p></div>'
+        + '<p>Please review the request and take appropriate action. You can acknowledge, update status, or resolve the issue.</p>'
+        + f'<div class="btns"><a href="{base_url}/landlord/maintenance" class="btn orange">View Maintenance Requests &rarr;</a></div>'
+        + _foot(support_email)
+    )
+
+
+def _html_maintenance_updated(
+    tenant_name, property_title, landlord_name, new_status, base_url, support_email
+):
+    """Email to tenant: maintenance request status updated."""
+    status_text = ""
+    if new_status == "ACKNOWLEDGED":
+        status_text = "Acknowledged"
+    elif new_status == "IN_PROGRESS":
+        status_text = "In Progress"
+    elif new_status == "RESOLVED":
+        status_text = "Resolved"
+    elif new_status == "CLOSED":
+        status_text = "Closed"
+
+    return (
+        _open("blue", "🔧 Maintenance Request Updated", f"Status: {status_text}")
+        + f'<p>Hi <strong>{tenant_name}</strong>,</p>'
+        + f'<p><strong>{landlord_name}</strong> has updated your maintenance request for <strong>"{property_title}"</strong> to <strong>{status_text}</strong>.</p>'
+        + '<div class="divider"></div>'
+        + f'<div class="box"><strong>Update</strong><p>The landlord has updated the status of your maintenance request.</p></div>'
+        + '<p>Log in to view the full details or provide feedback.</p>'
+        + f'<div class="btns"><a href="{base_url}/tenant/maintenance" class="btn orange">View Maintenance Requests &rarr;</a></div>'
         + _foot(support_email)
     )

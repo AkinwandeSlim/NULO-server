@@ -130,7 +130,7 @@ async def fetch_landlords_batch(
             try:
                 r = supabase_admin.table("properties").select(
                     "landlord_id", count="exact"
-                ).in_("landlord_id", landlord_ids).eq("status", "vacant").execute()
+                ).in_("landlord_id", landlord_ids).eq("status", "vacant").is_("deleted_at", "null").execute()
                 # Count per landlord properly — don't divide total evenly
                 counts: Dict[str, int] = {lid: 0 for lid in landlord_ids}
                 for row in (r.data or []):
@@ -228,14 +228,17 @@ async def search_properties(
     try:
         print(f"🔍 [SEARCH] location={location}, beds={bedrooms}, price={min_price}-{max_price}")
         
-        # Build optimized query
+        # FILTER 1: Only vacant AND approved + non-deleted properties (uses idx_properties_status)
+        # Filter out soft-deleted properties from public marketplace (REG-08 fix)
         query = supabase_admin.table("properties").select(
-            "*",  # Select all fields from properties table
-            count="exact"
+            "*"
+        ).eq(
+            "status", "vacant"
+        ).eq(
+            "verification_status", "approved"
+        ).is_(
+            "deleted_at", "null"
         )
-        
-        # FILTER 1: Only vacant AND approved properties (uses idx_properties_status)
-        query = query.eq("status", "vacant").eq("verification_status", "approved")
         
         # FILTER 2: Location search - SMART BACKWARD COMPATIBLE SEARCH
         # Handles both new format (Maitama, FCT) and old corrupted data (Maitama, Abuja, Abuja)
@@ -277,9 +280,22 @@ async def search_properties(
         if bathrooms is not None and bathrooms > 0:
             query = query.gte("baths", bathrooms)
         
-        # FILTER 6: Property type
-        if property_type and property_type != "all":
-            query = query.eq("property_type", property_type)
+        # FILTER 6: Property type (BUG-016 fix)
+        #   The frontend filter dropdown sends Capitalised values
+        #   ("Apartment", "Villa", "Penthouse"...) but the DB may hold
+        #   the same word in any case ("apartment", "APARTMENT"...).
+        #   `.eq()` is case-sensitive so "Apartment" would miss "apartment"
+        #   rows and return 0 results. Use `.ilike()` (case-insensitive
+        #   pattern match) without wildcards so we get a case-insensitive
+        #   equality. We also strip + lowercase the value first to avoid
+        #   accidentally injecting SQL LIKE wildcards from the query string.
+        if property_type and property_type.strip().lower() != "all":
+            safe = (
+                property_type.strip()
+                .replace("%", r"\%")
+                .replace("_", r"\_")
+            )
+            query = query.ilike("property_type", safe)
         
         # FILTER 7: Furnished
         if furnished is not None:
@@ -304,11 +320,13 @@ async def search_properties(
             query = query.order("created_at", desc=True)
         
         # PAGINATION
-        # Supabase range() is exclusive on upper bound (like Python slicing)
-        # For limit=20, page=1: offset=0, range(0, 20) = 20 items (indices 0-19)
+        # Supabase/PostgREST `.range(start, end)` is INCLUSIVE on both ends
+        # (the underlying Range header uses closed intervals). So for limit=20,
+        # page=1: offset=0, range(0, 19) = 20 items. The previous comment was
+        # wrong and the formula produced `limit + 1` items.
         offset = (page - 1) * limit
         range_start = offset
-        range_end = offset + limit
+        range_end = offset + limit - 1
         
         print(f"📍 [PAGINATION] page={page}, limit={limit}, offset={offset}, range({range_start}, {range_end}) - expecting {limit} items")
         query = query.range(range_start, range_end)
@@ -437,6 +455,8 @@ async def get_featured_properties(
             "status", "vacant"
         ).eq(
             "verification_status", "approved"
+        ).is_(
+            "deleted_at", "null"
         ).eq(
             "featured", True
         ).order(
@@ -483,33 +503,81 @@ async def get_my_properties(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     status_filter: Optional[str] = Query(None, description="Filter by status: vacant, rented, inactive"),
+    include_deleted: bool = Query(False, description="REG-08 fix: include soft-deleted properties (landlord view)"),
+    include_pending: bool = Query(False, description="Include properties still awaiting admin approval"),
+    include_rejected: bool = Query(False, description="Include properties rejected by admin"),
+    search: Optional[str] = Query(None, description="Search across title, address, city, state, location"),
     current_user: dict = Depends(get_current_landlord)
 ):
     """
-    Get all properties for the current landlord with pagination and filtering
+    Get all properties for the current landlord with pagination and filtering.
+
+    Default filtering (matches My Properties page UI):
+      - Excludes soft-deleted (`deleted_at IS NULL`)
+      - Excludes rejected (admin test data leak fix)
+      - Excludes pending review (no action available until approved)
+      - Only returns properties that are approved AND (vacant OR occupied)
     """
     try:
         landlord_id = current_user["id"]
-        
+
         # Calculate offset
+        # ── Off-by-one fix: Supabase/PostgREST `.range(start, end)` is INCLUSIVE
+        # on both ends, so `range(0, 14)` returns 15 items, not 14.
+        # The previous code used `range_end = offset + limit` which produced
+        # `limit + 1` items (e.g. 16 instead of 15). Use `offset + limit - 1`.
         offset = (page - 1) * limit
         range_start = offset
-        range_end = offset + limit
-        
-        print(f"📍 [MY-PROPERTIES PAGINATION] page={page}, limit={limit}, offset={offset}, range({range_start}, {range_end}) - expecting {limit} items")
-        
+        range_end = offset + limit - 1
+
+        print(f"📍 [MY-PROPERTIES PAGINATION] page={page}, limit={limit}, offset={offset}, range({range_start}, {range_end}), include_deleted={include_deleted} - expecting {limit} items")
+
         # Build query
         query = supabase_admin.table("properties").select(
             "*", count="exact"
         ).eq("landlord_id", landlord_id)
-        
-        # Apply status filter if provided
-        if status_filter:
+
+        # REG-08 fix: exclude soft-deleted by default; landlord can opt-in to see them
+        if not include_deleted:
+            query = query.is_("deleted_at", "null")
+
+        # Filter by admin verification status. Default is "approved" only so
+        # admin test/rejected/pending records don't leak into the My Properties
+        # list. The landlord can opt-in to see pending or rejected rows.
+        if include_rejected and include_pending:
+            query = query.in_("verification_status", ["approved", "pending", "rejected"])
+        elif include_rejected:
+            query = query.in_("verification_status", ["approved", "rejected"])
+        elif include_pending:
+            query = query.in_("verification_status", ["approved", "pending"])
+        else:
+            query = query.eq("verification_status", "approved")
+
+        # Apply status (lifecycle) filter if provided.
+        # Allowed values: vacant, occupied, maintenance. Anything else is ignored.
+        if status_filter and status_filter in ("vacant", "occupied", "maintenance"):
             query = query.eq("status", status_filter)
-        
+        else:
+            # No status filter supplied — restrict to active lifecycle states so
+            # 'maintenance' or other transient states don't show by default.
+            query = query.in_("status", ["vacant", "occupied"])
+
+        # Apply search filter (case-insensitive) across multiple text fields.
+        # Uses PostgREST `or=` with `ilike` for substring match.
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            query = query.or_(
+                f"title.ilike.{term},"
+                f"address.ilike.{term},"
+                f"city.ilike.{term},"
+                f"state.ilike.{term},"
+                f"location.ilike.{term},"
+                f"full_address.ilike.{term}"
+            )
+
         # Order by creation date (newest first)
         query = query.order("created_at", desc=True)
-        
+
         # Apply pagination
         response = query.range(range_start, range_end).execute()
         
@@ -694,9 +762,54 @@ async def create_property(
     """
     try:
         landlord_id = current_user["id"]
-        
+
         print(f"📤 [CREATE] landlord={landlord_id}, title={title}, city={city}, state={state}, images={len(images)}")
-        
+
+        # ── ONBD-09 fix: Block rejected landlords from creating new properties ──
+        # Admins reject landlords via /api/v1/onboarding/admin/review/{onboarding_id}
+        # which sets users.verification_status = 'rejected'. A rejected landlord
+        # must NOT be able to create new property listings. The landlord must
+        # contact support / re-submit onboarding instead.
+        landlord_status_check = supabase_admin.table("users").select(
+            "verification_status"
+        ).eq("id", landlord_id).single().execute()
+        landlord_status = (
+            (landlord_status_check.data or {}).get("verification_status", "pending")
+        )
+
+        if landlord_status == "rejected":
+            print(f"❌ [CREATE] Blocked: landlord {landlord_id} is rejected")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Your landlord account was rejected and cannot create new "
+                    "property listings. Please contact support or resubmit your "
+                    "verification documents."
+                ),
+            )
+
+        # ── BUG-014 fix: Block unverified (still-pending) landlords too ──
+        # Previously, only "rejected" was blocked. An account still in the
+        # verification queue (status == "pending") could still create
+        # listings. Now we require an *approved* verification_status before
+        # accepting new listings — anything else (pending / partial /
+        # suspended) is rejected with an actionable error message.
+        if landlord_status != "approved":
+            print(
+                f"❌ [CREATE] Blocked: landlord {landlord_id} is not verified "
+                f"(verification_status={landlord_status})"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"You can only publish property listings once your landlord "
+                    f"verification is approved. Your current status is "
+                    f"'{landlord_status}'. Please complete the onboarding "
+                    f"process and wait for admin approval before listing "
+                    f"properties."
+                ),
+            )
+
         # Validate and set security deposit to 2 months rent if not provided
         if not security_deposit:
             security_deposit = price * 2  # Default to 2 months rent
@@ -857,7 +970,7 @@ async def get_platform_stats():
             asyncio.to_thread(
                 lambda: supabase_admin.table("properties").select(
                     "id", count="exact"
-                ).eq("status", "vacant").execute()
+                ).eq("status", "vacant").is_("deleted_at", "null").execute()
             )
         )
         
@@ -952,7 +1065,7 @@ async def get_cities_summary():
         for city in cities_data:
             response = supabase_admin.table("properties").select(
                 "id", count="exact"
-            ).eq("city", city["name"]).eq("status", "vacant").eq("verification_status", "approved").execute()
+            ).eq("city", city["name"]).eq("status", "vacant").eq("verification_status", "approved").is_("deleted_at", "null").execute()
             city["property_count"] = response.count or 0
         
         return {
@@ -990,7 +1103,7 @@ async def get_popular_locations(
         # Fetch all vacant + approved properties with location data (marketplace-visible only)
         response = supabase_admin.table("properties").select(
             "location, city, state, country"
-        ).eq("status", "vacant").eq("verification_status", "approved").execute()
+        ).eq("status", "vacant").eq("verification_status", "approved").is_("deleted_at", "null").execute()
         
         if not response.data:
             return {
@@ -1081,41 +1194,96 @@ def get_coordinates_for_location(location: str, city: str) -> dict:
 @router.put("/{property_id}")
 async def update_property(
     property_id: str,
-    title: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
-    property_type: Optional[str] = Form(None),
-    location: Optional[str] = Form(None),
-    address: Optional[str] = Form(None),
-    price: Optional[float] = Form(None),
-    bedrooms: Optional[int] = Form(None),
-    bathrooms: Optional[int] = Form(None),
-    sqft: Optional[int] = Form(None),
-    amenities: Optional[str] = Form("[]"),
-    status: Optional[str] = Form(None),
+    property_data: dict,
     current_user: dict = Depends(get_current_landlord)
 ):
     """
     Update an existing property (landlord only, own properties)
+
+    BUG-012 fix: Switched from Form() to JSON body to fix FastAPI PUT request
+    parsing issue where all fields were received as NULL when sent as
+    multipart/form-data. JSON is more reliable for PUT operations.
+
+    Accepts a JSON body with optional fields:
+    - title, description, property_type
+    - location, address
+    - price, beds, baths, sqft
+    - amenities (array), status
+    - security_deposit, pet_friendly, parking_spaces
+    - furnished, lease_duration, rules, available_from
     """
     try:
         landlord_id = current_user["id"]
-        
+
+        # Extract fields from JSON body with None defaults
+        title = property_data.get("title")
+        description = property_data.get("description")
+        property_type = property_data.get("property_type")
+        location = property_data.get("location")
+        address = property_data.get("address")
+        price = property_data.get("price")
+        bedrooms = property_data.get("bedrooms") or property_data.get("beds")
+        bathrooms = property_data.get("bathrooms") or property_data.get("baths")
+        sqft = property_data.get("sqft") or property_data.get("square_feet")
+        amenities = property_data.get("amenities", [])
+        status = property_data.get("status")
+
+        #region debug-point H4-backend-receives
+        # Debug: Log what the backend receives
+        print(f"🔍 [BACKEND-UPDATE] property_id={property_id}, landlord_id={landlord_id}")
+        print(f"🔍 [BACKEND-UPDATE] Received fields: title={title}, price={price}, bedrooms={bedrooms}, bathrooms={bathrooms}")
+
+        # Report to debug server (fire-and-forget)
+        try:
+            import urllib.request
+            import json
+            debug_data = {
+                "hypothesisId": "H4",
+                "stage": "backend-receives",
+                "property_id": property_id,
+                "landlord_id": landlord_id,
+                "received_fields": {
+                    "title": title,
+                    "price": price,
+                    "bedrooms": bedrooms,
+                    "bathrooms": bathrooms,
+                    "sqft": sqft,
+                    "amenities": amenities,
+                    "status": status
+                }
+            }
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    "http://127.0.0.1:7778/event",
+                    data=json.dumps(debug_data).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                ),
+                timeout=1
+            )
+        except Exception as e:
+            print(f"⚠️ [BACKEND-UPDATE] Failed to report to debug server: {e}")
+        #endregion debug-point H4-backend-receives
+
         # Verify ownership
         property_check = supabase_admin.table("properties").select("landlord_id").eq(
             "id", property_id
         ).execute()
-        
+
         if not property_check.data or property_check.data[0]["landlord_id"] != landlord_id:
+            print(f"❌ [BACKEND-UPDATE] Ownership check failed for property_id={property_id}, landlord_id={landlord_id}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You don't have permission to update this property"
             )
-        
+
+        print(f"✅ [BACKEND-UPDATE] Ownership verified for property_id={property_id}")
+
         # Build update data with only provided fields
         update_data = {
             "updated_at": datetime.now().isoformat()
         }
-        
+
         # Add fields only if they are provided
         if title is not None:
             update_data["title"] = title
@@ -1128,23 +1296,135 @@ async def update_property(
         if address is not None:
             update_data["address"] = address
         if price is not None:
-            update_data["price"] = int(price)
+            update_data["price"] = int(price) if isinstance(price, (int, float, str)) else None
         if bedrooms is not None:
-            update_data["beds"] = bedrooms
+            update_data["beds"] = int(bedrooms) if isinstance(bedrooms, (int, float, str)) else None
         if bathrooms is not None:
-            update_data["baths"] = bathrooms
+            update_data["baths"] = int(bathrooms) if isinstance(bathrooms, (int, float, str)) else None
         if sqft is not None:
-            update_data["sqft"] = sqft
+            update_data["sqft"] = int(sqft) if isinstance(sqft, (int, float, str)) else None
         if amenities is not None:
-            update_data["amenities"] = json.loads(amenities)
+            # Handle both array and JSON string
+            if isinstance(amenities, str):
+                try:
+                    update_data["amenities"] = json.loads(amenities)
+                except (ValueError, TypeError):
+                    update_data["amenities"] = []
+            elif isinstance(amenities, list):
+                update_data["amenities"] = amenities
+            else:
+                update_data["amenities"] = []
+
+        # Handle additional fields that might be in the JSON
+        security_deposit = property_data.get("security_deposit")
+        if security_deposit is not None:
+            update_data["security_deposit"] = int(security_deposit) if isinstance(security_deposit, (int, float, str)) else None
+
+        pet_friendly = property_data.get("pet_friendly")
+        if pet_friendly is not None:
+            if isinstance(pet_friendly, bool):
+                update_data["pet_friendly"] = pet_friendly
+            elif isinstance(pet_friendly, str):
+                update_data["pet_friendly"] = pet_friendly.lower() in ("true", "1", "yes", "on")
+
+        parking_spaces = property_data.get("parking_spaces")
+        if parking_spaces is not None:
+            update_data["parking_spaces"] = int(parking_spaces) if isinstance(parking_spaces, (int, float, str)) else None
+
+        furnished = property_data.get("furnished")
+        if furnished is not None:
+            if isinstance(furnished, bool):
+                update_data["furnished"] = furnished
+            elif isinstance(furnished, str):
+                update_data["furnished"] = furnished.lower() in ("true", "1", "yes", "on")
+
+        lease_duration = property_data.get("lease_duration")
+        if lease_duration is not None:
+            update_data["lease_duration"] = lease_duration
+
+        rules = property_data.get("rules")
+        if rules is not None:
+            if isinstance(rules, str):
+                try:
+                    update_data["rules"] = json.loads(rules)
+                except (ValueError, TypeError):
+                    update_data["rules"] = []
+            elif isinstance(rules, list):
+                update_data["rules"] = rules
+
+        available_from = property_data.get("available_from") or property_data.get("availability_start")
+        if available_from is not None:
+            update_data["available_from"] = available_from
+
         if status is not None:
             update_data["status"] = status
         
         # Update property
+        print(f"📝 [BACKEND-UPDATE] Sending update to Supabase: {update_data}")
         response = supabase_admin.table("properties").update(update_data).eq(
             "id", property_id
         ).execute()
-        
+
+        print(f"📊 [BACKEND-UPDATE] Supabase response: data={response.data}, count={response.count}")
+
+        #region debug-point H5-database-saved
+        # Debug: Verify what was actually saved to the database
+        if response.data:
+            saved_data = response.data[0]
+            print(f"✅ [BACKEND-UPDATE] Saved to DB: title={saved_data.get('title')}, price={saved_data.get('price')}")
+
+            try:
+                import urllib.request
+                import json
+                debug_data = {
+                    "hypothesisId": "H5",
+                    "stage": "database-saved",
+                    "property_id": property_id,
+                    "saved_fields": {
+                        "title": saved_data.get("title"),
+                        "price": saved_data.get("price"),
+                        "beds": saved_data.get("beds"),
+                        "baths": saved_data.get("baths"),
+                        "status": saved_data.get("status")
+                    },
+                    "update_data_sent": update_data
+                }
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        "http://127.0.0.1:7778/event",
+                        data=json.dumps(debug_data).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    ),
+                    timeout=1
+                )
+            except Exception as e:
+                print(f"⚠️ [BACKEND-UPDATE] Failed to report to debug server: {e}")
+        else:
+            print(f"⚠️ [BACKEND-UPDATE] Supabase returned no data! Response: {response}")
+            try:
+                import urllib.request
+                import json
+                debug_data = {
+                    "hypothesisId": "H5",
+                    "stage": "database-saved-empty",
+                    "property_id": property_id,
+                    "message": "Supabase returned empty data",
+                    "update_data_sent": update_data
+                }
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        "http://127.0.0.1:7778/event",
+                        data=json.dumps(debug_data).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    ),
+                    timeout=1
+                )
+            except Exception:
+                pass
+        #endregion debug-point H5-database-saved
+
         if not response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1194,11 +1474,17 @@ async def delete_property(
         
         property_title = property_check.data[0]["title"]
         
-        # Soft delete — set deleted_at timestamp; status stays as-is so DB constraint is respected
-        # Use verification_status='rejected' to hide from marketplace; deleted_at flags the record
+
+        # REG-08 + UX fix: only set deleted_at — do NOT touch verification_status.
+        # Setting verification_status='rejected' on landlord-delete was a semantic bug:
+        # it conflated admin-rejection (property_verification.py) with self-deletion,
+        # causing the UI to label deleted properties as "Rejected". Now:
+        #   • deleted_at IS NOT NULL         → landlord has deleted the property
+        #   • verification_status='rejected' → admin has rejected the property
+        # Marketplace queries already filter by deleted_at IS NULL, so this change
+        # preserves all filtering behavior while restoring semantic accuracy.
         supabase_admin.table("properties").update({
-            "deleted_at": datetime.now().isoformat(),
-            "verification_status": "rejected"
+            "deleted_at": datetime.now().isoformat()
         }).eq("id", property_id).execute()
         
         return {

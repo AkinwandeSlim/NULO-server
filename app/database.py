@@ -79,6 +79,7 @@ def create_optimized_client(url: str, key: str) -> Client:
 @retry_on_timeout(max_retries=3, delay=1.0)
 def get_supabase_client() -> Client:
     """Get Supabase client instance (anon key) with optimizations"""
+    print(f"🔍 [DB] Creating supabase client with key starting with: {settings.SUPABASE_KEY[:20]}...")
     return create_optimized_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 
@@ -88,6 +89,8 @@ def get_supabase_admin() -> Client:
     """Get Supabase admin client (service role key) with optimizations"""
     # Use SERVICE_ROLE_KEY for admin operations (has auth admin privileges)
     service_key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+    print(f"🔍 [DB] Creating supabase_admin with service key starting with: {service_key[:20]}...")
+    print(f"🔍 [DB] Service key source: {'SUPABASE_SERVICE_ROLE_KEY' if settings.SUPABASE_SERVICE_ROLE_KEY else 'SUPABASE_SERVICE_KEY'}")
     return create_optimized_client(settings.SUPABASE_URL, service_key)
 
 

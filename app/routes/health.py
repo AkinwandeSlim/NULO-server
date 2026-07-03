@@ -4,6 +4,7 @@ Health check and diagnostic endpoints
 from fastapi import APIRouter, HTTPException
 from app.services.email_service import email_service
 from app.config import settings
+from app.database import supabase_admin
 import smtplib
 import logging
 
@@ -14,11 +15,24 @@ router = APIRouter(prefix="/health", tags=["Health & Diagnostics"])
 
 @router.get("/")
 async def health_check():
-    """Basic health check"""
+    """Basic health check with Supabase connectivity verification"""
+    supabase_status = "healthy"
+    try:
+        # Simple test query to verify Supabase is reachable
+        supabase_admin.table("users").select("id").limit(1).execute()
+    except Exception as e:
+        logger.error(f"❌ [HEALTH] Supabase check failed: {str(e)}")
+        supabase_status = "unhealthy"
+    
+    overall_status = "healthy" if supabase_status == "healthy" else "degraded"
+    
     return {
-        "status": "healthy",
+        "status": overall_status,
         "environment": settings.ENVIRONMENT,
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "checks": {
+            "supabase": supabase_status
+        }
     }
 
 

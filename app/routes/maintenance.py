@@ -2,12 +2,14 @@
 Maintenance routes - Using Supabase (not SQLAlchemy)
 Post Move-in Maintenance Management
 """
-from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File, Form
 from app.database import supabase_admin
 from app.middleware.auth import get_current_user
-from pydantic import BaseModel, Field
+from app.services.notification_service import notification_service
+from pydantic import BaseModel, Field, ValidationError
 from typing import Optional, List
 from datetime import datetime, date
+import json
 
 router = APIRouter(prefix="/maintenance")
 
@@ -36,7 +38,7 @@ class MaintenanceUpdate(BaseModel):
 
 @router.post("/")
 async def create_maintenance_request(
-    maintenance_data: MaintenanceCreate,
+    maintenance_data: str = Form(...),
     photos: Optional[List[UploadFile]] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
@@ -45,6 +47,16 @@ async def create_maintenance_request(
     Only tenants can create maintenance requests for properties they're renting
     """
     try:
+        # Parse maintenance data from JSON string
+        try:
+            maintenance_dict_data = json.loads(maintenance_data)
+            maintenance_create = MaintenanceCreate(**maintenance_dict_data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid maintenance data: {str(e)}"
+            )
+        
         # Verify user is a tenant
         if current_user["user_type"] != "tenant":
             raise HTTPException(
@@ -54,7 +66,7 @@ async def create_maintenance_request(
         
         # Verify property exists
         property_response = supabase_admin.table("properties").select("*").eq(
-            "id", maintenance_data.property_id
+            "id", maintenance_create.property_id
         ).execute()
         
         if not property_response.data:
@@ -65,43 +77,80 @@ async def create_maintenance_request(
         
         property = property_response.data[0]
         
-        # TODO: Verify tenant is actively renting this property
-        # This would require checking active agreements/leases
+        # Verify tenant is actively renting this property
+        agreement_response = supabase_admin.table("agreements").select("id").eq(
+            "property_id", maintenance_create.property_id
+        ).eq("tenant_id", current_user["id"]).eq(
+            "status", "ACTIVE"
+        ).execute()
+        
+        if not agreement_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You must have an active agreement for this property to submit a maintenance request"
+            )
         
         # Handle photo uploads
         photo_urls = []
         if photos:
             for photo in photos:
-                photo_url = await upload_maintenance_photo(photo, maintenance_data.property_id)
-                photo_urls.append(photo_url)
+                photo_url = await upload_maintenance_photo(photo, maintenance_create.property_id)
+                if photo_url:
+                    photo_urls.append(photo_url)
         
         # Create maintenance request
         maintenance_dict = {
-            "property_id": maintenance_data.property_id,
+            "property_id": maintenance_create.property_id,
             "tenant_id": current_user["id"],
             "landlord_id": property["landlord_id"],
-            "category": maintenance_data.category,
-            "title": maintenance_data.title,
-            "description": maintenance_data.description,
-            "urgency": maintenance_data.urgency,
+            "category": maintenance_create.category,
+            "title": maintenance_create.title,
+            "description": maintenance_create.description,
+            "urgency": maintenance_create.urgency,
             "photos": photo_urls,
-            "preferred_date": maintenance_data.preferred_date,
+            "preferred_date": maintenance_create.preferred_date,
             "status": "PENDING"
         }
         
         response = supabase_admin.table("maintenance_requests").insert(maintenance_dict).execute()
-        
+
         if not response.data:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create maintenance request"
             )
-        
+
         maintenance_request = response.data[0]
+
+        # Get tenant and landlord details for notification
+        tenant_response = supabase_admin.table("users").select("full_name, email, phone_number").eq("id", maintenance_create.tenant_id if hasattr(maintenance_create, 'tenant_id') else current_user["id"]).single().execute()
+        landlord_response = supabase_admin.table("users").select("full_name, email, phone_number").eq("id", property["landlord_id"]).single().execute()
         
+        tenant_name = tenant_response.data["full_name"] if tenant_response.data else "Tenant"
+        tenant_email = tenant_response.data["email"] if tenant_response.data else None
+        tenant_phone = tenant_response.data["phone_number"] if tenant_response.data else None
+        landlord_name = landlord_response.data["full_name"] if landlord_response.data else "Landlord"
+        landlord_email = landlord_response.data["email"] if landlord_response.data else None
+        landlord_phone = landlord_response.data["phone_number"] if landlord_response.data else None
+
         # Send notification to landlord
-        await send_maintenance_notification(maintenance_request, "landlord")
-        
+        await notification_service.notify_maintenance_created(
+            maintenance_request_id=str(maintenance_request["id"]),
+            property_id=str(maintenance_request["property_id"]),
+            property_title=property.get("title", "Property"),
+            tenant_id=str(maintenance_request["tenant_id"]),
+            tenant_name=tenant_name,
+            tenant_email=tenant_email,
+            tenant_phone=tenant_phone,
+            landlord_id=str(maintenance_request["landlord_id"]),
+            landlord_name=landlord_name,
+            landlord_email=landlord_email,
+            landlord_phone=landlord_phone,
+            category=maintenance_request["category"],
+            title=maintenance_request["title"],
+            urgency=maintenance_request["urgency"],
+        )
+
         return maintenance_request
         
     except HTTPException:
@@ -265,10 +314,37 @@ async def update_maintenance_request(
             if update_data.resolution_notes:
                 update_dict["resolution_notes"] = update_data.resolution_notes
             
-            if update_data.status == "RESOLVED":
-                update_dict["completed_at"] = datetime.utcnow().isoformat()
+            if update_data.status:
+                update_dict["status"] = update_data.status
+                if update_data.status == "RESOLVED":
+                    update_dict["completed_at"] = datetime.utcnow().isoformat()
+                
+                # Get tenant and landlord details for notification
+                tenant_response = supabase_admin.table("users").select("full_name, email, phone_number").eq("id", maintenance_request["tenant_id"]).single().execute()
+                landlord_response = supabase_admin.table("users").select("full_name, email, phone_number").eq("id", maintenance_request["landlord_id"]).single().execute()
+                
+                tenant_name = tenant_response.data["full_name"] if tenant_response.data else "Tenant"
+                tenant_email = tenant_response.data["email"] if tenant_response.data else None
+                tenant_phone = tenant_response.data["phone_number"] if tenant_response.data else None
+                landlord_name = landlord_response.data["full_name"] if landlord_response.data else "Landlord"
+                
+                # Get property details
+                property_response = supabase_admin.table("properties").select("title").eq("id", maintenance_request["property_id"]).single().execute()
+                property_title = property_response.data["title"] if property_response.data else "Property"
+                
                 # Send notification to tenant
-                await send_maintenance_notification(maintenance_request, "tenant")
+                await notification_service.notify_maintenance_updated(
+                    maintenance_request_id=str(maintenance_request["id"]),
+                    property_id=str(maintenance_request["property_id"]),
+                    property_title=property_title,
+                    tenant_id=str(maintenance_request["tenant_id"]),
+                    tenant_name=tenant_name,
+                    tenant_email=tenant_email,
+                    tenant_phone=tenant_phone,
+                    landlord_id=str(maintenance_request["landlord_id"]),
+                    landlord_name=landlord_name,
+                    new_status=update_data.status,
+                )
         
         # Tenant updates
         else:  # tenant
@@ -512,22 +588,3 @@ async def upload_maintenance_photo(photo: UploadFile, property_id: str):
     except Exception as e:
         print(f"Failed to upload photo {photo.filename}: {str(e)}")
         return None
-
-
-async def send_maintenance_notification(maintenance_request, recipient_type):
-    """
-    Send notification for maintenance request
-    """
-    try:
-        # TODO: Integrate with notification system
-        if recipient_type == "landlord":
-            message = f"New maintenance request: {maintenance_request['title']}"
-            # Send to landlord
-        else:
-            message = f"Your maintenance request has been {maintenance_request['status'].lower()}"
-            # Send to tenant
-        
-        print(f"Notification sent: {message}")
-        
-    except Exception as e:
-        print(f"Failed to send notification: {str(e)}")

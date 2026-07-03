@@ -9,6 +9,13 @@ from enum import Enum
 import os
 from app.database import get_supabase_client
 
+# License cache to avoid hitting Supabase on every request
+_license_cache = {
+    "data": None,
+    "last_checked": None,
+    "ttl_seconds": 300  # Cache for 5 minutes to prevent timeout issues
+}
+
 
 class LicenseStatus(str, Enum):
     ACTIVE = "active"
@@ -167,33 +174,53 @@ class LicenseService:
     
     @staticmethod
     def get_license() -> dict:
-        """Get current license info from Supabase"""
+        """Get current license info from Supabase, with caching"""
+        global _license_cache
+        
+        now = datetime.utcnow()
+        
+        # Check if cache is valid
+        if (_license_cache["data"] 
+                and _license_cache["last_checked"] 
+                and (now - _license_cache["last_checked"]).total_seconds() < _license_cache["ttl_seconds"]):
+            return _license_cache["data"]
+        
         try:
             supabase = get_supabase_client()
             response = supabase.table(LICENSE_TABLE).select("*").eq("license_key", LICENSE_KEY).single().execute()
             
             if response.data:
-                return response.data
+                license_data = response.data
+            else:
+                # Fallback: return default if not found
+                license_data = {
+                    "license_key": LICENSE_KEY,
+                    "expiry_date": LicenseConfig.INITIAL_EXPIRY_DATE,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "extended_count": 0,
+                    "last_extended_at": None,
+                    "status": "active"
+                }
             
-            # Fallback: return default if not found
-            return {
-                "license_key": LICENSE_KEY,
-                "expiry_date": LicenseConfig.INITIAL_EXPIRY_DATE,
-                "created_at": datetime.utcnow().isoformat(),
-                "extended_count": 0,
-                "last_extended_at": None,
-                "status": "active"
-            }
+            # Update cache
+            _license_cache["data"] = license_data
+            _license_cache["last_checked"] = now
+            
+            return license_data
         except Exception as e:
             print(f"❌ Error getting license: {str(e)}")
             # Return safe default on error (don't break app)
-            return {
+            license_data = {
                 "license_key": LICENSE_KEY,
                 "expiry_date": LicenseConfig.INITIAL_EXPIRY_DATE,
                 "extended_count": 0,
                 "last_extended_at": None,
                 "status": "active"
             }
+            # Cache the default too
+            _license_cache["data"] = license_data
+            _license_cache["last_checked"] = now
+            return license_data
     
     @staticmethod
     def check_license_valid() -> tuple[bool, str]:

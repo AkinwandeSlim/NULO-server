@@ -260,7 +260,7 @@ async def list_verifications(
                     true_status = 'partial'
             
             verification = {
-                'id': f"verification_{user_id}",
+                'id': onboarding.get('id') or user_id,
                 'landlord_id': user_id,
                 'admin_review_status': true_status,  # Use corrected status
                 'submitted_for_review': onboarding.get('submitted_for_review', False),
@@ -630,12 +630,31 @@ async def get_verification_detail(
         
         # Get user info - select only needed fields to speed up query
         user_result = supabase_admin.table('users')\
-            .select('id, email, full_name, avatar_url, trust_score, phone_number')\
+            .select('id, email, full_name, avatar_url, trust_score, phone_number, verification_status')\
             .eq('id', landlord_id)\
             .single()\
             .execute()
         
         user = user_result.data if user_result.data else {}
+
+        # ── BUG-011 fix: derive a single "true_status" that the frontend
+        # can render the same way it renders the list view. Without this
+        # consolidation the detail page could show "Approved" while the
+        # list row showed "Rejected" because each view read from a
+        # different source. We mirror the same logic the list endpoint
+        # uses (admin_review_status takes priority once submitted).
+        onboarding_admin_status = onboarding.get('admin_review_status')
+        onboarding_submitted = onboarding.get('submitted_for_review')
+        user_verification_status = user.get('verification_status')
+
+        if onboarding_submitted and onboarding_admin_status:
+            true_status = onboarding_admin_status
+        elif onboarding_submitted and not onboarding_admin_status:
+            true_status = 'pending'
+        elif user_verification_status == 'pending' and not onboarding_submitted:
+            true_status = 'partial'
+        else:
+            true_status = user_verification_status or 'partial'
         
         # Get document processing jobs - select only needed fields
         jobs = []
@@ -663,19 +682,63 @@ async def get_verification_detail(
             except Exception as prop_err:
                 print(f"⚠️ [VERIFICATION-DETAIL] Failed to fetch property: {str(prop_err)}")
                 property_info = None
+
+        # ── Generate signed URLs for documents ──
+        document_fields = [
+            "nin_document_url", "selfie_url", "id_document_url", 
+            "bank_statement_url", "guarantor_id_url", "insurance_document_url",
+            "proof_of_address_url", "company_registration_url", "property_ownership_proof"
+        ]
+        
+        signed_docs = {}
+        for field in document_fields:
+            path = onboarding.get(field)
+            if path and isinstance(path, str) and not path.startswith(("http://", "https://")):
+                try:
+                    signed = supabase_admin.storage.from_("landlord-verification").create_signed_url(path, 3600)
+                    signed_url = signed.get("signedURL") if isinstance(signed, dict) else None
+                    if signed_url:
+                        signed_docs[field] = signed_url
+                    else:
+                        print(f"⚠️ [VERIFICATION-DETAIL] No signedURL returned for {field}: {path}")
+                except Exception as storage_err:
+                    print(f"⚠️ [VERIFICATION-DETAIL] Failed to sign {field}: {path}, error: {str(storage_err)}")
+            else:
+                signed_docs[field] = path
+        
+        # Update onboarding dict with signed URLs
+        enriched_onboarding = {
+            **onboarding,
+            **signed_docs
+        }
         
         response = {
             "success": True,
             "verification": {
-                **onboarding,
+                **enriched_onboarding,
                 # Create nested landlord object as expected by frontend
                 "landlord": {
                     "id": landlord_id,
                     "email": user.get('email'),
                     "full_name": user.get('full_name'),
                     "avatar_url": user.get('avatar_url'),
-                    "trust_score": user.get('trust_score', 50)
+                    "trust_score": user.get('trust_score', 50),
+                    # BUG-011: include both raw user.verification_status and
+                    # the derived true_status so the detail view can render
+                    # exactly what the list view shows. Frontend should
+                    # prefer "verification_status" (the synced value).
+                    "verification_status": true_status,
+                    "raw_verification_status": user_verification_status,
                 },
+                # BUG-011: top-level verification_status uses the same
+                # derived "true_status" so any consumer (including the
+                # admin landlord profile page) sees a single, consistent
+                # value that matches the list view.
+                "verification_status": true_status,
+                "admin_review_status": true_status,
+                # BUG-007: Map landlord_type to account_type for frontend compatibility
+                # Frontend detail page checks verification.account_type, not landlord_type
+                "account_type": onboarding.get('landlord_type', 'individual'),
                 # Map backend fields to frontend expectations
                 "phone_number": user.get('phone_number', onboarding.get('phone_number')),  # Use user phone_number first, fallback to onboarding
                 "admin_notes": onboarding.get('admin_feedback'),

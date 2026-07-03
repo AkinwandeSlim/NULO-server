@@ -12,6 +12,7 @@ from app.services.notification_service import notification_service
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import logging
+from app.routes.landlord_dashboard import _dashboard_cache
 
 router = APIRouter(prefix="/properties", tags=["admin-properties"])
 logger = logging.getLogger(__name__)
@@ -349,7 +350,21 @@ async def verify_property(
             )
         
         logger.info(f"✅ [PROPERTIES] Property {property_id} {action.action}ed successfully")
-        
+
+        # Invalidate landlord dashboard server cache so the next overview
+        # request immediately reflects the new verification_status.
+        property_data = result.data[0] if result.data else {}
+        landlord_id_for_cache = property_data.get("landlord_id")
+        if landlord_id_for_cache:
+            # Match the actual cache key format used by landlord_dashboard.py:
+            #   cache_key = f"dashboard_{landlord_id}"
+            cache_key_to_invalidate = f"dashboard_{landlord_id_for_cache}"
+            _dashboard_cache.pop(cache_key_to_invalidate, None)
+            # Also clear any other landlord entries to be safe
+            for k in [k for k in list(_dashboard_cache.keys()) if k.startswith("dashboard_")]:
+                _dashboard_cache.pop(k, None)
+            logger.info(f"🧹 [PROPERTIES] Invalidated landlord dashboard server cache (landlord={landlord_id_for_cache})")
+
         # Fetch landlord info and fire notification (non-blocking)
         try:
             property_data = result.data[0]
@@ -449,7 +464,15 @@ async def bulk_property_action(
                 failed_ids.append(property_id)
         
         logger.info(f"✅ [PROPERTIES] Bulk action complete - {success_count} succeeded, {len(failed_ids)} failed")
-        
+
+        # Invalidate landlord dashboard server cache so the next overview
+        # request immediately reflects the new verification_status.
+        # Match the actual cache key format used by landlord_dashboard.py:
+        #   cache_key = f"dashboard_{landlord_id}"
+        for k in [k for k in list(_dashboard_cache.keys()) if k.startswith("dashboard_")]:
+            _dashboard_cache.pop(k, None)
+        logger.info("🧹 [PROPERTIES] Invalidated landlord dashboard server cache (bulk action)")
+
         return {
             'success': True,
             'total_processed': len(action.property_ids),

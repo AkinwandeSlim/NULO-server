@@ -2,6 +2,16 @@
 ReconciliationEngine - Reconcile payments against expected amounts with multi-frequency support
 Purpose: Match received payments with expected amounts, handle underpayment/overpayment/duplicates
 Reference: MASTER_PRD_NOMBA_INTEGRATION.md Section 6.3
+
+⚠️  IMPLEMENTATION STATUS: ACTIVE — DEFERRED START
+─────────────────────────────────────────────────
+Status:        Active development, NOT YET INTEGRATED into main routes
+Target Start:  June 24, 2026
+Prerequisites:
+  1. `nomba_client.py` webhook receiver ready
+  2. `payment_scheduler.py` schedules stored in DB
+  3. Cron job / scheduler to run periodic reconciliation
+Do NOT delete — needed for upcoming hackathon integration.
 """
 
 from typing import Dict, Any, Optional

@@ -39,11 +39,18 @@ class Settings(BaseSettings):
     
     # CORS
     ALLOWED_ORIGINS: str = "http://localhost:3000,https://nuloafrica.vercel.app"
+
+    # Frontend URL used for Supabase auth email redirects (signup, password reset).
+    # Falls back to the first allowed CORS origin if unset. Set this in production
+    # to your public frontend URL (e.g. https://nuloafrica.com) so verification
+    # links land on the correct domain instead of localhost.
+    FRONTEND_URL: str | None = None
     
     # Paystack (Optional)
     PAYSTACK_SECRET_KEY: str | None = None
     PAYSTACK_PUBLIC_KEY: str | None = None
     PAYSTACK_WEBHOOK_URL: str | None = None  # Local: https://abc123.ngrok.io, Cloud: https://nuloafrica.com
+    PAYSTACK_API_URL: str = "https://api.paystack.co"
     
     # Environment
     ENV: str = "local"  # local | development | production
@@ -62,6 +69,12 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: str | None = None
+
+    # Feature Flags
+    # ENABLE_PROPERTY_STEP: Controls whether landlord onboarding requires
+    # Step 3 (Property Information). When False, landlords can skip this step
+    # without errors. Default: True for backward compatibility.
+    ENABLE_PROPERTY_STEP: bool = True
     
     @property
     def cors_origins(self) -> List[str]:
