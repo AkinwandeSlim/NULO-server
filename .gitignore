@@ -1,34 +1,14 @@
-# documentation - moved to ../docs/ folder (parent directory)
-# (uncomment below if you want to ignore docs in THIS directory)
-# docs/
-# *.md
-# !README.md          # keep the README
-
-# IMPORTANT: README.md MUST be tracked for GitHub repository documentation
-# Do NOT add *.md or !README.md here unless intentional
-
-# database migrations/dumps – ignore unless you actually want them in repo
-*.sql
-migrations/
-database/
-
-# development sandbox (test files, demo scripts - NOT for production)
-dev_tests/
-
-# typical build artefacts
-node_modules/
-bin/
-obj/
-dist/
-
-# local config / secrets
+__pycache__/
+*.pyc
 .env
-.env.*
 .env.local
-*.user
-*.suo
-
-# editor/OS noise
+.env.*.local
+node_modules/
+dist/
+build/
 .vscode/
-*.log
-Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
