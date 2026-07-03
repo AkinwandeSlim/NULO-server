@@ -1,0 +1,145 @@
+###############################################################################
+# NuloAfrica x Nomba - full flow (collect -> reconcile -> disburse)
+#
+# HOW TO USE (free, no paid tool):
+#   1. Install VS Code extension: "REST Client" (humao.rest-client)
+#   2. Fill the @tokens below (see token howto at bottom)
+#   3. Click the "Send Request" link that appears above each ### request
+#   4. Run top-to-bottom. Response IDs chain automatically where possible.
+#
+# Agreement under test: 8b565c14 (SIGNED, Yaba, rent 990000, fee 0)
+#   tenant   = mediaslim0705@gmail.com            -> {{tenantJwt}}
+#   landlord = raphawellnessoptimization@gmail.com -> {{landlordJwt}}
+###############################################################################
+
+@baseUrl = http://localhost:8000/api/v1
+@agreementId = 8b565c14-79f7-4b0d-b84f-19cfbb2b18e8
+
+# Paste access_token from each user's browser localStorage (see bottom of file).
+@tenantJwt = eyJhbGciOiJIUzI1NiIsImtpZCI6ImhIMld3aXlWUnd6SXBWNDQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3RxbWpjeWdleWttYmRqY2ZkYmdhLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiIwNWM3MTE1Mi1hMDE4LTQyM2UtOGMyNy1mNzAxNzI3ZjQ5MzUiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzgzMDk0NDM2LCJpYXQiOjE3ODMwOTA4MzYsImVtYWlsIjoibWVkaWFzbGltMDcwNUBnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6ImVtYWlsIiwicHJvdmlkZXJzIjpbImVtYWlsIiwiZ29vZ2xlIl19LCJ1c2VyX21ldGFkYXRhIjp7ImF1dGhfcHJvdmlkZXIiOiJlbWFpbCIsImF2YXRhcl91cmwiOiJodHRwczovL2xoMy5nb29nbGV1c2VyY29udGVudC5jb20vYS9BQ2c4b2NMcW9UblIwTkhaeGw1dTFzOGZUWjBpRi1tS1lXa1ZXNjRzeXpYUDlpVllJOHNkdUdzPXM5Ni1jIiwiZW1haWwiOiJtZWRpYXNsaW0wNzA1QGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmaXJzdF9uYW1lIjoiRXplIiwiZnVsbF9uYW1lIjoiRXplIFVjaGVubmEgR2VyYWxkIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50cy5nb29nbGUuY29tIiwibGFzdF9uYW1lIjoiVWNoZW5uYSBHZXJhbGQiLCJuYW1lIjoiRXplIFVjaGVubmEgR2VyYWxkIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jTHFvVG5SME5IWnhsNXUxczhmVFowaUYtbUtZV2tWVzY0c3l6WFA5aVZZSThzZHVHcz1zOTYtYyIsInByb3ZpZGVyX2lkIjoiMTE2MjU2MzgyMDI0NDYwMjkxMzU5Iiwic3ViIjoiMTE2MjU2MzgyMDI0NDYwMjkxMzU5IiwidXNlcl90eXBlIjoidGVuYW50In0sInJvbGUiOiJhdXRoZW50aWNhdGVkIiwiYWFsIjoiYWFsMSIsImFtciI6W3sibWV0aG9kIjoib2F1dGgiLCJ0aW1lc3RhbXAiOjE3ODMwOTA4MzZ9XSwic2Vzc2lvbl9pZCI6ImQ0ZjY0ZjgwLWZlNjUtNDVmMy1hNmUzLWRjZjliZDEzYTJkOCIsImlzX2Fub255bW91cyI6ZmFsc2V9.a1icJkgiH3TysFKbglB96-cjsM5tbafH884SixsETZw
+@landlordJwt = eyJhbGciOiJIUzI1NiIsImtpZCI6ImhIMld3aXlWUnd6SXBWNDQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3RxbWpjeWdleWttYmRqY2ZkYmdhLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiIwNzA2NzFjZC1hNzc5LTQ5OTctOTA0Ni03NzE0NjczOTRmNTMiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzgzMDk0OTQyLCJpYXQiOjE3ODMwOTEzNDIsImVtYWlsIjoicmFwaGF3ZWxsbmVzc29wdGltaXphdGlvbkBnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lmV2UtLXZqTHM1Zm45bUZmcnVsdGNJa2x5Z2hKczdTeEJZS1lkQlR5Ry1lRzlnZz1zOTYtYyIsImVtYWlsIjoicmFwaGF3ZWxsbmVzc29wdGltaXphdGlvbkBnbWFpbC5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiZmlyc3RfbmFtZSI6IlJhcGhhd2VsbG5lc3MiLCJmdWxsX25hbWUiOiJSYXBoYXdlbGxuZXNzIG9wdGltaXphdGlvbiIsImlzcyI6Imh0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbSIsImxhc3RfbmFtZSI6Im9wdGltaXphdGlvbiIsIm5hbWUiOiJSYXBoYXdlbGxuZXNzIG9wdGltaXphdGlvbiIsInBob25lX3ZlcmlmaWVkIjpmYWxzZSwicGljdHVyZSI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lmV2UtLXZqTHM1Zm45bUZmcnVsdGNJa2x5Z2hKczdTeEJZS1lkQlR5Ry1lRzlnZz1zOTYtYyIsInByb3ZpZGVyX2lkIjoiMTE1NjQ5NjEzMDI2MjUzMDM3NzI0Iiwic3ViIjoiMTE1NjQ5NjEzMDI2MjUzMDM3NzI0IiwidXNlcl90eXBlIjoibGFuZGxvcmQifSwicm9sZSI6ImF1dGhlbnRpY2F0ZWQiLCJhYWwiOiJhYWwxIiwiYW1yIjpbeyJtZXRob2QiOiJvYXV0aCIsInRpbWVzdGFtcCI6MTc4MzA5MTM0Mn1dLCJzZXNzaW9uX2lkIjoiZDFjMjY0NWYtZWUzMi00MmFmLTk5MDktM2E5ZjcwNjc3OWYwIiwiaXNfYW5vbnltb3VzIjpmYWxzZX0.-xK2lcdivUCEL7wFibrKYAC_JAgBg-9a_sg6Z6Dj4z0
+
+# Webhook signatures: generate with
+#   ./venv/Scripts/python.exe scripts/simulate_nomba_webhook.py 8b565c14-79f7-4b0d-b84f-19cfbb2b18e8 full_payment
+# then paste the printed nomba-signature here (one per scenario).
+@sigFull = 96n8z+rBJ872dk0Ep1+xB/RZoShlwhBwJism6Jcn+Vc=
+@sigUnder = 6H6yPaRrVy5eFFZQp8q1uRUCzoujuECVHj+w2xLk7+s=
+@sigOver = dXEpzssCzQvudgt/5E573PlX5SSrKYvZM06jZESGZRw=
+@sigMisdir = PGHdIGjnXm1G+ke2xf2DzhKI+38BTXYmu2iL/aXBHFA=
+@ts = 2026-07-01T10:00:00Z
+
+
+### 0. Health (no auth)
+GET http://localhost:8000/api/v1/health/nomba
+
+
+### 1. Provision virtual account  (tenant or landlord JWT)
+POST http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/provision-nomba
+Authorization: Bearer {{tenantJwt}}
+Content-Type: application/json
+
+{}
+
+
+### 2. Payment status BEFORE  (expect reconciliation_status = PENDING)
+GET http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/payment-status
+Authorization: Bearer {{tenantJwt}}
+
+
+### 3. Webhook FULL payment  (paste body from simulator full_payment)
+# Body MUST be the exact JSON the simulator printed for full_payment.
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigFull}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/full_payment.json
+
+
+### 4. Webhook REPLAY (idempotency -> already_processed)
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigFull}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/full_payment.json
+
+
+### 5. Webhook BAD signature -> 401
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: invalidsignature==
+nomba-timestamp: {{ts}}
+
+< ./payloads/full_payment.json
+
+
+### 6. Webhook UNDERPAYMENT
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigUnder}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/underpayment.json
+
+
+### 7. Webhook OVERPAYMENT
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigOver}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/overpayment.json
+
+
+### 8. Webhook MISDIRECTED (unknown agreement)
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigMisdir}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/misdirected.json
+
+
+# @name statusAfter
+### 9. Payment status AFTER  (expect FULL_PAYMENT; note transfer_history[0].id)
+GET http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/payment-status
+Authorization: Bearer {{tenantJwt}}
+
+
+### 10. Lookup + verify landlord bank  (landlord JWT)
+POST http://localhost:8000/api/v1/disbursements/lookup-bank
+Authorization: Bearer {{landlordJwt}}
+Content-Type: application/json
+
+{
+  "account_number": "0000000000",
+  "bank_code": "035"
+}
+
+
+# @name disburse
+### 11. Disburse to landlord  (source_transfer_id auto-pulled from request 9)
+POST http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/disburse
+Authorization: Bearer {{landlordJwt}}
+Content-Type: application/json
+
+{
+  "source_transfer_id": "{{statusAfter.response.body.$.transfer_history[0].id}}",
+  "retry_count": 0
+}
+
+
+### 12. Disbursement status  (merchant_tx_ref auto-pulled from request 11)
+GET http://localhost:8000/api/v1/disbursements/{{disburse.response.body.$.merchant_tx_ref}}
+Authorization: Bearer {{landlordJwt}}
+
+
+###############################################################################
+# TOKEN HOWTO (Google OAuth users have no password - grab the live token):
+#   1. Log into the app in your browser as the user.
+#   2. DevTools (F12) -> Console -> run:
+#        JSON.parse(localStorage.getItem('sb-tqmjcygeykmbdjcfdbga-auth-token')).access_token
+#   3. Copy the eyJ... string into @tenantJwt / @landlordJwt above.
+#   Tokens expire ~1h; re-copy if you start getting 401s.
+###############################################################################

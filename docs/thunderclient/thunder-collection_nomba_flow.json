@@ -1,0 +1,246 @@
+{
+  "client": "Thunder Client",
+  "collectionName": "NuloAfrica Nomba Flow",
+  "dateExported": "2026-07-03T12:00:00.000Z",
+  "version": "1.2",
+  "folders": [
+    { "_id": "fld-collect", "name": "1. Collect (VA + Webhook)", "containerId": "", "created": "2026-07-03T12:00:00.000Z", "sortNum": 10000 },
+    { "_id": "fld-disburse", "name": "2. Disburse (Payout)", "containerId": "", "created": "2026-07-03T12:00:00.000Z", "sortNum": 20000 }
+  ],
+  "requests": [
+    {
+      "_id": "req-health",
+      "colId": "col-nomba",
+      "containerId": "",
+      "name": "0. Health (no auth)",
+      "url": "{{baseUrl}}/health/nomba",
+      "method": "GET",
+      "sortNum": 5000,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [],
+      "params": [],
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "json-query", "custom": "json.nomba_auth", "action": "equal", "value": "true" }
+      ]
+    },
+    {
+      "_id": "req-provision",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "1. Provision VA (JWT: tenant/landlord)",
+      "url": "{{baseUrl}}/agreements/{{agreementId}}/provision-nomba",
+      "method": "POST",
+      "sortNum": 10010,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{jwt}}" } ],
+      "params": [],
+      "body": { "type": "json", "raw": "{}", "form": [] },
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "set-env-var", "custom": "json.virtual_account_number", "action": "setto", "value": "vaNumber" }
+      ]
+    },
+    {
+      "_id": "req-status-before",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "2. Payment status BEFORE (JWT)",
+      "url": "{{baseUrl}}/agreements/{{agreementId}}/payment-status",
+      "method": "GET",
+      "sortNum": 10020,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{jwt}}" } ],
+      "params": [],
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    },
+    {
+      "_id": "req-wh-full",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "3. Webhook: FULL payment (paste sig+body from simulator)",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10030,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "{{sigFull}}" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "PASTE the exact JSON body printed by:\n  python scripts/simulate_nomba_webhook.py <agreementId> full_payment\nand set env var sigFull to the printed nomba-signature.", "form": [] },
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    },
+    {
+      "_id": "req-wh-replay",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "4. Webhook: REPLAY same (idempotency -> already_processed)",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10040,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "{{sigFull}}" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "SAME body as request 3 (identical requestId).", "form": [] },
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "json-query", "custom": "json.status", "action": "equal", "value": "already_processed" }
+      ]
+    },
+    {
+      "_id": "req-wh-badsig",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "5. Webhook: BAD signature -> 401",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10050,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "invalidsignature==" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "ANY valid webhook body (same as request 3).", "form": [] },
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "401" } ]
+    },
+    {
+      "_id": "req-wh-under",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "6. Webhook: UNDERPAYMENT (simulator underpayment)",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10060,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "{{sigUnder}}" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "Body from: python scripts/simulate_nomba_webhook.py <agreementId> underpayment", "form": [] },
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    },
+    {
+      "_id": "req-wh-over",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "7. Webhook: OVERPAYMENT (simulator overpayment)",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10070,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "{{sigOver}}" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "Body from: python scripts/simulate_nomba_webhook.py <agreementId> overpayment", "form": [] },
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    },
+    {
+      "_id": "req-wh-misdir",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "8. Webhook: MISDIRECTED (unknown agreement)",
+      "url": "{{baseUrl}}/webhooks/nomba/transfer",
+      "method": "POST",
+      "sortNum": 10080,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [
+        { "name": "Content-Type", "value": "application/json" },
+        { "name": "nomba-signature", "value": "{{sigMisdir}}" },
+        { "name": "nomba-timestamp", "value": "2026-07-01T10:00:00Z" }
+      ],
+      "params": [],
+      "body": { "type": "json", "raw": "Body from: python scripts/simulate_nomba_webhook.py <agreementId> misdirected", "form": [] },
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    },
+    {
+      "_id": "req-status-after",
+      "colId": "col-nomba",
+      "containerId": "fld-collect",
+      "name": "9. Payment status AFTER -> capture sourceTransferId",
+      "url": "{{baseUrl}}/agreements/{{agreementId}}/payment-status",
+      "method": "GET",
+      "sortNum": 10090,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{jwt}}" } ],
+      "params": [],
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "json-query", "custom": "json.reconciliation_status", "action": "equal", "value": "FULL_PAYMENT" },
+        { "type": "set-env-var", "custom": "json.transfer_history.0.id", "action": "setto", "value": "sourceTransferId" }
+      ]
+    },
+    {
+      "_id": "req-lookup-bank",
+      "colId": "col-nomba",
+      "containerId": "fld-disburse",
+      "name": "10. Lookup + verify landlord bank (JWT: landlord)",
+      "url": "{{baseUrl}}/disbursements/lookup-bank",
+      "method": "POST",
+      "sortNum": 20010,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{landlordJwt}}" } ],
+      "params": [],
+      "body": { "type": "json", "raw": "{\n  \"account_number\": \"0000000000\",\n  \"bank_code\": \"035\"\n}", "form": [] },
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "json-query", "custom": "json.account_name", "action": "isnotnull", "value": "" }
+      ]
+    },
+    {
+      "_id": "req-disburse",
+      "colId": "col-nomba",
+      "containerId": "fld-disburse",
+      "name": "11. Disburse to landlord (JWT: landlord) -> capture merchantTxRef",
+      "url": "{{baseUrl}}/agreements/{{agreementId}}/disburse",
+      "method": "POST",
+      "sortNum": 20020,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{landlordJwt}}" } ],
+      "params": [],
+      "body": { "type": "json", "raw": "{\n  \"source_transfer_id\": \"{{sourceTransferId}}\",\n  \"retry_count\": 0\n}", "form": [] },
+      "tests": [
+        { "type": "res-code", "custom": "", "action": "equal", "value": "200" },
+        { "type": "set-env-var", "custom": "json.merchant_tx_ref", "action": "setto", "value": "merchantTxRef" }
+      ]
+    },
+    {
+      "_id": "req-disburse-status",
+      "colId": "col-nomba",
+      "containerId": "fld-disburse",
+      "name": "12. Disbursement status (JWT: landlord/admin)",
+      "url": "{{baseUrl}}/disbursements/{{merchantTxRef}}",
+      "method": "GET",
+      "sortNum": 20030,
+      "created": "2026-07-03T12:00:00.000Z",
+      "modified": "2026-07-03T12:00:00.000Z",
+      "headers": [ { "name": "Authorization", "value": "Bearer {{landlordJwt}}" } ],
+      "params": [],
+      "tests": [ { "type": "res-code", "custom": "", "action": "equal", "value": "200" } ]
+    }
+  ]
+}

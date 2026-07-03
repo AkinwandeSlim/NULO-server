@@ -1,0 +1,33 @@
+{
+  "event_type": "payment_success",
+  "requestId": "test-req-misdirected-001",
+  "data": {
+    "merchant": {
+      "walletId": "test-wallet-001",
+      "walletBalance": 50000,
+      "userId": "test-user-001"
+    },
+    "terminal": {},
+    "transaction": {
+      "aliasAccountNumber": "9391076543",
+      "fee": 5,
+      "sessionId": "sess-misdirected",
+      "type": "vact_transfer",
+      "transactionId": "test-txn-misdirected-001",
+      "aliasAccountName": "NuloAfrica/Test Tenant",
+      "responseCode": "",
+      "originatingFrom": "api",
+      "transactionAmount": 990000.0,
+      "narration": "Rent misdirected",
+      "time": "2026-07-01T10:00:00Z",
+      "aliasAccountReference": "00000000-0000-0000-0000-000000000000",
+      "aliasAccountType": "VIRTUAL"
+    },
+    "customer": {
+      "bankCode": "035",
+      "senderName": "TEST TENANT",
+      "bankName": "Wema Bank",
+      "accountNumber": "0123456789"
+    }
+  }
+}
