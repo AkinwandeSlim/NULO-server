@@ -283,11 +283,32 @@ class NombaClient:
             account_ref, self.parent_account_id, resp.status_code,
             expected_amount if expected_amount is not None else 0.0,
         )
-        resp.raise_for_status()
+
+        # If we got an error, log the full response body for debugging
+        if resp.status_code >= 400:
+            logger.error(
+                "VA creation REJECTED | ref=%s | status=%s | response_body=%s | "
+                "request_payload=%s | url=%s",
+                account_ref, resp.status_code,
+                resp.text[:1000],
+                payload, f"{self.base_url}/accounts/virtual",
+            )
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise NombaAPIError(
+                    f"{exc} | response_body={resp.text[:500]}"
+                ) from exc
 
         body = resp.json()
         if body.get("code") != "00":
-            raise NombaAPIError(body.get("description", "Nomba error"))
+            logger.error(
+                "VA creation non-00 code | ref=%s | code=%s | description=%s | body=%s",
+                account_ref, body.get("code"), body.get("description"), body,
+            )
+            raise NombaAPIError(
+                f"{body.get('description', 'Nomba error')} | code={body.get('code')}"
+            )
         return body["data"]
         # Returns per spec: createdAt, accountHolderId, accountRef, bvn, accountName,
         # bankName, bankAccountNumber, bankAccountName, currency, callbackUrl, expired
