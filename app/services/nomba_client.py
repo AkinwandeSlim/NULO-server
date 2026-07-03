@@ -458,6 +458,25 @@ class NombaClient:
             merchant_tx_ref, amount, resp.status_code,
         )
 
+        # If we got a 400 or other error, log the full response body
+        # so we can debug the actual rejection reason from Nomba
+        if resp.status_code >= 400:
+            logger.error(
+                "Transfer REJECTED by Nomba | ref=%s | status=%s | "
+                "response_body=%s | request_payload=%s",
+                merchant_tx_ref, resp.status_code,
+                resp.text[:1000],
+                {
+                    "amount": amount,
+                    "accountNumber": account_number,
+                    "accountName": account_name,
+                    "bankCode": bank_code,
+                    "merchantTxRef": merchant_tx_ref,
+                    "senderName": sender_name,
+                    "narration": narration,
+                },
+            )
+
         # Per live docs, both 200 and 201 are valid response codes. The CALLER
         # must check body.data.status (SUCCESS | PENDING_BILLING | NEW | REFUND)
         # to decide what to do. We just surface the data.
@@ -470,8 +489,14 @@ class NombaClient:
             )
             return data
 
-        # Any other status is an HTTP-level error -- let raise_for_status surface it
-        resp.raise_for_status()
+        # Any other status is an HTTP-level error
+        # Build a detailed error message including Nomba's response body
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            error_detail = f"{exc} | response_body={resp.text[:500]}"
+            logger.error("Transfer HTTP error | ref=%s | %s", merchant_tx_ref, error_detail)
+            raise NombaAPIError(error_detail) from exc
         # Unreachable, but keeps static checkers happy
         return {}
 
