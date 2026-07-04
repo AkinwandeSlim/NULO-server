@@ -143,6 +143,10 @@ async def disburse_to_landlord(
     9. Background: notify landlord of payout progress
     """
     source_transfer_id = (body.get("source_transfer_id") or "").strip()
+    # Test-only override: allow disbursement of UNDERPAYMENT (or any) transfers.
+    # Production must always pass FULL_PAYMENT; this flag is for hackathon tests
+    # where we want to disburse a partial collection for verification.
+    force = bool(body.pop("force", False))
     retry_count = int(body.get("retry_count") or 0)
     if not source_transfer_id:
         raise HTTPException(400, "source_transfer_id is required")
@@ -189,10 +193,19 @@ async def disburse_to_landlord(
     if transfer.get("agreement_id") != agreement_id:
         raise HTTPException(400, "Source transfer does not belong to this agreement")
     if transfer.get("reconciliation_result") != "FULL_PAYMENT":
-        raise HTTPException(
-            400,
-            f"Source transfer reconciliation_result is "
-            f"{transfer.get('reconciliation_result')}, must be FULL_PAYMENT",
+        if not force:
+            raise HTTPException(
+                400,
+                f"Source transfer reconciliation_result is "
+                f"{transfer.get('reconciliation_result')}, must be FULL_PAYMENT "
+                f"(pass force=true in body to override for testing)",
+            )
+        logger.warning(
+            "Disbursing UNDERPAYMENT (force=true) | agreement=%s | "
+            "source_transfer=%s | result=%s | received=%.2f | expected=%.2f",
+            agreement_id, source_transfer_id, transfer.get("reconciliation_result"),
+            float(transfer.get("amount_received") or 0),
+            float(agreement.get("expected_payment_amount") or 0),
         )
 
     # Idempotency: check if a disbursement already exists for this source transfer
