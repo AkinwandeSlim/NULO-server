@@ -306,8 +306,11 @@ class NombaClient:
                 "VA creation non-00 code | ref=%s | code=%s | description=%s | body=%s",
                 account_ref, body.get("code"), body.get("description"), body,
             )
+            # Include the FULL body so the caller can see exactly what Nomba rejected
+            # (e.g. {"description":"accountName must be 8-64 chars", "code":"400"}).
             raise NombaAPIError(
-                f"{body.get('description', 'Nomba error')} | code={body.get('code')}"
+                f"{body.get('description', 'Nomba error')} | code={body.get('code')} | "
+                f"body={body}"
             )
         return body["data"]
         # Returns per spec: createdAt, accountHolderId, accountRef, bvn, accountName,

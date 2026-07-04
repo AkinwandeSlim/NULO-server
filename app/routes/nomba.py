@@ -140,6 +140,13 @@ async def provision_nomba(
         float(agreement["rent_amount"]), frequency
     )
 
+    # Log exact payload being sent to Nomba for debug visibility
+    logger.info(
+        "Nomba VA provision attempt | agreement=%s | account_ref=%s | "
+        "account_name=%r (len=%d) | expected_local=%.2f",
+        agreement_id, agreement_id, account_name, len(account_name), expected_amount,
+    )
+
     try:
         data = await nomba_client.create_virtual_account(
             account_ref=agreement_id,
@@ -147,8 +154,11 @@ async def provision_nomba(
             expected_amount=expected_amount,
         )
     except NombaAPIError as exc:
+        # Surface the FULL Nomba error in the response so callers can see
+        # the actual validation message (the underlying response_body is
+        # already attached to the NombaAPIError string in the client).
         logger.error(
-            "Nomba provisioning failed | agreement=%s | error=%s",
+            "Nomba provisioning failed | agreement=%s | full_error=%s",
             agreement_id, exc,
         )
         raise HTTPException(502, f"Nomba provisioning failed: {exc}")
