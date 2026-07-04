@@ -689,6 +689,96 @@ class NombaClient:
         # Unreachable, but keeps static checkers happy
         return {}
 
+    async def transfer_to_bank_from_subaccount(
+        self,
+        sub_account_id: str,
+        amount_naira: float,
+        account_number: str,
+        account_name: str,
+        bank_code: str,
+        merchant_tx_ref: str,
+        narration: str,
+        sender_name: str = "NuloAfrica",
+    ) -> dict:
+        """
+        Disburse funds to a landlord's bank account from a SUB-ACCOUNT wallet.
+
+        PER LIVE NOMBA DOCS (developer.nomba.com -- "Transfer from sub-account to bank"):
+        - Path:  POST /v2/transfers/bank/{subAccountId}
+        - Header: accountId = PARENT account (still parent in header, sub is in path)
+        - Body:   same as parent transfer (amount, accountNumber, accountName, bankCode,
+                  merchantTxRef, senderName, narration)
+        - Requires: Nomba team to enable sub-account transfers on the business
+        - Rate limit: 5 transfers to same recipient per minute (same as parent)
+        - Response: same shape as parent endpoint (200 or 201, body.data.status)
+
+        LIVE DISCOVERY (2026-07-04):
+        - Parent account reports 10,095,630 NGN via GET /v1/accounts/balance
+        - But /v2/transfers/bank (parent) returns 400 INSUFFICIENT_BALANCE
+        - The actual spendable wallet is the SUB-ACCOUNT, even though the
+          balance endpoint appears to mirror the value.
+        - The 100 NGN from VA 3783622764 (sub-account-scoped NUBAN) lands in
+          the sub-account, and disbursements must be made from the sub-account.
+        - Sub-account balance: 10,095,630 NGN (preloaded hackathon test money)
+          and grows by 100 NGN per real inbound test payment.
+        """
+        if not merchant_tx_ref or not isinstance(merchant_tx_ref, str):
+            raise NombaAPIError(
+                "merchant_tx_ref is required and must be a non-empty string"
+            )
+        if not sub_account_id:
+            raise NombaAPIError("sub_account_id is required for sub-account transfer")
+
+        amount = round(float(amount_naira), 2)
+
+        # /v2 per live docs. Sub-account ID goes in the path; parent stays in header.
+        transfer_url = (
+            f"{self.base_url.rsplit('/v1', 1)[0]}"
+            f"/v2/transfers/bank/{sub_account_id}"
+        )
+
+        headers = await self._headers()
+        resp = requests.post(
+            transfer_url,
+            headers=headers,
+            json={
+                "amount": amount,
+                "accountNumber": account_number,
+                "accountName": account_name,
+                "bankCode": bank_code,
+                "merchantTxRef": merchant_tx_ref,
+                "senderName": sender_name,
+                "narration": narration,
+            },
+            timeout=30,
+        )
+
+        logger.info(
+            "transfer_to_bank_from_subaccount | sub=%s | ref=%s | "
+            "amount_ngn=%.2f | http=%s",
+            sub_account_id, merchant_tx_ref, amount, resp.status_code,
+        )
+
+        if resp.status_code in (200, 201):
+            body = resp.json()
+            data = body.get("data", {}) or {}
+            logger.info(
+                "Sub-account transfer response | ref=%s | nomba_status=%s | body_code=%s",
+                merchant_tx_ref, data.get("status"), body.get("code"),
+            )
+            return data
+
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            error_detail = f"{exc} | response_body={resp.text[:500]}"
+            logger.error(
+                "Sub-account transfer HTTP error | sub=%s | ref=%s | %s",
+                sub_account_id, merchant_tx_ref, error_detail,
+            )
+            raise NombaAPIError(error_detail) from exc
+        return {}
+
     async def requery_transfer(
         self,
         merchant_tx_ref: str,

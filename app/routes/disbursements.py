@@ -12,6 +12,7 @@
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -177,7 +178,7 @@ async def disburse_to_landlord(
         None,
         lambda: supabase_admin
             .table("virtual_account_transfers")
-            .select("id, amount_received, reconciliation_result, agreement_id, currency")
+            .select("id, amount_received, reconciliation_result, agreement_id, currency, nomba_account_ref")
             .eq("id", source_transfer_id)
             .maybe_single()
             .execute(),
@@ -300,15 +301,44 @@ async def disburse_to_landlord(
     tx_row = insert_result.data[0] if insert_result.data else {}
 
     # 7. Call Nomba
+    # Detect sub-account source: the nomba_account_ref we stored has a "-SUB"
+    # suffix when the VA was provisioned under the sub-account. Disbursements
+    # from those VAs MUST go through the sub-account transfer endpoint, since
+    # the parent wallet has 0 spendable balance even though the balance API
+    # reports funds (verified live 2026-07-04 with INSUFFICIENT_BALANCE).
+    account_ref = transfer.get("nomba_account_ref") or ""
+    is_sub_account_va = account_ref.upper().endswith("-SUB")
+    sub_account_id = os.environ.get("NOMBA_SUB_ACCOUNT_ID") if is_sub_account_va else None
+
     try:
-        nomba_data = await nomba_client.transfer_to_bank(
-            amount_naira=payout_amount,
-            account_number=landlord["bank_account_number"],
-            account_name=landlord["account_name"],
-            bank_code=landlord["bank_code"],
-            merchant_tx_ref=merchant_tx_ref,
-            narration=f"Rent disbursement agreement={agreement_id[:8]}",
-        )
+        if is_sub_account_va:
+            if not sub_account_id:
+                raise NombaAPIError(
+                    "Source transfer is from a sub-account VA (ref has -SUB) but "
+                    "NOMBA_SUB_ACCOUNT_ID is not configured in the environment"
+                )
+            logger.info(
+                "Disbursing from sub-account | sub=%s | account_ref=%s | ref=%s",
+                sub_account_id, account_ref, merchant_tx_ref,
+            )
+            nomba_data = await nomba_client.transfer_to_bank_from_subaccount(
+                sub_account_id=sub_account_id,
+                amount_naira=payout_amount,
+                account_number=landlord["bank_account_number"],
+                account_name=landlord["account_name"],
+                bank_code=landlord["bank_code"],
+                merchant_tx_ref=merchant_tx_ref,
+                narration=f"Rent disbursement agreement={agreement_id[:8]}",
+            )
+        else:
+            nomba_data = await nomba_client.transfer_to_bank(
+                amount_naira=payout_amount,
+                account_number=landlord["bank_account_number"],
+                account_name=landlord["account_name"],
+                bank_code=landlord["bank_code"],
+                merchant_tx_ref=merchant_tx_ref,
+                narration=f"Rent disbursement agreement={agreement_id[:8]}",
+            )
     except NombaAPIError as exc:
         logger.error(
             "Disbursement failed | agreement=%s | ref=%s | error=%s",
