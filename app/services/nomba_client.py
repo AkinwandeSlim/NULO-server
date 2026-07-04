@@ -38,20 +38,28 @@ class NombaClient:
       the 30-minute expiry). Implemented in _store_token_data(): parsed expiresAt
       minus 5 minutes, with time.time() + 1500 (25 min) as the fallback when the
       field is missing or unparseable.
-    - Virtual account creation: POST /v1/accounts/virtual  (no sub-account in path --
-      the spec scopes this endpoint to the parent accountId header only. Sub-account
-      routing for virtual account payments is configured in the Nomba dashboard, not
-      in this call. The ONLY fields in the spec body are accountRef + accountName --
-      currency and expectedAmount do NOT exist in the OpenAPI spec. We track
-      expected_amount locally in agreements.expected_payment_amount instead.)
-    - expectedAmount: NOT in the spec. Decimal Naira expectation is OUR concern,
-      stored in our DB, not sent to Nomba.
-    - Bank transfers (disbursement): POST /v2/transfers/bank  (PARENT account,
-      no subAccountId in path). Architecture decision (2026-07-02): no sub-account
-      anywhere in the integration. Money in (NUBAN -> parent) and money out
-      (parent -> landlord bank) both go through the parent account. This keeps
-      the integration simple and removes the "sub-account transfers must be
-      enabled by Nomba" external dependency.
+    - Virtual account creation: TWO supported paths
+        (a) PARENT-scoped:  POST /v1/accounts/virtual  (accountId header = parent,
+            VA accountHolderId = parent)
+        (b) SUB-scoped:     POST /v1/accounts/virtual/{subAccountId}  (accountId
+            header still = parent, but VA accountHolderId = sub-account).
+            This is the path that lets the VA's inbound webhooks route through
+            the SUB-account's registered webhook URL, which is the URL our
+            hackathon submission registered.
+    - Currency and expectedAmount do NOT exist in the OpenAPI spec for either
+      path -- we track expected_amount locally in agreements.expected_payment_amount.
+    - Bank transfers (disbursement): TWO supported paths
+        (a) PARENT wallet:  POST /v2/transfers/bank  (accountId header = parent)
+        (b) SUB wallet:     POST /v2/transfers/bank/{subAccountId}  (accountId
+            header = parent, sub in path). USE THIS for disbursements backed
+            by funds collected via a sub-account-scoped VA -- the parent
+            wallet has 0 spendable balance even though the balance API
+            reports funds (verified live 2026-07-04 with INSUFFICIENT_BALANCE).
+    - Architecture (current, 2026-07-04): sub-account is the SAFE HAVEN. The
+      hackathon URL is registered on the sub-account. The parent has 0
+      spendable balance for transfers, and inbound webhooks for parent-scoped
+      VAs silently fail with "No redirect configuration". All new VAs should
+      be provisioned via path (b) and all disbursements should use path (b).
     - Rate limit: 5 bank transfers to the same recipient per minute (per live docs).
     - data.status enum (per live docs): SUCCESS | PENDING_BILLING | NEW | REFUND.
       PENDING_BILLING and NEW are both processing states, not errors.
@@ -85,15 +93,18 @@ class NombaClient:
             self.base_url = "https://sandbox.nomba.com/v1"
 
         self.parent_account_id = os.environ.get("NOMBA_PARENT_ACCOUNT_ID", "")
-        # Sub-account removed from architecture on 2026-07-02. Money in (NUBAN) and
-        # money out (transfer) both go through the parent account. The env var
-        # is still read for backward compat, but is unused -- warn if set.
+        # Sub-account is REQUIRED for the hackathon:
+        #   - It is where the registered webhook URL lives
+        #   - It holds the spendable balance for outbound transfers
+        #   - VAs are provisioned under it via POST /v1/accounts/virtual/{subAccountId}
+        # Money in (NUBAN) lands in the sub-account, money out (transfer)
+        # must originate from the sub-account. See ARCHITECTURE note above.
         self.sub_account_id = os.environ.get("NOMBA_SUB_ACCOUNT_ID", "")
-        if self.sub_account_id:
+        if not self.sub_account_id:
             logger.warning(
-                "NOMBA_SUB_ACCOUNT_ID is set but is no longer used by the integration. "
-                "All operations now go through NOMBA_PARENT_ACCOUNT_ID. "
-                "You can safely remove the env var."
+                "NOMBA_SUB_ACCOUNT_ID is NOT set. Disbursements will use the "
+                "parent wallet and will fail with INSUFFICIENT_BALANCE because "
+                "the parent has 0 spendable balance. Set it in your env vars."
             )
         self.webhook_secret = os.environ.get("NOMBA_WEBHOOK_SECRET", "")
 
@@ -598,7 +609,13 @@ class NombaClient:
         - Body:   amount, accountNumber, accountName, bankCode, merchantTxRef,
                   senderName, narration
         - Rate limit: 5 transfers to same recipient per minute
-        - No external dependency on sub-account activation (we use parent)
+
+        LIVE FINDING (2026-07-04): This endpoint returns 400 INSUFFICIENT_BALANCE
+        even when the parent balance API reports 10M+ NGN. The parent has 0
+        SPENDABLE balance -- funds actually sit in the sub-account. Use
+        `transfer_to_bank_from_subaccount()` for the disbursements. This
+        method is kept for completeness and for any future flow that
+        legitimately funds the parent wallet.
 
         - amount: decimal Naira, JSON number. Do NOT multiply by 100.
         - merchant_tx_ref: idempotency key. Reuse on retries. Only generate new ref
@@ -607,12 +624,6 @@ class NombaClient:
                   SUCCESS | PENDING_BILLING | NEW | REFUND
                   201 with status=PENDING_BILLING or NEW = processing async, NOT an error.
                   The caller (route) must inspect data.status to decide what to do.
-
-        ARCHITECTURE NOTE (simplified 2026-07-02):
-        Tenant payments land in PARENT via virtual accounts. We disburse from PARENT
-        via this method. No sub-account involvement anywhere. The platform fee
-        is the residual that stays in parent after disbursement -- our logic,
-        not Nomba's.
         """
         # Enforce idempotency key -- a missing ref silently fails on Nomba's side
         if not merchant_tx_ref or not isinstance(merchant_tx_ref, str):
