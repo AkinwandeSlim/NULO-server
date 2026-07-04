@@ -478,10 +478,29 @@ async def _reconcile_payment(
     """
     Match inbound transfer to agreement. Update status and totals.
     account_ref = aliasAccountReference from webhook = agreement.id
+    (or agreement.id with an optional suffix like "-SUB" when the VA was
+    provisioned via the sub-account endpoint for test routing purposes).
     """
+    import re
     if not account_ref:
         logger.warning("No aliasAccountReference in webhook -- cannot reconcile")
         return
+
+    # Extract a UUID from the account_ref. Nomba's accountRef field allows
+    # 16-64 chars, so callers can append suffixes (e.g., "-SUB") for testing
+    # routing under the sub-account endpoint while still mapping back to the
+    # agreement's UUID. agreements.id is uuid-typed, so we need a clean UUID
+    # for the .eq("id", ...) query.
+    uuid_match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        account_ref, re.IGNORECASE,
+    )
+    agreement_id = uuid_match.group(0) if uuid_match else account_ref
+    if agreement_id != account_ref:
+        logger.info(
+            "Extracted UUID from accountRef | raw=%s | uuid=%s",
+            account_ref, agreement_id,
+        )
 
     result = await asyncio.get_event_loop().run_in_executor(
         None,
@@ -492,7 +511,7 @@ async def _reconcile_payment(
                 "rent_amount, expected_payment_amount, payment_frequency, "
                 "total_received_amount, reconciliation_status"
             )
-            .eq("id", account_ref)
+            .eq("id", agreement_id)
             .execute(),
     )
 
