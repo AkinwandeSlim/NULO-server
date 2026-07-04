@@ -316,6 +316,84 @@ class NombaClient:
         # Returns per spec: createdAt, accountHolderId, accountRef, bvn, accountName,
         # bankName, bankAccountNumber, bankAccountName, currency, callbackUrl, expired
 
+    async def get_virtual_account(self, account_ref: str) -> dict | None:
+        """
+        Fetch an existing virtual account by accountRef.
+
+        PER OPENAPI SPEC:
+        - GET /v1/accounts/virtual/{accountRef}
+        - Header: accountId = PARENT account
+        - 200: returns VirtualAccountObject on success
+        - 404: account does not exist (RecordNotFoundError)
+        - 401/403: auth issues
+        - 400: bad request
+
+        Returns the VirtualAccountObject dict on success, or None if not found.
+        Raises NombaAPIError on any other failure.
+        """
+        headers = await self._headers()
+        resp = requests.get(
+            f"{self.base_url}/accounts/virtual/{account_ref}",
+            headers=headers,
+            timeout=15,
+        )
+        logger.info(
+            "get_virtual_account | ref=%s | status=%s",
+            account_ref, resp.status_code,
+        )
+
+        if resp.status_code == 404:
+            return None
+
+        # 4xx/5xx -- surface body for debugging
+        if resp.status_code >= 400:
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise NombaAPIError(
+                    f"{exc} | response_body={resp.text[:500]}"
+                ) from exc
+
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(
+                f"{body.get('description', 'Nomba error')} | code={body.get('code')} | "
+                f"body={body}"
+            )
+        return body["data"]
+
+    async def expire_virtual_account(self, account_ref: str) -> bool:
+        """
+        Expire (DELETE) a virtual account by accountRef.
+
+        PER OPENAPI SPEC:
+        - DELETE /v1/accounts/virtual/{accountRef}
+        - Header: accountId = PARENT account
+
+        Returns True on success. Raises NombaAPIError on failure.
+        Used to clean up orphan VAs on Nomba's side after a failed
+        provisioning where we never got the success response.
+        """
+        headers = await self._headers()
+        resp = requests.delete(
+            f"{self.base_url}/accounts/virtual/{account_ref}",
+            headers=headers,
+            timeout=15,
+        )
+        logger.info(
+            "expire_virtual_account | ref=%s | status=%s | body=%s",
+            account_ref, resp.status_code, resp.text[:300],
+        )
+        if resp.status_code >= 400:
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise NombaAPIError(
+                    f"{exc} | response_body={resp.text[:500]}"
+                ) from exc
+        body = resp.json()
+        return body.get("code") == "00"
+
     def verify_webhook_signature(
         self,
         payload: dict,

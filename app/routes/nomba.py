@@ -149,21 +149,44 @@ async def provision_nomba(
         agreement_id, agreement_id, account_name, len(account_name), expected_amount,
     )
 
+    # RECOVERY: If a previous provisioning call succeeded on Nomba's side
+    # but failed on ours (e.g. server crash between Nomba 200 and our DB
+    # write), the VA is orphaned on Nomba with our accountRef. Nomba will
+    # then reject the next create with "accountRef already exists". We
+    # try to fetch the existing VA first and use it.
+    data = None
     try:
-        data = await nomba_client.create_virtual_account(
-            account_ref=agreement_id,
-            account_name=account_name,
-            expected_amount=expected_amount,
-        )
+        existing = await nomba_client.get_virtual_account(agreement_id)
+        if existing and not existing.get("expired", False):
+            logger.info(
+                "Recovered existing Nomba VA for agreement=%s | nuban=%s",
+                agreement_id, existing.get("bankAccountNumber"),
+            )
+            data = existing
     except NombaAPIError as exc:
-        # Surface the FULL Nomba error in the response so callers can see
-        # the actual validation message (the underlying response_body is
-        # already attached to the NombaAPIError string in the client).
-        logger.error(
-            "Nomba provisioning failed | agreement=%s | full_error=%s",
+        # GET failed for a non-404 reason -- log but try create anyway,
+        # create will fail with the real reason if there's a problem.
+        logger.warning(
+            "GET virtual_account failed during recovery | agreement=%s | err=%s",
             agreement_id, exc,
         )
-        raise HTTPException(502, f"Nomba provisioning failed: {exc}")
+
+    if data is None:
+        try:
+            data = await nomba_client.create_virtual_account(
+                account_ref=agreement_id,
+                account_name=account_name,
+                expected_amount=expected_amount,
+            )
+        except NombaAPIError as exc:
+            # Surface the FULL Nomba error in the response so callers can see
+            # the actual validation message (the underlying response_body is
+            # already attached to the NombaAPIError string in the client).
+            logger.error(
+                "Nomba provisioning failed | agreement=%s | full_error=%s",
+                agreement_id, exc,
+            )
+            raise HTTPException(502, f"Nomba provisioning failed: {exc}")
 
     next_due = None
     if agreement.get("lease_start_date"):
