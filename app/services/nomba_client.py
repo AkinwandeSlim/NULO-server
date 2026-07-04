@@ -283,7 +283,6 @@ class NombaClient:
             account_ref, self.parent_account_id, resp.status_code,
             expected_amount if expected_amount is not None else 0.0,
         )
-
         # If we got an error, log the full response body for debugging
         if resp.status_code >= 400:
             logger.error(
@@ -315,6 +314,94 @@ class NombaClient:
         return body["data"]
         # Returns per spec: createdAt, accountHolderId, accountRef, bvn, accountName,
         # bankName, bankAccountNumber, bankAccountName, currency, callbackUrl, expired
+
+    async def create_virtual_account_for_subaccount(
+        self,
+        sub_account_id: str,
+        account_ref: str,
+        account_name: str,
+    ) -> dict:
+        """
+        Create a Nomba virtual NUBAN for a sub-account (HACKATHON 2026 FIX).
+
+        PER NOMBA DOCS (https://developer.nomba.com/nomba-api-reference/
+        virtual-accounts/create-virtual-account-for-sub-account):
+        - Path:  POST /v1/accounts/virtual/{subAccountId}
+        - Header: accountId = PARENT account (unchanged, still the auth scope)
+        - Path param subAccountId = the sub-account that will OWN the VA
+        - Body:   { "accountRef": "...", "accountName": "..." }   (plus optional
+                  bvn, expiryDate, expectedAmount)
+        - Funds sent to the VA are collected in the sub-account specified.
+
+        WHY THIS EXISTS:
+          The plain /v1/accounts/virtual endpoint creates a VA under the parent
+          account. Nomba's webhook redirect service then looks up the parent's
+          webhook URL config to deliver payment_success events. The hackathon
+          form only registers a URL for the SUB-account, not the parent. So
+          real OPay/Nombank MFB payments made to a parent-scoped VA get a 404
+          at the redirect step and never reach our endpoint.
+
+          By using this sub-account endpoint, the VA is scoped to our
+          sub-account, so the redirect lookup hits the sub-account config --
+          which has a URL registered via the form.
+
+        ACCOUNT ID HEADER (IMPORTANT):
+          Do NOT swap the accountId header to the sub-account. The parent must
+          remain the auth/header value per the docs. The sub-account is only
+          specified in the URL path.
+
+        account_ref: agreement.id (UUID), 16-64 chars per spec.
+        account_name: 8-64 chars per spec (already sanitized in the route).
+        sub_account_id: from .env NOMBA_SUB_ACCOUNT_ID.
+        """
+        payload = {
+            "accountRef": account_ref,
+            "accountName": account_name,
+        }
+
+        headers = await self._headers()
+        # Sub-account goes in the URL path; parent stays in the auth header.
+        resp = requests.post(
+            f"{self.base_url}/accounts/virtual/{sub_account_id}",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+
+        logger.info(
+            "create_virtual_account_for_subaccount | ref=%s | sub=%s | parent=%s | "
+            "status=%s",
+            account_ref, sub_account_id, self.parent_account_id, resp.status_code,
+        )
+
+        if resp.status_code >= 400:
+            logger.error(
+                "Sub-account VA creation REJECTED | ref=%s | sub=%s | status=%s | "
+                "response_body=%s | request_payload=%s | url=%s",
+                account_ref, sub_account_id, resp.status_code,
+                resp.text[:1000], payload,
+                f"{self.base_url}/accounts/virtual/{sub_account_id}",
+            )
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise NombaAPIError(
+                    f"{exc} | response_body={resp.text[:500]}"
+                ) from exc
+
+        body = resp.json()
+        if body.get("code") != "00":
+            logger.error(
+                "Sub-account VA creation non-00 code | ref=%s | sub=%s | "
+                "code=%s | description=%s | body=%s",
+                account_ref, sub_account_id, body.get("code"),
+                body.get("description"), body,
+            )
+            raise NombaAPIError(
+                f"{body.get('description', 'Nomba error')} | code={body.get('code')} | "
+                f"body={body}"
+            )
+        return body["data"]
 
     async def get_virtual_account(self, account_ref: str) -> dict | None:
         """
