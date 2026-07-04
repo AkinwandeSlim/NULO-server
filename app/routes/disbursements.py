@@ -178,7 +178,7 @@ async def disburse_to_landlord(
         None,
         lambda: supabase_admin
             .table("virtual_account_transfers")
-            .select("id, amount_received, reconciliation_result, agreement_id, currency, nomba_account_ref")
+            .select("id, amount_received, reconciliation_result, agreement_id, currency, account_ref")
             .eq("id", source_transfer_id)
             .maybe_single()
             .execute(),
@@ -306,7 +306,7 @@ async def disburse_to_landlord(
     # from those VAs MUST go through the sub-account transfer endpoint, since
     # the parent wallet has 0 spendable balance even though the balance API
     # reports funds (verified live 2026-07-04 with INSUFFICIENT_BALANCE).
-    account_ref = transfer.get("nomba_account_ref") or ""
+    account_ref = transfer.get("account_ref") or ""
     is_sub_account_va = account_ref.upper().endswith("-SUB")
     sub_account_id = os.environ.get("NOMBA_SUB_ACCOUNT_ID") if is_sub_account_va else None
 
