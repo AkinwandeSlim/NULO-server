@@ -301,11 +301,17 @@ def main():
         "misdirected": 1.0,  # amount is irrelevant; account_ref is bogus
     }
     amount = round(expected_amount * scenario_ratios[args.scenario], 2)
-    account_ref = (
-        "00000000-0000-0000-0000-000000000000"
-        if args.scenario == "misdirected"
-        else args.agreement_id
-    )
+    # For non-misdirected scenarios, send the SUFFIXED accountRef ({uuid}-SUB).
+    # This matches what the production route now stores on Nomba (Path B
+    # sub-account VA) and what the webhook's aliasAccountReference will echo
+    # back. Without the suffix, virtual_account_transfers.account_ref will not
+    # match the row and payment_status will return an empty transfer_history.
+    # The misdirected scenario keeps the zero-UUID -- it tests the
+    # "no agreement matches" path regardless of suffix.
+    if args.scenario == "misdirected":
+        account_ref = "00000000-0000-0000-0000-000000000000"
+    else:
+        account_ref = f"{args.agreement_id}-SUB"
 
     # Fresh request_id per run so we can re-run the script multiple times
     # against the same agreement. For the second run, the webhook should

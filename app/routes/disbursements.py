@@ -82,23 +82,28 @@ async def lookup_bank(
     if not verified_account_name:
         raise HTTPException(502, "Bank returned empty accountName")
 
-    # Persist all correct fields to landlords row.
+    # Persist all correct fields to landlord_profiles row (PRD V3.2 OPEN #1:
+    # payout bank details now live on landlord_profiles, the single source of
+    # truth -- NOT landlords, which keeps a legacy duplicate for now and will
+    # be cleaned up in a future migration 007).
     # Use upsert() (not update()) because some landlords may not have a row
-    # in the `landlords` table if their onboarding flow didn't create one --
+    # in `landlord_profiles` if their onboarding flow didn't create one --
     # we should be able to recover from that here rather than 500-ing the
     # entire disburse flow later. On the happy path this is a no-op for
     # existing rows (PostgREST treats upsert as update when the PK exists).
+    # id is the shared PK (auth.users.id) on both landlord_profiles and the
+    # old landlords table, so the same upsert-by-id pattern still works.
     now = datetime.now(timezone.utc).isoformat()
     await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: supabase_admin
-            .table("landlords")
+            .table("landlord_profiles")
             .upsert({
                 "id": current_user["id"],
                 "bank_account_number": account_number,
-                "bank_name": bank_display_name,  # Human-readable display name
+                "bank_name": bank_display_name,    # Human-readable display name
                 "account_name": verified_account_name,
-                "bank_code": bank_code,          # Bank code for API calls
+                "bank_code": bank_code,            # Bank code for API calls
                 "bank_verified_at": now,
                 "updated_at": now,
             })
@@ -229,11 +234,12 @@ async def disburse_to_landlord(
                 "message": "Disbursement already in progress or complete",
             }
 
-    # 3. Fetch landlord bank details
+    # 3. Fetch landlord bank details (PRD V3.2 OPEN #1: now from landlord_profiles,
+    #    the payout-data single source of truth, NOT the legacy landlords table).
     landlord_result = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: supabase_admin
-            .table("landlords")
+            .table("landlord_profiles")
             .select("id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at")
             .eq("id", agreement["landlord_id"])
             .maybe_single()

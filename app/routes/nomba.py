@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+import re
 from datetime import date
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -142,11 +143,30 @@ async def provision_nomba(
         float(agreement["rent_amount"]), frequency
     )
 
+    # Sub-account is REQUIRED for VA provisioning. Without it, the VA would be
+    # scoped to the parent account, and Nomba's webhook redirect service would
+    # look up the parent's webhook URL config -- which is NOT registered for
+    # our hackathon submission. Result: silent 404 "No redirect configuration"
+    # on every inbound payment. Hard-fail fast here so callers see the issue
+    # instead of producing broken VAs.
+    if not nomba_client.sub_account_id:
+        raise HTTPException(
+            500,
+            "NOMBA_SUB_ACCOUNT_ID is not set; cannot provision a sub-account-"
+            "scoped VA (Path B). Configure the env var and retry.",
+        )
+
+    # Nomba spec: accountRef must be 16-64 chars. We append "-SUB" (4 chars)
+    # to a UUID (36 chars) for a total of 41 chars -- well within the spec.
+    # The suffix lets us tag which VAs are sub-account-scoped at lookup time
+    # (see disbursements.py auto-pick of the sub-account transfer endpoint).
+    sub_account_ref = f"{agreement_id}-SUB"
+
     # Log exact payload being sent to Nomba for debug visibility
     logger.info(
-        "Nomba VA provision attempt | agreement=%s | account_ref=%s | "
-        "account_name=%r (len=%d) | expected_local=%.2f",
-        agreement_id, agreement_id, account_name, len(account_name), expected_amount,
+        "Nomba VA provision attempt (Path B sub-account) | agreement=%s | "
+        "account_ref=%s | account_name=%r (len=%d) | expected_local=%.2f",
+        agreement_id, sub_account_ref, account_name, len(account_name), expected_amount,
     )
 
     # RECOVERY: If a previous provisioning call succeeded on Nomba's side
@@ -154,9 +174,16 @@ async def provision_nomba(
     # write), the VA is orphaned on Nomba with our accountRef. Nomba will
     # then reject the next create with "accountRef already exists". We
     # try to fetch the existing VA first and use it.
+    #
+    # Path B (sub-account) stores accountRef = {uuid}-SUB on Nomba, so the
+    # recovery GET must use the suffixed ref. get_virtual_account() returns
+    # None cleanly on 404 (nomba_client.py:443-444), so if Nomba 404s on the
+    # suffixed ref via the parent-header GET, recovery simply falls through
+    # to the Path-B creation call below. The header stays as the parent
+    # per the PRD's golden rule (header is always the parent).
     data = None
     try:
-        existing = await nomba_client.get_virtual_account(agreement_id)
+        existing = await nomba_client.get_virtual_account(sub_account_ref)
         if existing and not existing.get("expired", False):
             logger.info(
                 "Recovered existing Nomba VA for agreement=%s | nuban=%s",
@@ -173,10 +200,17 @@ async def provision_nomba(
 
     if data is None:
         try:
-            data = await nomba_client.create_virtual_account(
-                account_ref=agreement_id,
+            # Path B: provision under the sub-account. accountRef is the
+            # suffixed value (sub_account_ref) so the on-Nomba record matches
+            # the aliasAccountReference that webhooks will echo back.
+            # create_virtual_account_for_subaccount does not take
+            # expected_amount (body is exactly {accountRef, accountName});
+            # expected_amount is still persisted locally to
+            # agreements.expected_payment_amount below.
+            data = await nomba_client.create_virtual_account_for_subaccount(
+                sub_account_id=nomba_client.sub_account_id,
+                account_ref=sub_account_ref,
                 account_name=account_name,
-                expected_amount=expected_amount,
             )
         except NombaAPIError as exc:
             # Surface the FULL Nomba error in the response so callers can see
@@ -415,6 +449,22 @@ async def payment_status(
     ):
         raise HTTPException(403, "Not authorized")
 
+    # Query the transfer history. The webhook stores the SUFFIXED accountRef
+    # ({uuid}-SUB) for Path-B sub-account-scoped VAs, so we must query with
+    # the suffixed value -- not the bare agreement_id. Use the same UUID
+    # extraction regex as _reconcile_payment to defensively strip any suffix
+    # from agreement_id before re-appending "-SUB".
+    #
+    # Legacy parent-scoped VAs used the bare UUID as accountRef. Their rows
+    # are intentionally NOT surfaced here -- parent VAs are deprecated and we
+    # are not preserving their history in this endpoint.
+    uuid_match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        agreement_id, re.IGNORECASE,
+    )
+    clean_agreement_id = uuid_match.group(0) if uuid_match else agreement_id
+    suffixed_account_ref = f"{clean_agreement_id}-SUB"
+
     transfers = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: supabase_admin
@@ -423,7 +473,7 @@ async def payment_status(
                 "id, amount_received, sender_name, sender_bank, "
                 "reconciliation_result, created_at"
             )
-            .eq("account_ref", agreement_id)
+            .eq("account_ref", suffixed_account_ref)
             .order("created_at", desc=True)
             .execute(),
     )
@@ -481,7 +531,6 @@ async def _reconcile_payment(
     (or agreement.id with an optional suffix like "-SUB" when the VA was
     provisioned via the sub-account endpoint for test routing purposes).
     """
-    import re
     if not account_ref:
         logger.warning("No aliasAccountReference in webhook -- cannot reconcile")
         return

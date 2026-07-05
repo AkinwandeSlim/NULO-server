@@ -1,118 +1,63 @@
 """
-Re-provision virtual account in live environment.
-1. Clear the existing VA fields from the agreement (so provision creates a new one)
-2. Call the provision-nomba endpoint (uses live credentials from Render)
-3. Get the new live VA details
+[DEPRECATED -- DO NOT USE]
+
+This script used to call POST /agreements/{id}/provision-nomba on Render
+(LIVE) to reprovision a VA. It was the entry point for the parent-scoped
+Path A provisioning flow, which silently drops inbound webhooks with
+404 "No redirect configuration" because the hackathon's webhook URL is
+registered against the SUB-account, not the parent.
+
+The provision-nomba route now uses Path B (sub-account-scoped, -SUB
+suffix) by default. So even if you re-run this script, the route itself
+will now produce a working sub-account VA. BUT this script's name still
+implies "Path A on LIVE", and the docstring/logic still references the
+parent path. To avoid future confusion, the script has been disabled.
+
+Use one of these instead:
+  - server/scripts/reprovision_live_va_subaccount.py
+        Live sub-account VA provisioning (Path B). Use this for live tests.
+  - server/scripts/reprovision_sandbox_va_subaccount.py
+        Sandbox sub-account VA provisioning (Path B). Use this for local
+        testing with NOMBA_ENV=test.
+
+Or, for the normal app flow, just call the production endpoint:
+  POST /api/v1/agreements/{id}/provision-nomba
+  -- it now provisions a sub-account-scoped VA automatically.
+
+If you need to inspect what the (now-removed) Path A direct call looked
+like, see the git history. The script body is preserved below as comments
+for archaeology only.
+
+Original body (Path A, parent-scoped) -- kept for reference:
+-------------------------------------------------------------------------
+# Step 1-2: clear existing VA fields on the agreement
+# Step 3: generate a landlord JWT
+# Step 4: POST {BASE_URL}/agreements/{AGREEMENT_ID}/provision-nomba
+#         (which then internally called create_virtual_account(...) on the
+#          parent -- this is the call that broke webhook delivery)
+-------------------------------------------------------------------------
 """
-import os
-import requests
-from dotenv import load_dotenv
-load_dotenv()
+import sys
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
-BASE_URL = "https://api.nuloafrica.com/api/v1"
 
-AGREEMENT_ID = "8b565c14-79f7-4b0d-b84f-19cfbb2b18e8"
-LANDLORD_ID = "070671cd-a779-4997-9046-771467394f53"
-
-db_headers = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json"
-}
-
-print("=" * 70)
-print("RE-PROVISIONING VIRTUAL ACCOUNT IN LIVE ENVIRONMENT")
-print("=" * 70)
-print(f"Agreement: {AGREEMENT_ID}")
-print(f"Landlord:  {LANDLORD_ID}")
-print()
-
-# Step 1: Check current state
-print("Step 1: Check current agreement state...")
-url = f"{SUPABASE_URL}/rest/v1/agreements?id=eq.{AGREEMENT_ID}&select=id,virtual_account_number,virtual_account_name,nomba_account_ref,status"
-resp = requests.get(url, headers=db_headers).json()
-if resp:
-    a = resp[0]
-    print(f"  Status:        {a.get('status')}")
-    print(f"  VA Number:     {a.get('virtual_account_number')}")
-    print(f"  VA Name:       {a.get('virtual_account_name')}")
-    print(f"  Nomba Ref:     {a.get('nomba_account_ref')}")
-else:
-    print("  Agreement not found!")
-    exit(1)
-
-# Step 2: Clear existing VA fields
-print("\nStep 2: Clear existing VA fields so we can re-provision in live...")
-url = f"{SUPABASE_URL}/rest/v1/agreements?id=eq.{AGREEMENT_ID}"
-resp = requests.patch(
-    url,
-    headers=db_headers,
-    json={
-        "virtual_account_number": None,
-        "virtual_account_name": None,
-        "nomba_account_ref": None,
-    }
-)
-print(f"  PATCH status: {resp.status_code}")
-
-# Step 3: Generate landlord JWT
-print("\nStep 3: Generate landlord JWT...")
-from jose import jwt
-from datetime import datetime, timedelta, timezone
-
-JWT_SECRET = os.environ.get("JWT_SECRET_KEY")
-JWT_ALGO = os.environ.get("JWT_ALGORITHM", "HS256")
-
-token = jwt.encode(
-    {
-        "sub": LANDLORD_ID,
-        "user_id": LANDLORD_ID,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
-        "iat": datetime.now(timezone.utc),
-    },
-    JWT_SECRET,
-    algorithm=JWT_ALGO,
-)
-api_headers = {
-    "Authorization": f"Bearer {token}",
-    "Content-Type": "application/json"
-}
-print(f"  Token generated for: {LANDLORD_ID}")
-
-# Step 4: Call provision-nomba
-print(f"\nStep 4: Call provision-nomba on Render (will use live credentials)...")
-print(f"  URL: {BASE_URL}/agreements/{AGREEMENT_ID}/provision-nomba")
-resp = requests.post(
-    f"{BASE_URL}/agreements/{AGREEMENT_ID}/provision-nomba",
-    headers=api_headers,
-    timeout=60,
-)
-
-print(f"  HTTP Status: {resp.status_code}")
-print(f"  Response: {resp.text}")
-
-if resp.status_code == 200:
-    data = resp.json()
-    print()
+def main():
     print("=" * 70)
-    print("SUCCESS! New live VA provisioned")
+    print("[DEPRECATED] reprovision_live_va.py")
     print("=" * 70)
-    print(f"  VA Number: {data.get('virtual_account_number')}")
-    print(f"  VA Name:   {data.get('virtual_account_name')}")
-    print(f"  Expected:  {data.get('expected_amount')}")
-    print(f"  Frequency: {data.get('frequency')}")
     print()
-    print("NEXT STEPS:")
-    print("  1. Make a real small transfer (e.g., NGN 100) to the new VA")
-    print("  2. Wait for the webhook to fire and reconcile")
-    print("  3. Test the disbursement flow")
-else:
+    print("This script is disabled. The parent-scoped Path A provisioning")
+    print("flow silently drops inbound webhooks (404 'No redirect")
+    print("configuration') because the hackathon's webhook URL is")
+    print("registered on the sub-account, not the parent.")
     print()
-    print("FAILED!")
-    try:
-        err = resp.json()
-        print(f"  Error detail: {err.get('detail', err)}")
-    except Exception:
-        print(f"  Raw: {resp.text}")
+    print("Use instead:")
+    print("  - reprovision_live_va_subaccount.py     (live, Path B)")
+    print("  - reprovision_sandbox_va_subaccount.py  (sandbox, Path B)")
+    print("  - POST /api/v1/agreements/{id}/provision-nomba  (app route, now Path B)")
+    print()
+    print("No VA was created. No Nomba call was made.")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

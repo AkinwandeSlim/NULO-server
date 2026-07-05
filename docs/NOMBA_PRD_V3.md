@@ -158,7 +158,7 @@ If a prior provisioning succeeded on Nomba but failed before our DB write, the V
 
 **Stores:** `bankAccountNumber -> agreements.virtual_account_number` (show tenant); `bankAccountName -> agreements.virtual_account_name`; `accountRef -> agreements.nomba_account_ref`.
 
-> ⚠️ **[KNOWN GLITCH]** The `provision-nomba` route calls **Path A** (`create_virtual_account`) even though Path B is the recommended default. There is **no wired route that calls `create_virtual_account_for_subaccount`** for new provisions; the sub-account VA `3783622764` was created via a one-off script, not via the app route. See Part 5 OPEN #5.
+> ✅ **[RESOLVED 2026-07-05]** The `provision-nomba` route now calls **Path B** (`create_virtual_account_for_subaccount` with `subAccountId` in URL) and appends `-SUB` to the agreement UUID to form the on-Nomba `accountRef`. The route guards on `NOMBA_SUB_ACCOUNT_ID` and hard-fails with HTTP 500 if the env var is missing. The recovery branch uses the suffixed ref; `payment_status` queries with the suffixed ref (extracting the UUID defensively). See Part 5 OPEN #4.
 
 ### 1.3 Webhook — signature + payload [VERIFIED]
 Nomba signs with **HMAC-SHA256 over a colon-joined 9-field string** (NOT a raw-body hash), **base64**-encoded. Independently confirmed by a working handler and a hand-computed test vector.
@@ -376,7 +376,7 @@ These are NOT settled. Each is either untestable in sandbox, a known defect, or 
 1. **[KNOWN GLITCH] Duplicate payout bank columns.** `landlords` and `landlord_profiles` both carry `account_name`, `bank_account_number`, `bank_name`; the disburse route reads `landlords`. **Target: `landlord_profiles` as single source of truth.** Migration queued (Part 3.3). The route works today; this is a hygiene fix, not a live bug.
 2. **[OPEN] Requery by ref (Part 1.7).** Broken in sandbox; match-guard shipped. Re-test `single?transactionRef=`, `requery/{sessionId}`, the `{subAccountId}` variants in production before relying on requery for payout finalisation.
 3. **[OPEN] Auto-disbursement.** Disbursement is MANUAL (landlord hits the endpoint). Stage-2: a post-reconciliation hook that auto-triggers `disburse_to_landlord` on FULL_PAYMENT (with a grace window + guard against double-disburse). The `force=true` test override must be removed for any real flow.
-4. **[KNOWN GLITCH] `provision-nomba` route uses Path A only.** New VAs should use Path B (sub-account-scoped) per V3.1, but the route calls `create_virtual_account` (Path A). The live sub-account VA `3783622764` was created via a one-off script, not the route. Stage-2: point the route at `create_virtual_account_for_subaccount` and append `-SUB` to the accountRef.
+4. ✅ **[RESOLVED 2026-07-05] `provision-nomba` route now uses Path B.** The route at `server/app/routes/nomba.py:provision_nomba` now calls `create_virtual_account_for_subaccount(sub_account_id, account_ref=f"{agreement_id}-SUB", ...)` and hard-fails with HTTP 500 if `NOMBA_SUB_ACCOUNT_ID` is unset. Recovery branch was updated to use the suffixed ref; `payment_status` query was updated to extract the UUID and query with the suffixed ref. Local-testing companion script added: `server/scripts/reprovision_sandbox_va_subaccount.py`. The two Path-A-only scripts (`reprovision_live_va.py`, `diagnose_va_creation.py`) are disabled and print a deprecation pointer.
 5. **[OPEN] Frontend not wired.** The Next.js frontend does not yet call these endpoints with auth. Stage-2 wiring: tenant "pay" panel (show NUBAN), landlord dashboard (received/disbursed/release-funds).
 
 ---
@@ -473,6 +473,14 @@ database/newupdateDB.csv                          # exported live schema — col
   5. Corrected the **OpenAPI spec path** to `docs/nomba_openapi.json` (not `docs/hackathon/`).
   6. Documented that **`provision-nomba` uses Path A only** despite Path B being the default — a [KNOWN GLITCH] (OPEN #5).
   7. Requery kept [OPEN] with the match-guard mitigation; re-test in production still required.
+- **V3.3** (2026-07-05) — Stage-2 prep: `provision-nomba` route upgraded to Path B.
+  1. Route now calls `create_virtual_account_for_subaccount` with `accountRef = {uuid}-SUB` and hard-fails if `NOMBA_SUB_ACCOUNT_ID` is unset.
+  2. Recovery branch updated to use the suffixed ref; `payment_status` query updated to extract the UUID and query with the suffixed ref.
+  3. `simulate_live_webhook.py` repointed at the working sub-account VA `3783622764` with a sub-account `merchant.userId` and the suffixed `aliasAccountReference`. The mislabel (`SUB_ACCOUNT_USER_ID` was actually the parent) is fixed (renamed `MERCHANT_USER_ID`).
+  4. `test_webhook_local.py` sends the suffixed `accountRef` for non-misdirected scenarios so `payment_status` correctly surfaces the transfer history.
+  5. New `reprovision_sandbox_va_subaccount.py` script for local-testing fresh sandbox sub-account VAs (Path B).
+  6. The two Path-A-only scripts (`reprovision_live_va.py`, `diagnose_va_creation.py`) are disabled and now print a deprecation pointer.
+  7. OPEN #4 (Part 5) closed. `import re` hoisted to module level in `nomba.py`.
 
 ---
-*V3 generated 2026-07-03. V3.1 corrections 2026-07-04 after live production evidence. V3.2 corrections 2026-07-04 after re-grounding in the shipped code and `database/newupdateDB.csv`. Every `[VERIFIED]` line has a timestamp; every `[OPEN]`/`[KNOWN GLITCH]` item must be resolved or honestly surfaced before submission.*
+*V3 generated 2026-07-03. V3.1 corrections 2026-07-04 after live production evidence. V3.2 corrections 2026-07-04 after re-grounding in the shipped code and `database/newupdateDB.csv`. V3.3 corrections 2026-07-05 (Path B route upgrade). Every `[VERIFIED]` line has a timestamp; every `[OPEN]`/`[KNOWN GLITCH]` item must be resolved or honestly surfaced before submission.*

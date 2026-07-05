@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import sys
 
 import requests
@@ -16,8 +17,19 @@ SECRET = "NombaHackathon2026"
 TIMESTAMP = "2026-07-03T20:00:00Z"
 
 AGREEMENT_ID = "8b565c14-79f7-4b0d-b84f-19cfbb2b18e8"
-SUB_ACCOUNT_USER_ID = "f666ef9b-888e-4799-85ce-acb505b28023"  # parent account id
-VIRTUAL_ACCOUNT_NUMBER = "8404605359"
+# Use the sub-account ID (not the parent) -- this is the accountHolderId
+# Nomba stores for VAs provisioned via Path B (POST /v1/accounts/virtual/{subAccountId}).
+# Previously mislabeled as SUB_ACCOUNT_USER_ID; the parent header still
+# goes on the API calls, but the merchant.userId in the signed payload is
+# the sub-account that owns the VA.
+MERCHANT_USER_ID = os.environ.get(
+    "NOMBA_SUB_ACCOUNT_ID", "282e5b9b-d14f-4e43-840d-43ddfd90a071"
+)
+# Sub-account-scoped VA that successfully delivered a real OPay webhook
+# (NUBAN 3783622764 / Nombank MFB, accountHolderId = 282e5b9b-...).
+# The legacy parent VA 8404605359 dropped every webhook with
+# "No redirect configuration" and is intentionally NOT used here.
+VIRTUAL_ACCOUNT_NUMBER = "3783622764"
 
 LIVE_URL = "https://api.nuloafrica.com/api/v1/webhooks/nomba/transfer"
 
@@ -35,7 +47,7 @@ payload = {
         "merchant": {
             "walletId": "test-wallet-live",
             "walletBalance": 50000,
-            "userId": SUB_ACCOUNT_USER_ID,
+            "userId": MERCHANT_USER_ID,
         },
         "terminal": {},
         "transaction": {
@@ -50,7 +62,7 @@ payload = {
             "transactionAmount": amount,
             "narration": f"Test payment of NGN {amount}",
             "time": TIMESTAMP,
-            "aliasAccountReference": AGREEMENT_ID,
+            "aliasAccountReference": f"{AGREEMENT_ID}-SUB",
             "aliasAccountType": "VIRTUAL",
         },
         "customer": {
