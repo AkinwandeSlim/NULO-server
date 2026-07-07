@@ -17,6 +17,7 @@ from app.routes import (
     landlord_onboarding, landlord_dashboard, tenant_dashboard, notifications, admin_dashboard,
     admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health,
     engagement, banner_dismissals, payments, license, groq_agreement, nomba, disbursements,
+    admin_transactions,
 )
 
 import logging
@@ -233,6 +234,7 @@ app.include_router(nomba.router, prefix="/api/v1", tags=["Nomba Virtual Accounts
 app.include_router(disbursements.router, prefix="/api/v1", tags=["Nomba Disbursements"])
 app.include_router(license.router, prefix="/api/v1", tags=["License Management"])
 app.include_router(groq_agreement.router, tags=["Groq AI Agreement"])
+app.include_router(admin_transactions.router, prefix="/api/v1", tags=["Admin Transactions"])
 
 # Test / preview endpoints (NO AUTH) — useful for QA spot-checks of
 # generated PDFs without going through the full sign flow. Exposed under

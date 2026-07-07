@@ -1,6 +1,6 @@
 """
 Supabase database client setup with optimized configuration
-🔧 OPTIMIZED:
+OPTIMIZED:
   - Connection pooling enabled
   - Query timeout: 10 seconds
   - Automatic connection reuse
@@ -25,7 +25,7 @@ def retry_on_timeout(max_retries=3, delay=1.0):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     if "timed out" in str(e).lower() and attempt < max_retries - 1:
-                        print(f"⚠️ DB timeout attempt {attempt + 1}/{max_retries}, retrying in {delay}s...")
+                        print(f"DB timeout attempt {attempt + 1}/{max_retries}, retrying in {delay}s...")
                         await asyncio.sleep(delay)
                         continue
                     raise
@@ -38,7 +38,7 @@ def retry_on_timeout(max_retries=3, delay=1.0):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if "timed out" in str(e).lower() and attempt < max_retries - 1:
-                        print(f"⚠️ DB timeout attempt {attempt + 1}/{max_retries}, retrying in {delay}s...")
+                        print(f"DB timeout attempt {attempt + 1}/{max_retries}, retrying in {delay}s...")
                         time.sleep(delay)
                         continue
                     raise
@@ -52,7 +52,7 @@ def retry_on_timeout(max_retries=3, delay=1.0):
             return sync_wrapper
     return decorator
 
-# 🔧 OPTIMIZATION: Create Supabase client with SSL and timeout configuration
+# OPTIMIZATION: Create Supabase client with SSL and timeout configuration
 def create_optimized_client(url: str, key: str) -> Client:
     """Create Supabase client with SSL and timeout configuration
     
@@ -70,7 +70,7 @@ def create_optimized_client(url: str, key: str) -> Client:
         # Try creating client with default settings first
         return create_client(url, key)
     except Exception as e:
-        print(f"⚠️ Supabase client creation failed, trying fallback: {e}")
+        print(f"Supabase client creation failed, trying fallback: {e}")
         # Fallback: try with minimal configuration
         return create_client(url, key)
 
@@ -79,7 +79,7 @@ def create_optimized_client(url: str, key: str) -> Client:
 @retry_on_timeout(max_retries=3, delay=1.0)
 def get_supabase_client() -> Client:
     """Get Supabase client instance (anon key) with optimizations"""
-    print(f"🔍 [DB] Creating supabase client with key starting with: {settings.SUPABASE_KEY[:20]}...")
+    print(f"[DB] Creating supabase client with key starting with: {settings.SUPABASE_KEY[:20]}...")
     return create_optimized_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 
@@ -89,8 +89,8 @@ def get_supabase_admin() -> Client:
     """Get Supabase admin client (service role key) with optimizations"""
     # Use SERVICE_ROLE_KEY for admin operations (has auth admin privileges)
     service_key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
-    print(f"🔍 [DB] Creating supabase_admin with service key starting with: {service_key[:20]}...")
-    print(f"🔍 [DB] Service key source: {'SUPABASE_SERVICE_ROLE_KEY' if settings.SUPABASE_SERVICE_ROLE_KEY else 'SUPABASE_SERVICE_KEY'}")
+    print(f"[DB] Creating supabase_admin with service key starting with: {service_key[:20]}...")
+    print(f"[DB] Service key source: {'SUPABASE_SERVICE_ROLE_KEY' if settings.SUPABASE_SERVICE_ROLE_KEY else 'SUPABASE_SERVICE_KEY'}")
     return create_optimized_client(settings.SUPABASE_URL, service_key)
 
 

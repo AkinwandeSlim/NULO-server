@@ -25,6 +25,8 @@ BUGS FIXED vs original:
   7. PDF generation was placeholder (no actual file). Fixed: ReportLab + Supabase Storage.
 """
 import logging
+import asyncio
+import re
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
 from app.database import supabase_admin
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
@@ -97,6 +99,27 @@ def _fetch_agreement_participants(agreement: dict) -> tuple:
         landlord_data = r.data[0] if r.data else None
     except Exception as e:
         logger.warning(f"[AGREEMENTS] Could not fetch landlord {agreement.get('landlord_id')}: {e}")
+
+    # Merge bank details from landlord_profiles (shared-PK table) so the
+    # confirm-release dialog and receipt generation always show real values
+    # instead of "Your Bank" / "••••••••" placeholders.
+    if landlord_data:
+        try:
+            bp = supabase_admin.table("landlord_profiles").select(
+                "bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
+            ).eq("id", agreement["landlord_id"]).execute()
+            if bp.data:
+                profile = bp.data[0]
+                landlord_data = {
+                    **landlord_data,
+                    "bank_account_number": profile.get("bank_account_number"),
+                    "bank_name": profile.get("bank_name"),
+                    "account_name": profile.get("account_name"),
+                    "bank_code": profile.get("bank_code"),
+                    "bank_verified_at": profile.get("bank_verified_at"),
+                }
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Could not fetch landlord_profiles for {agreement.get('landlord_id')}: {e}")
 
     try:
         r = supabase_admin.table("properties").select(
@@ -246,6 +269,31 @@ async def get_agreements(
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch landlords failed: {e}")
 
+        # Merge bank details from landlord_profiles into landlords_map.
+        # landlord_profiles shares the same PK as users, so id == landlord_id.
+        # Without this, every confirm-release dialog shows "Your Bank / ••••••••".
+        try:
+            if landlord_ids:
+                profiles_resp = supabase_admin.table("landlord_profiles").select(
+                    "id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
+                ).in_("id", landlord_ids).execute()
+                for profile in profiles_resp.data:
+                    lid = profile["id"]
+                    if lid in landlords_map:
+                        landlords_map[lid] = {
+                            **landlords_map[lid],
+                            "bank_account_number": profile.get("bank_account_number"),
+                            "bank_name": profile.get("bank_name"),
+                            "account_name": profile.get("account_name"),
+                            "bank_code": profile.get("bank_code"),
+                            "bank_verified_at": profile.get("bank_verified_at"),
+                        }
+                    else:
+                        # landlord exists in profiles but not in users (edge case)
+                        landlords_map[lid] = profile
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Batch fetch landlord_profiles failed: {e}")
+
         try:
             if property_ids:
                 properties_resp = supabase_admin.table("properties").select(
@@ -255,14 +303,38 @@ async def get_agreements(
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch properties failed: {e}")
 
+        # Batch fetch latest disbursement status for each agreement
+        disbursements_map = {}
+        try:
+            if agreements:
+                # Get the latest disbursement for each agreement
+                disbursements_resp = supabase_admin.table("transactions").select(
+                    "agreement_id, status, amount, nomba_transfer_ref"
+                ).in_("agreement_id", [a["id"] for a in agreements if a.get("id")]) \
+                .in_("transaction_type", ["nomba_disbursement"]) \
+                .order("created_at", desc=True) \
+                .execute()
+                logger.info(f"[AGREEMENTS] Fetched {len(disbursements_resp.data)} disbursements")
+                # Keep only the latest disbursement per agreement
+                for d in disbursements_resp.data:
+                    if d["agreement_id"] not in disbursements_map:
+                        disbursements_map[d["agreement_id"]] = d
+                        logger.info(f"[AGREEMENTS] Agreement {d['agreement_id']} has disbursement status: {d.get('status')}")
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Batch fetch disbursements failed: {e}")
+
         # Attach pre-fetched data to each agreement
         enhanced = []
         for agreement in agreements:
+            disbursement = disbursements_map.get(agreement.get("id"))
             enhanced.append({
                 **agreement,
                 "tenant": tenants_map.get(agreement.get("tenant_id")),
                 "landlord": landlords_map.get(agreement.get("landlord_id")),
                 "property": properties_map.get(agreement.get("property_id")),
+                "disbursement_status": disbursement.get("status") if disbursement else None,
+                "disbursement_merchant_tx_ref": disbursement.get("nomba_transfer_ref") if disbursement else None,
+                "disbursement_amount": disbursement.get("amount") if disbursement else None,
             })
 
         logger.info(f"[AGREEMENTS] Returning {len(enhanced)} agreements for {user_type} {user_id}")
@@ -488,10 +560,60 @@ async def get_agreement(
 
         enriched = _enrich(agreement)
 
+        # Fetch latest disbursement status for this agreement
+        disbursement = None
+        try:
+            disbursement_resp = supabase_admin.table("transactions").select(
+                "agreement_id, status, amount, nomba_transfer_ref"
+            ).eq("agreement_id", agreement_id) \
+            .eq("transaction_type", "nomba_disbursement") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .maybe_single() \
+            .execute()
+            disbursement = disbursement_resp.data if disbursement_resp.data else None
+            if disbursement:
+                logger.info(f"[AGREEMENTS] Agreement {agreement_id} has disbursement status: {disbursement.get('status')}")
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Failed to fetch disbursement for {agreement_id}: {e}")
+
+        # Attach disbursement status to enriched agreement
+        if disbursement:
+            enriched["disbursement_status"] = disbursement.get("status")
+            enriched["disbursement_merchant_tx_ref"] = disbursement.get("nomba_transfer_ref")
+            enriched["disbursement_amount"] = disbursement.get("amount")
+
+        # Fetch transfer history for this agreement
+        transfer_history = []
+        if agreement.get("nomba_account_ref"):
+            # Extract UUID and build suffixed account ref for querying virtual_account_transfers
+            uuid_match = re.search(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                agreement_id, re.IGNORECASE,
+            )
+            clean_agreement_id = uuid_match.group(0) if uuid_match else agreement_id
+            suffixed_account_ref = f"{clean_agreement_id}-SUB"
+
+            transfers = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: supabase_admin
+                    .table("virtual_account_transfers")
+                    .select(
+                        "id, account_ref, account_number, amount_received, currency, "
+                        "sender_name, sender_bank, reconciliation_result, transaction_type, "
+                        "event_type, nomba_request_id, nomba_transaction_id, created_at"
+                    )
+                    .eq("account_ref", suffixed_account_ref)
+                    .order("created_at", desc=True)
+                    .execute(),
+            )
+            transfer_history = transfers.data or []
+
         logger.info(f"✅ [AGREEMENTS] Returning agreement {agreement_id} to {user_type} {user_id}")
         return {
             "success": True,
-            "agreement": enriched
+            "agreement": enriched,
+            "transfer_history": transfer_history
         }
 
     except HTTPException:
@@ -671,6 +793,79 @@ async def generate_pdf(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate PDF: {str(e)}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{agreement_id}/receipt")
+async def generate_receipt(
+    agreement_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate a payment receipt PDF for a completed payment.
+    Uses ReportLab to generate formatted PDF, uploads to Supabase Storage.
+    Returns public download URL (same pattern as agreement PDF generation).
+    """
+    try:
+        user_id = current_user["id"]
+        logger.info(f"📄 [RECEIPT] Generating receipt for agreement {agreement_id} by user {user_id}")
+
+        # Fetch agreement with participants
+        response = supabase_admin.table("agreements").select("*").eq(
+            "id", agreement_id
+        ).execute()
+
+        if not response.data:
+            logger.error(f"❌ [RECEIPT] Agreement {agreement_id} not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agreement not found"
+            )
+
+        agreement = response.data[0]
+
+        # Check authorization
+        if agreement["tenant_id"] != user_id and agreement["landlord_id"] != user_id:
+            logger.error(f"❌ [RECEIPT] User {user_id} not authorized for agreement {agreement_id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this agreement"
+            )
+
+        # Check if payment is complete
+        if agreement.get("reconciliation_status") != "FULL_PAYMENT":
+            logger.error(f"❌ [RECEIPT] Agreement {agreement_id} not fully paid (status: {agreement.get('reconciliation_status')})")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payment must be completed before generating receipt"
+            )
+
+        receipt_url = _generate_receipt_pdf(agreement, user_id)
+        
+        if not receipt_url:
+            logger.error(f"❌ [RECEIPT] PDF generation returned None for agreement {agreement_id}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate receipt"
+            )
+        
+        logger.info(f"✅ [RECEIPT] Receipt generated successfully for agreement {agreement_id}")
+
+        return {
+            "success": True,
+            "document_url": receipt_url,
+            "message": "Receipt generated successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [AGREEMENTS] Failed to generate receipt for {agreement_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate receipt: {str(e)}"
         )
 
 
@@ -949,7 +1144,7 @@ def _generate_agreement_pdf(agreement: dict) -> str:
                 ),
                 Paragraph(
                     f"<b>Status</b><br/>"
-                    f"<font size=8 color='#16A34A'><b>FULLY EXECUTED</b></font>",
+                    f"<font size=8 color='#F97316'><b>FULLY EXECUTED</b></font>",
                     body_style,
                 ),
             ]],
@@ -1029,13 +1224,13 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         landlord_signed_date = agreement.get('landlord_signed_at', None)
         
         tenant_stat_text = (
-            f"<font color='#16A34A'><b>SIGNED</b></font><br/>"
+            f"<font color='#F97316'><b>SIGNED</b></font><br/>"
             f"<font size=8 color='#64748B'>{tenant_signed_date[:10]}</font>"
             if tenant_signed_date
             else "<font color='#DC2626'><b>PENDING</b></font>"
         )
         landlord_stat_text = (
-            f"<font color='#16A34A'><b>SIGNED</b></font><br/>"
+            f"<font color='#F97316'><b>SIGNED</b></font><br/>"
             f"<font size=8 color='#64748B'>{landlord_signed_date[:10]}</font>"
             if landlord_signed_date
             else "<font color='#DC2626'><b>PENDING</b></font>"
@@ -1137,3 +1332,259 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         import traceback
         logger.error(traceback.format_exc())
         return None
+
+
+def _generate_receipt_pdf(agreement: dict, user_id: str) -> str:
+    """
+    Generate a payment receipt PDF and upload to Supabase Storage.
+    Uses ReportLab to create a branded receipt with payment details.
+    
+    Returns: Public download URL from Supabase Storage, or None if generation fails
+    """
+    try:
+        # Fetch participants and transfer data
+        tenant_data, landlord_data, property_data = _fetch_agreement_participants(agreement)
+        
+        # Fetch latest payment transfer
+        transfer_response = supabase_admin.table("virtual_account_transfers").select("*").eq(
+            "agreement_id", agreement["id"]
+        ).eq("reconciliation_result", "FULL_PAYMENT").order("created_at", desc=True).limit(1).execute()
+        
+        transfer = transfer_response.data[0] if transfer_response.data else None
+        if not transfer:
+            logger.error(f"❌ [AGREEMENTS] No payment transfer found for receipt generation")
+            return None
+        
+        # Determine recipient type
+        recipient_type = "tenant" if user_id == agreement["tenant_id"] else "landlord"
+        recipient_name = (tenant_data["full_name"] if tenant_data else "Tenant") if recipient_type == "tenant" else (landlord_data["full_name"] if landlord_data else "Landlord")
+        
+        # Create PDF in memory
+        pdf_buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            pdf_buffer,
+            pagesize=letter,
+            rightMargin=RIGHT_MARGIN,
+            leftMargin=LEFT_MARGIN,
+            topMargin=TOP_MARGIN,
+            bottomMargin=BOTTOM_MARGIN,
+        )
+
+        # Page template with branded header + footer
+        brand_frame = Frame(
+            LEFT_MARGIN,
+            BOTTOM_MARGIN,
+            PAGE_WIDTH - LEFT_MARGIN - RIGHT_MARGIN,
+            PAGE_HEIGHT - TOP_MARGIN - BOTTOM_MARGIN,
+            id="brand_frame",
+            showBoundary=0,
+        )
+        doc.addPageTemplates([
+            PageTemplate(
+                id="branded",
+                frames=[brand_frame],
+                onPage=lambda c, d: _draw_receipt_header_footer(c, agreement, recipient_type),
+            )
+        ])
+        
+        # Build document content
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'ReceiptTitle',
+            parent=styles['Heading1'],
+            fontSize=20,
+            textColor=BRAND_ORANGE,  # Orange for NuloAfrica branding
+            spaceAfter=16,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        )
+        
+        # Title based on recipient type
+        receipt_title = "PAYMENT RECEIPT" if recipient_type == "tenant" else "DISBURSEMENT RECEIPT"
+        elements.append(Paragraph(receipt_title, title_style))
+        elements.append(Spacer(1, 0.2 * inch))
+        
+        heading_style = ParagraphStyle(
+            'ReceiptHeading',
+            parent=styles['Heading2'],
+            fontSize=12,
+            textColor=colors.HexColor('#334155'),
+            spaceAfter=8,
+            spaceBefore=12,
+            fontName='Helvetica-Bold'
+        )
+        
+        body_style = ParagraphStyle(
+            'ReceiptBody',
+            parent=styles['BodyText'],
+            fontSize=10,
+            alignment=TA_LEFT,
+            spaceAfter=6,
+            leading=12
+        )
+        
+        # Recipient info - explicit copy label based on recipient type
+        copy_label = "TENANT COPY" if recipient_type == "tenant" else "LANDLORD COPY"
+        elements.append(Paragraph(f"<b>{copy_label}</b>", body_style))
+        elements.append(Paragraph(f"<b>Name:</b> {recipient_name}", body_style))
+        elements.append(Spacer(1, 0.3 * inch))
+        
+        # Payment details table
+        amount_ngn = transfer.get("amount_received", 0)
+        payment_date = transfer.get("created_at", datetime.now())
+        date_str = payment_date.strftime("%B %d, %Y at %I:%M %p") if hasattr(payment_date, 'strftime') else str(payment_date)
+        
+        payment_data = [
+            ["Amount", f"₦{amount_ngn:,.2f}"],
+            ["Date", date_str],
+            ["Payment Method", "Bank Transfer (NUBAN)"],
+            ["Transaction ID", transfer.get("id", "")[:12] + "..."],
+            ["Agreement ID", agreement["id"][:12] + "..."],
+        ]
+        
+        payment_table = Table(payment_data, colWidths=[2 * inch, 4 * inch])
+        payment_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, -1), BRAND_BG),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("TEXTCOLOR", (0, 0), (-1, -1), BRAND_SLATE),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [BRAND_BG, colors.white]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(payment_table)
+        elements.append(Spacer(1, 0.3 * inch))
+        
+        # Property information
+        elements.append(Paragraph("PROPERTY INFORMATION", heading_style))
+        elements.append(Paragraph(f"<b>Property:</b> {property_data['title'] if property_data else 'N/A'}", body_style))
+        elements.append(Paragraph(f"<b>Address:</b> {property_data.get('city', '') if property_data else ''}, {property_data.get('state', '') if property_data else ''}", body_style))
+        
+        lease_start = agreement.get("lease_start_date", "")
+        lease_end = agreement.get("lease_end_date", "")
+        elements.append(Paragraph(f"<b>Lease Period:</b> {lease_start} to {lease_end}", body_style))
+        elements.append(Spacer(1, 0.3 * inch))
+        
+        # Status badge
+        elements.append(Paragraph("PAYMENT STATUS", heading_style))
+        status_box = Table([[Paragraph("✓ PAYMENT CONFIRMED", ParagraphStyle(
+            'Status',
+            parent=styles['BodyText'],
+            fontSize=12,
+            textColor=colors.white,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        ))]], colWidths=[6 * inch])
+        status_box.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), BRAND_ORANGE),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 12),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+        ]))
+        elements.append(status_box)
+        elements.append(Spacer(1, 0.3 * inch))
+        
+        # Footer note
+        elements.append(Paragraph(
+            "This receipt is automatically generated by NuloAfrica. If you have any questions about this payment, please contact our support team at nuloafrica26@outlook.com",
+            ParagraphStyle(
+                'Footer',
+                parent=styles['BodyText'],
+                fontSize=8,
+                textColor=colors.HexColor('#64748B'),
+                alignment=TA_CENTER
+            )
+        ))
+        
+        # Build PDF
+        doc.build(elements)
+        pdf_buffer.seek(0)
+
+        # Upload to Supabase Storage
+        file_name = f"receipts/{agreement['id']}_receipt.pdf"
+
+        try:
+            storage_response = supabase_admin.storage.from_('ownership-docs').upload(
+                file=pdf_buffer.getvalue(),
+                path=file_name,
+                file_options={"content-type": "application/pdf"}
+            )
+            logger.info(f"✅ [AGREEMENTS] Receipt uploaded to ownership-docs/{file_name}")
+        except Exception as upload_error:
+            logger.warning(f"⚠️ [AGREEMENTS] Storage upload warning: {upload_error}")
+
+        # Generate public URL
+        try:
+            pdf_url = supabase_admin.storage.from_('ownership-docs').get_public_url(file_name)
+        except Exception as url_error:
+            logger.error(f"❌ [AGREEMENTS] Failed to build public URL: {url_error}")
+            return None
+
+        logger.info(f"✅ [AGREEMENTS] Receipt generated and stored for {agreement['id']}")
+        return pdf_url
+        
+    except Exception as e:
+        logger.error(f"❌ [AGREEMENTS] Receipt generation failed for {agreement['id']}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+
+def _draw_receipt_header_footer(canvas_obj: "canvas.Canvas", agreement: dict, recipient_type: str) -> None:
+    """Draw branded header and footer for receipt PDF."""
+    page_w, page_h = PAGE_WIDTH, PAGE_HEIGHT
+
+    # ── HEADER (Orange for NuloAfrica branding) ─────────────────────────────────────
+    canvas_obj.setFillColor(BRAND_ORANGE)
+    canvas_obj.rect(0, page_h - 0.45 * inch, page_w, 0.45 * inch, stroke=0, fill=1)
+
+    # White wordmark
+    gx = LEFT_MARGIN
+    gy = page_h - 0.40 * inch
+    canvas_obj.setFillColor(colors.white)
+    canvas_obj.setFont("Helvetica-Bold", 16)
+    canvas_obj.drawString(gx, gy + 0.07 * inch, "NuloAfrica")
+
+    # Right-aligned tagline
+    canvas_obj.setFont("Helvetica-Oblique", 9)
+    receipt_type = "Payment Receipt" if recipient_type == "tenant" else "Disbursement Receipt"
+    canvas_obj.drawRightString(page_w - RIGHT_MARGIN, gy + 0.10 * inch,
+                               f"{receipt_type} · Nigeria")
+
+    # Divider under header
+    canvas_obj.setStrokeColor(BRAND_SLATE)
+    canvas_obj.setLineWidth(0.6)
+    canvas_obj.line(LEFT_MARGIN, page_h - 0.55 * inch,
+                    page_w - RIGHT_MARGIN, page_h - 0.55 * inch)
+
+    # ── FOOTER ─────────────────────────────────────────────────────────────
+    canvas_obj.setStrokeColor(BRAND_SLATE_LIGHT)
+    canvas_obj.setLineWidth(0.4)
+    canvas_obj.line(LEFT_MARGIN, 0.70 * inch,
+                    page_w - RIGHT_MARGIN, 0.70 * inch)
+
+    # Left: brand line
+    canvas_obj.setFillColor(BRAND_SLATE)
+    canvas_obj.setFont("Helvetica-Bold", 8)
+    receipt_type = "Payment Receipt" if recipient_type == "tenant" else "Disbursement Receipt"
+    canvas_obj.drawString(LEFT_MARGIN, 0.50 * inch,
+                          f"NuloAfrica · {receipt_type}")
+    canvas_obj.setFont("Helvetica", 7)
+    canvas_obj.setFillColor(BRAND_SLATE_LIGHT)
+    canvas_obj.drawString(LEFT_MARGIN, 0.36 * inch,
+                          f"Agreement ID: {agreement.get('id', 'N/A')[:12]}...")
+
+    # Right: page number
+    canvas_obj.setFont("Helvetica", 8)
+    canvas_obj.setFillColor(BRAND_SLATE)
+    page_num = canvas_obj.getPageNumber()
+    canvas_obj.drawRightString(page_w - RIGHT_MARGIN, 0.50 * inch,
+                               f"Page {page_num}")

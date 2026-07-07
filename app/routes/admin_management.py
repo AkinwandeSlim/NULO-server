@@ -6,10 +6,13 @@ from app.database import supabase_admin
 from app.middleware.auth import get_current_admin
 from app.models.user import UserResponse
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel
+import asyncio
+import logging
 
 router = APIRouter(prefix="/admin", tags=["admin-management"])
+logger = logging.getLogger(__name__)
 
 class UserDeleteRequest(BaseModel):
     email: str
@@ -17,6 +20,15 @@ class UserDeleteRequest(BaseModel):
 class UserDeleteResponse(BaseModel):
     success: bool
     message: str
+
+class SimulatePayoutRequest(BaseModel):
+    merchant_tx_ref: str
+
+class SimulatePayoutResponse(BaseModel):
+    success: bool
+    message: str
+    transaction_id: Optional[str] = None
+    status: Optional[str] = None
 
 @router.delete("/users/delete-by-email", response_model=UserDeleteResponse)
 async def delete_user_by_email(
@@ -440,8 +452,89 @@ async def delete_admin_account(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ [ADMIN API] Error deleting admin account: {e}")
+        logger.error(f"[ADMIN API] Error deleting admin account: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete admin account"
+        )
+
+@router.post("/simulate-payout-webhook", response_model=SimulatePayoutResponse)
+async def simulate_payout_webhook(
+    request: SimulatePayoutRequest,
+    current_admin: UserResponse = Depends(get_current_admin)
+):
+    """
+    Simulate a payout_success webhook for demo/testing purposes.
+    
+    This allows testing the complete disbursement flow without waiting
+    for the actual Nomba webhook. It directly updates the transaction
+    status to 'released' and sets the released_at timestamp.
+    
+    Only admins can use this endpoint for demo purposes.
+    """
+    try:
+        merchant_tx_ref = request.merchant_tx_ref
+        logger.info(f"[ADMIN API] Simulating payout_success webhook for ref: {merchant_tx_ref}")
+        
+        # Find the transaction by merchant_tx_ref
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: supabase_admin
+                .table("transactions")
+                .select("id, status, amount, agreement_id")
+                .eq("nomba_transfer_ref", merchant_tx_ref)
+                .maybe_single()
+                .execute(),
+        )
+        
+        transaction = result.data
+        if not transaction:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Transaction with merchant_tx_ref '{merchant_tx_ref}' not found"
+            )
+        
+        # Check if already released
+        if transaction.get("status") == "released":
+            return SimulatePayoutResponse(
+                success=True,
+                message="Transaction already in released state",
+                transaction_id=transaction.get("id"),
+                status="released"
+            )
+        
+        # Update transaction to released
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: supabase_admin
+                .table("transactions")
+                .update({
+                    "status": "released",
+                    "released_at": now_iso,
+                    "nomba_transfer_id": f"simulated-{merchant_tx_ref[:8]}",
+                })
+                .eq("id", transaction.get("id"))
+                .execute(),
+        )
+        
+        logger.info(
+            f"[ADMIN API] Simulated payout_success | tx_id={transaction.get('id')} | "
+            f"ref={merchant_tx_ref} | amount={transaction.get('amount')}"
+        )
+        
+        return SimulatePayoutResponse(
+            success=True,
+            message="Payout webhook simulated successfully",
+            transaction_id=transaction.get("id"),
+            status="released"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ADMIN API] Error simulating payout webhook: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to simulate payout webhook: {str(e)}"
         )

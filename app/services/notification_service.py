@@ -1496,7 +1496,7 @@ class NotificationService:
                 title="Payment Initiated",
                 message=(
                     f"You have initiated payment of {amount_fmt} for '{property_title}'. "
-                    f"Complete your payment on Paystack to confirm your tenancy."
+                    f"Complete your payment on Paystack to confirm your tenancy."  # LEGACY: Paystack deprecated 2026-07-05
                 ),
                 link=f"/tenant/payments/callback?reference=pending&agreement_id={agreement_id}",
                 data={
@@ -2453,7 +2453,7 @@ def _html_payment_confirmed_tenant(
         + f'<p>Congratulations, <strong>{tenant_name}</strong>!</p>'
         + f'<p>Your payment for <strong>"{property_title}"</strong> has been received and confirmed. Your tenancy is now officially active.</p>'
         + '<div class="divider"></div>'
-        + f'<div class="badge success"><h3>&#10003; Payment Received</h3><p>{amount_fmt} confirmed via Paystack</p></div>'
+        + f'<div class="badge success"><h3>&#10003; Payment Received</h3><p>{amount_fmt} confirmed via Paystack</p></div>'  # LEGACY: Paystack deprecated 2026-07-05
         + '<div class="feat-item"><div class="feat-dot"></div><div><strong>Tenancy Active</strong><span>Your rental agreement is now active and the property is yours</span></div></div>'
         + '<div class="feat-item"><div class="feat-dot"></div><div><strong>Payment Receipt</strong><span>This email serves as your payment confirmation. Download your signed agreement from your dashboard.</span></div></div>'
         + '<div class="feat-item"><div class="feat-dot"></div><div><strong>Maintenance Requests</strong><span>You can now raise maintenance requests directly from your tenant dashboard</span></div></div>'
@@ -2475,7 +2475,7 @@ def _html_payment_confirmed_landlord(
         + f'<p>Hi <strong>{landlord_name}</strong>,</p>'
         + f'<p><strong>{tenant_name}</strong> has completed payment for <strong>"{property_title}"</strong>. The tenancy is now active and the property is occupied.</p>'
         + '<div class="divider"></div>'
-        + f'<div class="badge success"><h3>&#10003; {amount_fmt} Received</h3><p>Payment confirmed via Paystack</p></div>'
+        + f'<div class="badge success"><h3>&#10003; {amount_fmt} Received</h3><p>Payment confirmed via Paystack</p></div>'  # LEGACY: Paystack deprecated 2026-07-05
         + f'<div class="feat-item"><div class="feat-dot"></div><div><strong>Tenant</strong><span>{tenant_name}</span></div></div>'
         + f'<div class="feat-item"><div class="feat-dot"></div><div><strong>Amount</strong><span>{amount_fmt}</span></div></div>'
         + '<div class="feat-item"><div class="feat-dot"></div><div><strong>Property Status</strong><span>Updated to Occupied on the marketplace</span></div></div>'
@@ -2528,5 +2528,68 @@ def _html_maintenance_updated(
         + f'<div class="box"><strong>Update</strong><p>The landlord has updated the status of your maintenance request.</p></div>'
         + '<p>Log in to view the full details or provide feedback.</p>'
         + f'<div class="btns"><a href="{base_url}/tenant/maintenance" class="btn orange">View Maintenance Requests &rarr;</a></div>'
+        + _foot(support_email)
+    )
+
+
+# ── RECEIPT TEMPLATE ───────────────────────────────────────────────────────────────
+
+def _html_payment_receipt(
+    recipient_name,
+    recipient_type,  # "tenant" or "landlord"
+    property_title,
+    property_address,
+    amount_ngn,
+    payment_date,
+    payment_method,
+    transaction_id,
+    agreement_id,
+    lease_period,
+    support_email,
+):
+    """
+    Generate a payment receipt HTML matching NuloAfrica email branding.
+    
+    Used for both tenant receipts (proof of payment) and landlord receipts (proof of receipt).
+    """
+    amount_fmt = f"₦{amount_ngn:,.2f}"
+    date_fmt = payment_date.strftime("%B %d, %Y at %I:%M %p") if hasattr(payment_date, 'strftime') else payment_date
+    
+    recipient_label = "Tenant" if recipient_type == "tenant" else "Landlord"
+    icon = "&#128179;"  # Receipt emoji
+    
+    return (
+        _open("green", f"{icon} Payment Receipt", f"{recipient_label} Copy")
+        + f'<p>Hi <strong>{recipient_name}</strong>,</p>'
+        + '<p>This receipt confirms your payment transaction. Please save this for your records.</p>'
+        + '<div class="divider"></div>'
+        
+        # Payment Details Table
+        + '<div class="box"><strong>Payment Details</strong>'
+        + f'<table class="detail">'
+        + f'<tr><td>Amount</td><td style="font-weight:700;font-size:16px;color:#16A34A">{amount_fmt}</td></tr>'
+        + f'<tr><td>Date</td><td>{date_fmt}</td></tr>'
+        + f'<tr><td>Payment Method</td><td>{payment_method}</td></tr>'
+        + f'<tr><td>Transaction ID</td><td style="font-family:monospace;font-size:12px">{transaction_id}</td></tr>'
+        + f'<tr><td>Agreement ID</td><td style="font-family:monospace;font-size:12px">{agreement_id[:12]}...</td></tr>'
+        + '</table></div>'
+        
+        # Property Details
+        + '<div class="divider"></div>'
+        + '<div class="box"><strong>Property Information</strong>'
+        + f'<p><strong>Property:</strong> {property_title}</p>'
+        + f'<p><strong>Address:</strong> {property_address}</p>'
+        + f'<p><strong>Lease Period:</strong> {lease_period}</p>'
+        + '</div>'
+        
+        # Status Badge
+        + '<div class="badge success"><h3>&#10003; Payment Confirmed</h3><p>This payment has been verified and recorded</p></div>'
+        
+        # Footer Note
+        + '<p style="margin-top:16px;font-size:12px;color:#64748B">'
+        + 'This receipt is automatically generated by NuloAfrica. '
+        + 'If you have any questions about this payment, please contact our support team.'
+        + '</p>'
+        
         + _foot(support_email)
     )

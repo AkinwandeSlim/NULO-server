@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import logging
@@ -113,6 +114,16 @@ class NombaClient:
         self._expires_at = 0.0
         self._lock = asyncio.Lock()
 
+    async def _async_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Run a synchronous requests.* call in a thread-pool executor so it does
+        not block the asyncio event loop.  Drop-in replacement for
+        requests.get() / requests.post() inside async methods.
+        """
+        loop = asyncio.get_event_loop()
+        fn = functools.partial(getattr(requests, method), url, **kwargs)
+        return await loop.run_in_executor(None, fn)
+
     async def _issue_token(self):
         """
         Issue a brand-new token using client credentials.
@@ -121,7 +132,8 @@ class NombaClient:
         Always called under self._lock.
         Docs: POST /v1/auth/token/issue
         """
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             f"{self.base_url}/auth/token/issue",
             headers={
                 "Content-Type": "application/json",
@@ -161,7 +173,8 @@ class NombaClient:
             await self._issue_token()
             return
 
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             f"{self.base_url}/auth/token/refresh",
             headers={
                 "Authorization": f"Bearer {self._token}",
@@ -282,7 +295,8 @@ class NombaClient:
 
         headers = await self._headers()
         # No sub-account in URL. Header is parent. Body is the two fields.
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             f"{self.base_url}/accounts/virtual",
             headers=headers,
             json=payload,
@@ -372,7 +386,8 @@ class NombaClient:
 
         headers = await self._headers()
         # Sub-account goes in the URL path; parent stays in the auth header.
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             f"{self.base_url}/accounts/virtual/{sub_account_id}",
             headers=headers,
             json=payload,
@@ -430,7 +445,8 @@ class NombaClient:
         Raises NombaAPIError on any other failure.
         """
         headers = await self._headers()
-        resp = requests.get(
+        resp = await self._async_request(
+            "get",
             f"{self.base_url}/accounts/virtual/{account_ref}",
             headers=headers,
             timeout=15,
@@ -561,16 +577,29 @@ class NombaClient:
         ALWAYS call this before transfer_to_bank() -- it confirms the account
         exists and returns the verified account holder name.
 
-        Endpoint: POST /v1/transfers/bank/lookup
+        Endpoint: POST /v1/transfers/bank/lookup (sandbox) -- v2 (live)
         Docs: https://developer.nomba.com/docs/products/transfers/bank-account-lookup
+
+        LIVE FINDING (2026-07-06): The documented v1 path
+        (https://api.nomba.com/v1/transfers/bank/lookup) now returns 404 on the
+        live API. The transfers product family was migrated to v2 (see
+        transfer_to_bank() below, which already uses /v2/transfers/bank). Mirror
+        that for live lookups. Sandbox still serves v1, so keep v1 there to
+        avoid a sandbox regression -- only go v2 when NOMBA_ENV=live.
 
         Returns: { "accountNumber": "...", "accountName": "M.A Animashaun" }
         Store the returned accountName -- pass it back into transfer_to_bank()
         rather than using user-supplied name.
         """
         headers = await self._headers()
-        resp = requests.post(
-            f"{self.base_url}/transfers/bank/lookup",
+        if os.environ.get("NOMBA_ENV", "test") == "live":
+            # base_url ends with /v1; strip it and re-append /v2 (matches transfer_to_bank).
+            lookup_url = f"{self.base_url.rsplit('/v1', 1)[0]}/v2/transfers/bank/lookup"
+        else:
+            lookup_url = f"{self.base_url}/transfers/bank/lookup"
+        resp = await self._async_request(
+            "post",
+            lookup_url,
             headers=headers,
             json={
                 "accountNumber": account_number,
@@ -638,7 +667,8 @@ class NombaClient:
         transfer_url = f"{self.base_url.rsplit('/v1', 1)[0]}/v2/transfers/bank"
 
         headers = await self._headers()
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             transfer_url,
             headers=headers,
             json={
@@ -749,7 +779,8 @@ class NombaClient:
         )
 
         headers = await self._headers()
-        resp = requests.post(
+        resp = await self._async_request(
+            "post",
             transfer_url,
             headers=headers,
             json={
@@ -937,6 +968,280 @@ class NombaClient:
         if body.get("code") != "00":
             raise NombaAPIError(f"Failed to get banks list: {body.get('description')}")
         return body["data"]
+
+    async def fetch_account_transactions(
+        self,
+        date_from: str = None,
+        date_to: str = None,
+        limit: int = 50,
+        page: int = 1,
+    ) -> dict:
+        """
+        Fetch all transactions on the sub-account (NuloAfrica business account).
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/transactions/accounts/{subAccountId}
+        - Query params: dateFrom, dateTo (ISO format), limit, page (pagination)
+        - Returns paginated list of transactions with amount, status, type, etc.
+        
+        :param date_from: ISO datetime string (e.g., "2023-01-01T00:00:00")
+        :param date_to: ISO datetime string (e.g., "2025-01-01T00:00:00")
+        :param limit: Number of records per page (default 50)
+        :param page: Page number (default 1)
+        :return: { "code": "00", "data": { "content": [...], "pageable": {...} } }
+        """
+        if not self.sub_account_id:
+            raise NombaAPIError("NOMBA_SUB_ACCOUNT_ID is not set; cannot fetch sub-account transactions")
+        
+        headers = await self._headers()
+        params = {"limit": limit, "page": page}
+        if date_from:
+            params["dateFrom"] = date_from
+        if date_to:
+            params["dateTo"] = date_to
+        
+        resp = requests.get(
+            f"{self.base_url}/transactions/accounts/{self.sub_account_id}",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_account_transactions | sub_account=%s | dateFrom=%s | dateTo=%s | limit=%s | status=%s",
+            self.sub_account_id, date_from, date_to, limit, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch account transactions: {body.get('description')}")
+        return body.get("data", {})
+
+    async def fetch_virtual_account_transactions(
+        self,
+        virtual_account: str,
+        date_from: str = None,
+        date_to: str = None,
+        limit: int = 50,
+        page: int = 1,
+    ) -> dict:
+        """
+        Fetch transactions for a specific virtual account (NUBAN).
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/transactions/virtual
+        - Query params: virtual_account (required), dateFrom, dateTo, limit, page
+        - Returns paginated list of transactions for that VA
+        
+        :param virtual_account: The virtual account number (NUBAN)
+        :param date_from: ISO datetime string (e.g., "2025-06-24")
+        :param date_to: ISO datetime string (e.g., "2025-06-25")
+        :param limit: Number of records per page (default 50)
+        :param page: Page number (default 1)
+        :return: { "code": "00", "data": { "content": [...], "pageable": {...} } }
+        """
+        if not virtual_account:
+            raise NombaAPIError("virtual_account is required")
+        
+        headers = await self._headers()
+        params = {"virtual_account": virtual_account, "limit": limit, "page": page}
+        if date_from:
+            params["dateFrom"] = date_from
+        if date_to:
+            params["dateTo"] = date_to
+        
+        resp = requests.get(
+            f"{self.base_url}/transactions/virtual",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_virtual_account_transactions | virtual_account=%s | dateFrom=%s | dateTo=%s | status=%s",
+            virtual_account, date_from, date_to, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch VA transactions: {body.get('description')}")
+        return body.get("data", {})
+
+    async def fetch_bank_transactions(
+        self,
+        limit: int = 50,
+        page: int = 1,
+    ) -> dict:
+        """
+        Fetch credit/debit transactions on the sub-account (NuloAfrica business account).
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/transactions/bank/{subAccountId}
+        - Query params: limit, page (pagination)
+        - Returns paginated list of bank transactions
+        
+        :param limit: Number of records per page (default 50)
+        :param page: Page number (default 1)
+        :return: { "code": "00", "data": { "content": [...], "pageable": {...} } }
+        """
+        if not self.sub_account_id:
+            raise NombaAPIError("NOMBA_SUB_ACCOUNT_ID is not set; cannot fetch sub-account bank transactions")
+        
+        headers = await self._headers()
+        params = {"limit": limit, "page": page}
+        
+        resp = requests.get(
+            f"{self.base_url}/transactions/bank/{self.sub_account_id}",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_bank_transactions | sub_account=%s | limit=%s | page=%s | status=%s",
+            self.sub_account_id, limit, page, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch bank transactions: {body.get('description')}")
+        return body.get("data", {})
+
+    async def fetch_sub_account_details(
+        self,
+        sub_account_id: str = None,
+        account_ref: str = None,
+    ) -> dict:
+        """
+        Fetch details of a sub-account.
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/accounts/sub-account-details
+        - Query params: subAccountId OR accountRef (one is required)
+        - Returns: account details, status, type, linked banks
+        
+        :param sub_account_id: The sub account ID (UUID)
+        :param account_ref: The unique reference passed when creating the sub account
+        :return: { "code": "00", "data": { "accountId", "accountHolderId", "accountRef", "status", "type", "accountName", "currency", "banks": [...] } }
+        """
+        if not sub_account_id and not account_ref:
+            raise NombaAPIError("Either sub_account_id or account_ref is required")
+        
+        headers = await self._headers()
+        params = {}
+        if sub_account_id:
+            params["subAccountId"] = sub_account_id
+        if account_ref:
+            params["accountRef"] = account_ref
+        
+        resp = requests.get(
+            f"{self.base_url}/accounts/sub-account-details",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_sub_account_details | sub_account_id=%s | account_ref=%s | status=%s",
+            sub_account_id, account_ref, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch sub-account details: {body.get('description')}")
+        return body.get("data", {})
+
+    async def fetch_sub_account_balance(self, sub_account_id: str = None) -> dict:
+        """
+        Fetch the balance of a sub-account.
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/accounts/{subAccountId}/balance
+        - Path param: subAccountId (required)
+        - Returns: amount, currency, timeCreated
+        
+        :param sub_account_id: The sub account ID (UUID). Defaults to self.sub_account_id if not provided.
+        :return: { "code": "00", "data": { "amount": "281946.0", "currency": "NGN", "timeCreated": "..." } }
+        """
+        target_sub_account_id = sub_account_id or self.sub_account_id
+        if not target_sub_account_id:
+            raise NombaAPIError("sub_account_id is required (either as parameter or via NOMBA_SUB_ACCOUNT_ID)")
+        
+        headers = await self._headers()
+        
+        resp = requests.get(
+            f"{self.base_url}/accounts/{target_sub_account_id}/balance",
+            headers=headers,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_sub_account_balance | sub_account_id=%s | status=%s",
+            target_sub_account_id, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch sub-account balance: {body.get('description')}")
+        return body.get("data", {})
+
+    async def fetch_sub_account_terminals(
+        self,
+        sub_account_id: str = None,
+        limit: int = 50,
+        cursor: str = None,
+        terminal_id: str = None,
+        terminal_label: str = None,
+        merchant_name: str = None,
+    ) -> dict:
+        """
+        Fetch terminals assigned to a sub-account.
+        PER LIVE NOMBA DOCS:
+        - Endpoint: GET /v1/accounts/{accountId}/terminals
+        - Path param: accountId (sub-account ID)
+        - Query params: limit, cursor, terminalId, terminalLabel, merchantName (all optional)
+        - Returns: paginated list of terminals with cursor
+        
+        :param sub_account_id: The sub account ID (UUID). Defaults to self.sub_account_id if not provided.
+        :param limit: Page size (default 50)
+        :param cursor: Pagination cursor from previous response
+        :param terminal_id: Filter by terminal ID
+        :param terminal_label: Filter by terminal label
+        :param merchant_name: Filter by merchant name
+        :return: { "code": "00", "data": { "results": [...], "cursor": "..." } }
+        """
+        target_sub_account_id = sub_account_id or self.sub_account_id
+        if not target_sub_account_id:
+            raise NombaAPIError("sub_account_id is required (either as parameter or via NOMBA_SUB_ACCOUNT_ID)")
+        
+        headers = await self._headers()
+        params = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if terminal_id:
+            params["terminalId"] = terminal_id
+        if terminal_label:
+            params["terminalLabel"] = terminal_label
+        if merchant_name:
+            params["merchantName"] = merchant_name
+        
+        resp = requests.get(
+            f"{self.base_url}/accounts/{target_sub_account_id}/terminals",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        
+        logger.info(
+            "fetch_sub_account_terminals | sub_account_id=%s | limit=%s | status=%s",
+            target_sub_account_id, limit, resp.status_code,
+        )
+        
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != "00":
+            raise NombaAPIError(f"Failed to fetch sub-account terminals: {body.get('description')}")
+        return body.get("data", {})
 
 
 # Module-level singleton -- import this in your routers

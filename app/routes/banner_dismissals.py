@@ -127,16 +127,39 @@ async def list_dismissals(current_user: dict = Depends(get_current_user)):
 
     try:
         # Opportunistic cleanup of expired dismissals for this user.
-        sb.rpc("banner_dismissals_cleanup_expired").execute()
-
-        result = (
-            sb.table("banner_dismissals")
-            .select("banner_key, banner_type, status_hash, dismissed_at, expires_at")
-            .eq("user_id", user["id"])
-            .execute()
-        )
+        # This RPC is OPTIONAL — if the banner_dismissals migration
+        # (database/fix_banner_dismissals.sql) hasn't been applied, or the
+        # RPC/table is absent, we must NOT let that break listing. Swallow
+        # the error so the endpoint degrades to "no persisted dismissals"
+        # instead of 500-ing (which makes the frontend fail-open and re-show
+        # every previously-dismissed banner).
+        try:
+            sb.rpc("banner_dismissals_cleanup_expired").execute()
+        except Exception as cleanup_err:  # noqa: BLE001
+            logger.warning(
+                "Optional banner_dismissals_cleanup_expired RPC skipped "
+                "(migration not applied?): %s", cleanup_err
+            )
 
         items: List[BannerDismissalItem] = []
+        try:
+            result = (
+                sb.table("banner_dismissals")
+                .select("banner_key, banner_type, status_hash, dismissed_at, expires_at")
+                .eq("user_id", user["id"])
+                .execute()
+            )
+        except Exception as query_err:  # noqa: BLE001
+            # Table may not exist yet (migration not applied). Degrade to
+            # "no persisted dismissals" instead of 500 so the frontend keeps
+            # working. Banners simply won't persist server-side until the
+            # migration is run.
+            logger.warning(
+                "banner_dismissals table read skipped (migration not applied?): %s",
+                query_err,
+            )
+            return BannerDismissalListResponse(dismissals=items, count=0)
+
         for row in (result.data or []):
             items.append(
                 BannerDismissalItem(

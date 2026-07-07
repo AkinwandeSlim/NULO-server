@@ -7,8 +7,9 @@
 
 import asyncio
 import logging
+import os
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
@@ -601,6 +602,58 @@ async def _reconcile_payment(
             .execute(),
     )
 
+    # Update agreement status to ACTIVE when payment is fully received
+    if new_status == "FULL_PAYMENT" or new_status == "RECONCILED":
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: supabase_admin
+                    .table("agreements")
+                    .update({
+                        "status": "ACTIVE",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    .eq("id", agreement["id"])
+                    .in_("status", ["SIGNED", "ACTIVE"])
+                    .execute(),
+            )
+            logger.info(
+                "Updated agreement status to ACTIVE | agreement=%s | reconciliation_status=%s",
+                agreement["id"], new_status,
+            )
+
+            # ── Sync property status → 'occupied' ────────────────────────────
+            # properties.status must match agreement reality so the landlord
+            # dashboard stat cards (occupied / vacant) are accurate.
+            property_id = agreement.get("property_id")
+            if property_id:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: supabase_admin
+                            .table("properties")
+                            .update({
+                                "status": "occupied",
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            .eq("id", property_id)
+                            .execute(),
+                    )
+                    logger.info(
+                        "Synced property status to occupied | property=%s | agreement=%s",
+                        property_id, agreement["id"],
+                    )
+                except Exception as prop_err:
+                    logger.warning(
+                        "Could not sync property status to occupied | property=%s | error=%s",
+                        property_id, prop_err,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Could not update agreement status to ACTIVE | agreement=%s | error=%s",
+                agreement["id"], e,
+            )
+
     # Update transfer record
     await asyncio.get_event_loop().run_in_executor(
         None,
@@ -669,6 +722,230 @@ async def _reconcile_payment(
     logger.info(
         "Reconciled | agreement=%s | received=%.2f | expected=%.2f | status=%s",
         agreement["id"], amount_received, expected, new_status,
+    )
+
+    # Auto-disbursement: if status is FULL_PAYMENT and account_ref ends with -SUB
+    if new_status == "FULL_PAYMENT" and account_ref.upper().endswith("-SUB"):
+        try:
+            await _auto_disburse_to_landlord(agreement["id"], transfer_row.get("id"), amount_received)
+        except Exception as exc:
+            logger.error(
+                "Auto-disbursement failed | agreement=%s | error=%s",
+                agreement["id"], exc,
+            )
+
+
+async def _auto_disburse_to_landlord(agreement_id: str, source_transfer_id: str, amount_received: float):
+    """Auto-disburse a FULL_PAYMENT to the landlord (if they have verified bank details)."""
+    from app.services.nomba_helpers import build_merchant_tx_ref, calculate_landlord_payout
+
+    logger.info(
+        "Starting auto-disbursement | agreement=%s | source_transfer=%s | amount=%.2f",
+        agreement_id, source_transfer_id, amount_received,
+    )
+
+    # 1. Fetch agreement
+    agreement_result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("agreements")
+            .select("id, landlord_id, tenant_id, platform_fee, expected_payment_amount")
+            .eq("id", agreement_id)
+            .maybe_single()
+            .execute(),
+    )
+    agreement = (
+        agreement_result
+        if isinstance(agreement_result, dict)
+        else (agreement_result.data if agreement_result else None)
+    )
+    if not agreement:
+        logger.warning("Auto-disburse: Agreement not found | agreement=%s", agreement_id)
+        return
+
+    # 2. Fetch source transfer
+    transfer_result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("virtual_account_transfers")
+            .select("id, amount_received, reconciliation_result, agreement_id, currency, account_ref")
+            .eq("id", source_transfer_id)
+            .maybe_single()
+            .execute(),
+    )
+    transfer = (
+        transfer_result
+        if isinstance(transfer_result, dict)
+        else (transfer_result.data if transfer_result else None)
+    )
+    if not transfer:
+        logger.warning("Auto-disburse: Source transfer not found | id=%s", source_transfer_id)
+        return
+
+    # 3. Check idempotency: already disbursed?
+    existing_result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("transactions")
+            .select("id, nomba_transfer_ref, status, amount")
+            .eq("source_transfer_id", source_transfer_id)
+            .in_("transaction_type", ["nomba_disbursement"])
+            .execute(),
+    )
+    if existing_result.data:
+        logger.info(
+            "Auto-disburse: Already processed | agreement=%s | source_transfer=%s",
+            agreement_id, source_transfer_id,
+        )
+        return
+
+    # 4. Fetch landlord bank details
+    landlord_result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("landlord_profiles")
+            .select("id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at")
+            .eq("id", agreement["landlord_id"])
+            .maybe_single()
+            .execute(),
+    )
+    landlord = (
+        landlord_result
+        if isinstance(landlord_result, dict)
+        else (landlord_result.data if landlord_result else None)
+    )
+    if not landlord or not landlord.get("bank_verified_at"):
+        logger.info(
+            "Auto-disburse: No verified bank details for landlord | agreement=%s | landlord=%s",
+            agreement_id, agreement["landlord_id"],
+        )
+        return
+    for field in ("bank_account_number", "bank_code", "account_name"):
+        if not landlord.get(field):
+            logger.info(
+                "Auto-disburse: Incomplete bank details for landlord | agreement=%s | missing=%s",
+                agreement_id, field,
+            )
+            return
+
+    # 5. Calculate payout amount
+    platform_fee = float(agreement.get("platform_fee") or 0)
+    payout_amount = calculate_landlord_payout(amount_received, platform_fee)
+    if payout_amount <= 0:
+        logger.warning(
+            "Auto-disburse: Payout amount is 0 | agreement=%s | received=%.2f | fee=%.2f",
+            agreement_id, amount_received, platform_fee,
+        )
+        return
+
+    # 6. Generate idempotency key
+    merchant_tx_ref = build_merchant_tx_ref(source_transfer_id, 0)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 7. INSERT transactions row FIRST
+    insert_result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("transactions")
+            .insert({
+                "agreement_id": agreement_id,
+                "tenant_id": agreement["tenant_id"],
+                "landlord_id": agreement["landlord_id"],
+                "property_id": None,
+                "application_id": None,
+                "amount": payout_amount,
+                "currency": transfer.get("currency", "NGN"),
+                "transaction_type": "nomba_disbursement",
+                "status": "pending",
+                "payment_gateway": "nomba",
+                "held_at": now,
+                "released_at": None,
+                "nomba_transfer_ref": merchant_tx_ref,
+                "nomba_transfer_id": None,
+                "source_transfer_id": source_transfer_id,
+                "notes": f"payout={payout_amount} status=auto_disburse_initial_pending",
+            })
+            .execute(),
+    )
+    tx_row = insert_result.data[0] if insert_result.data else {}
+
+    # 8. Call Nomba
+    account_ref = transfer.get("account_ref") or ""
+    is_sub_account_va = account_ref.upper().endswith("-SUB")
+    sub_account_id = os.environ.get("NOMBA_SUB_ACCOUNT_ID") if is_sub_account_va else None
+
+    try:
+        if is_sub_account_va:
+            if not sub_account_id:
+                raise NombaAPIError(
+                    "Auto-disburse: Source transfer is from a sub-account VA but NOMBA_SUB_ACCOUNT_ID is not configured"
+                )
+            logger.info(
+                "Auto-disbursement: Calling Nomba sub-account transfer | sub=%s | ref=%s",
+                sub_account_id, merchant_tx_ref,
+            )
+            nomba_data = await nomba_client.transfer_to_bank_from_subaccount(
+                sub_account_id=sub_account_id,
+                amount_naira=payout_amount,
+                account_number=landlord["bank_account_number"],
+                account_name=landlord["account_name"],
+                bank_code=landlord["bank_code"],
+                merchant_tx_ref=merchant_tx_ref,
+                narration=f"Auto-disbursement agreement={agreement_id[:8]}",
+            )
+        else:
+            logger.info(
+                "Auto-disbursement: Calling Nomba parent transfer | ref=%s",
+                merchant_tx_ref,
+            )
+            nomba_data = await nomba_client.transfer_to_bank(
+                amount_naira=payout_amount,
+                account_number=landlord["bank_account_number"],
+                account_name=landlord["account_name"],
+                bank_code=landlord["bank_code"],
+                merchant_tx_ref=merchant_tx_ref,
+                narration=f"Auto-disbursement agreement={agreement_id[:8]}",
+            )
+    except NombaAPIError as exc:
+        logger.error(
+            "Auto-disbursement failed at Nomba call | agreement=%s | ref=%s | error=%s",
+            agreement_id, merchant_tx_ref, exc,
+        )
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: supabase_admin
+                .table("transactions")
+                .update({"status": "failed", "notes": f"Auto-disburse Nomba call failed: {exc}"})
+                .eq("id", tx_row["id"])
+                .execute(),
+        )
+        raise
+
+    # 9. Update transactions row
+    nomba_status = nomba_data.get("status", "PENDING").upper()
+    if nomba_status == "SUCCESS":
+        tx_status = "released"
+    elif nomba_status == "REFUND":
+        tx_status = "failed"
+    else:
+        tx_status = "pending"
+    await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("transactions")
+            .update({
+                "status": tx_status,
+                "nomba_transfer_id": nomba_data.get("id"),
+                "released_at": now if tx_status == "released" else None,
+                "notes": f"payout={payout_amount} status={nomba_status}",
+            })
+            .eq("id", tx_row["id"])
+            .execute(),
+    )
+
+    logger.info(
+        "Auto-disbursement completed | agreement=%s | ref=%s | amount=%.2f | status=%s",
+        agreement_id, merchant_tx_ref, payout_amount, tx_status,
     )
 
 

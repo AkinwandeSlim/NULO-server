@@ -17,6 +17,41 @@ from ..models.landlord_onboarding import (
     AdminReviewUpdate, AdminReviewResponse, AdminQueueResponse,
     DocumentProcessingJobCreate, DocumentProcessingJobResponse
 )
+
+
+# ✅ Whitelist of `landlord_profiles` columns that this onboarding flow is
+# allowed to write. Onboarding fields like `full_name`, `phone`,
+# `company_address`, `nin_document_url`, `guarantor_*`, `insurance_document_url`
+# live on the `landlord_onboarding` table (see the upsert at line ~842), NOT
+# on `landlord_profiles`. Pushing them into landlord_profiles raises
+# PGRST204 ("Could not find the 'full_name' column of 'landlord_profiles'").
+# This set is the source of truth for what `landlord_profiles` accepts.
+LANDLORD_PROFILES_WRITEABLE_COLUMNS = {
+    # Personal / business
+    "account_name", "account_type", "company_name", "date_of_birth",
+    # Bank
+    "bank_account_number", "bank_code", "bank_name", "bank_statement_url",
+    # Documents
+    "id_document_url", "selfie_photo_url", "nin",
+    # Identity
+    "bvn",
+    # Onboarding state flags + timestamps
+    "first_time_visit", "onboarding_started",
+    "profile_step_completed", "property_step_completed",
+    "payment_step_completed", "protection_step_completed",
+    "onboarding_completed_at", "updated_at",
+}
+
+
+def _filter_to_landlord_profiles_columns(data: dict) -> dict:
+    """Drop any keys not present on the landlord_profiles table.
+
+    Onboarding-specific fields (full_name, phone, guarantor_*, insurance_*,
+    company_address, nin_document_url) are intentionally dropped here — they
+    are persisted to landlord_onboarding via the upsert below, never to
+    landlord_profiles.
+    """
+    return {k: v for k, v in data.items() if k in LANDLORD_PROFILES_WRITEABLE_COLUMNS}
 from ..middleware.auth import get_current_user, get_current_admin
 from ..services.email_service import email_service
 from ..services.notification_service import notification_service
@@ -28,6 +63,71 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/onboarding", tags=["landlord-onboarding"])
+
+# Nigerian bank codes mapping for Nomba API
+NIGERIAN_BANK_CODES = {
+    "access bank": "044",
+    "access bank plc": "044",
+    "citibank": "023",
+    "citibank nigeria": "023",
+    "diamond bank": "063",  # Merged with Access Bank
+    "ecobank": "050",
+    "ecobank nigeria": "050",
+    "fidelity bank": "070",
+    "fidelity bank plc": "070",
+    "first bank": "011",
+    "first bank of nigeria": "011",
+    "first city monument bank": "214",
+    "fcmb": "214",
+    "guaranty trust bank": "058",
+    "gtbank": "058",
+    "gtco": "058",
+    "heritage bank": "030",
+    "jaiz bank": "301",
+    "keystone bank": "082",
+    "kuda bank": "50211",
+    "polaris bank": "076",
+    "providus bank": "101",
+    "providus": "101",
+    "rand merchant bank": "50201",
+    "stanbic ibtc": "221",
+    "stanbic ibtc bank": "221",
+    "standard chartered": "068",
+    "sterling bank": "232",
+    "suntrust bank": "100",
+    "titan trust bank": "102",
+    "union bank": "033",
+    "union bank of nigeria": "033",
+    "united bank for africa": "033",
+    "uba": "033",
+    "unity bank": "215",
+    "wema bank": "035",
+    "zenith bank": "057",
+    "zenith bank plc": "057",
+}
+
+def derive_bank_code(bank_name: str) -> Optional[str]:
+    """
+    Derive Nomba bank code from bank name.
+    Returns the bank code if found, None otherwise.
+    """
+    if not bank_name:
+        return None
+    
+    # Normalize bank name for lookup
+    normalized = bank_name.lower().strip()
+    
+    # Direct lookup
+    if normalized in NIGERIAN_BANK_CODES:
+        return NIGERIAN_BANK_CODES[normalized]
+    
+    # Partial match lookup
+    for bank, code in NIGERIAN_BANK_CODES.items():
+        if bank in normalized or normalized in bank:
+            return code
+    
+    # If not found, return None (will need manual lookup)
+    return None
 
 
 # ============================================================================
@@ -590,14 +690,49 @@ async def submit_complete_onboarding(
         # is incomplete, because the frontend validates all steps locally and
         # sends a complete onboarding payload at once.
 
-        # ── 1. Ensure landlord_profiles row exists ────────────────────────────
-        profile_check = supabase_admin.table("landlord_profiles").select("id").eq(
+        # ── 1. Ensure landlord_profiles row exists and copy all details from onboarding ─────────
+        # Bank verification moved to disbursement time to reduce onboarding friction
+        profile_check = supabase_admin.table("landlord_profiles").select("*").eq(
             "id", current_user["id"]
         ).execute()
 
+        # Extract all relevant fields from onboarding request
+        bank_account_number = request_data.get("account_number")
+        bank_name = request_data.get("bank_name")
+        account_name = request_data.get("account_name")
+        bank_code = request_data.get("bank_code") or derive_bank_code(bank_name)
+        
+        # Personal details
+        full_name = request_data.get("full_name")
+        phone = request_data.get("phone")
+        date_of_birth = request_data.get("date_of_birth")
+        
+        # Business details
+        landlord_type = request_data.get("landlord_type")
+        company_name = request_data.get("company_name")
+        company_address = request_data.get("company_address")
+        
+        # Verification documents
+        id_document_url = request_data.get("id_document_url")
+        selfie_url = request_data.get("selfie_url")
+        nin_document_url = request_data.get("nin_document_url")
+        bank_statement_url = request_data.get("bank_statement_url")
+        
+        # BVN
+        bvn = request_data.get("bvn")
+        
+        # Guarantor details
+        guarantor_name = request_data.get("guarantor_name")
+        guarantor_phone = request_data.get("guarantor_phone")
+        guarantor_address = request_data.get("guarantor_address")
+        guarantor_id_url = request_data.get("guarantor_id_url")
+        
+        # Insurance details
+        insurance_document_url = request_data.get("insurance_document_url")
+
         if not profile_check.data:
             print(f"🆕 [ONBOARDING/submit] Creating landlord_profiles for {current_user['id']}")
-            supabase_admin.table("landlord_profiles").insert({
+            profile_data = {
                 "id": current_user["id"],
                 "onboarding_started": True,
                 "first_time_visit": False,
@@ -607,10 +742,70 @@ async def submit_complete_onboarding(
                 "protection_step_completed": True,
                 "onboarding_completed_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
-            }).execute()
-            print(f"✅ [ONBOARDING/submit] landlord_profiles created")
+            }
+            # Add personal details
+            if full_name:
+                profile_data["full_name"] = full_name
+            if phone:
+                profile_data["phone"] = phone
+            if date_of_birth:
+                profile_data["date_of_birth"] = date_of_birth
+            
+            # Add business details
+            if landlord_type:
+                profile_data["account_type"] = landlord_type
+            if company_name:
+                profile_data["company_name"] = company_name
+            if company_address:
+                profile_data["company_address"] = company_address
+            
+            # Add bank details (verification happens during disbursement)
+            if bank_account_number:
+                profile_data["bank_account_number"] = bank_account_number
+            if bank_name:
+                profile_data["bank_name"] = bank_name
+            if account_name:
+                profile_data["account_name"] = account_name
+            if bank_code:
+                profile_data["bank_code"] = bank_code
+            if bank_statement_url:
+                profile_data["bank_statement_url"] = bank_statement_url
+            
+            # Add verification documents
+            if id_document_url:
+                profile_data["id_document_url"] = id_document_url
+            if selfie_url:
+                profile_data["selfie_photo_url"] = selfie_url
+            if nin_document_url:
+                profile_data["nin_document_url"] = nin_document_url
+            
+            # Add BVN
+            if bvn:
+                profile_data["bvn"] = bvn
+            
+            # Add guarantor details
+            if guarantor_name:
+                profile_data["guarantor_name"] = guarantor_name
+            if guarantor_phone:
+                profile_data["guarantor_phone"] = guarantor_phone
+            if guarantor_address:
+                profile_data["guarantor_address"] = guarantor_address
+            if guarantor_id_url:
+                profile_data["guarantor_id_url"] = guarantor_id_url
+            
+            # Add insurance details
+            if insurance_document_url:
+                profile_data["insurance_document_url"] = insurance_document_url
+            
+            # ✅ Filter to columns that actually exist on landlord_profiles.
+            # Onboarding-only fields (full_name, phone, guarantor_*, insurance_*,
+            # company_address, nin_document_url) live on landlord_onboarding
+            # and would raise PGRST204 if pushed here.
+            safe_profile_data = _filter_to_landlord_profiles_columns(profile_data)
+            supabase_admin.table("landlord_profiles").insert(safe_profile_data).execute()
+            print(f"✅ [ONBOARDING/submit] landlord_profiles created with all details")
         else:
-            supabase_admin.table("landlord_profiles").update({
+            profile_data = {
                 "first_time_visit": False,
                 "profile_step_completed": True,
                 "property_step_completed": True,
@@ -618,8 +813,71 @@ async def submit_complete_onboarding(
                 "protection_step_completed": True,
                 "onboarding_completed_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
-            }).eq("id", current_user["id"]).execute()
-            print(f"✅ [ONBOARDING/submit] landlord_profiles updated")
+            }
+            # Add personal details
+            if full_name:
+                profile_data["full_name"] = full_name
+            if phone:
+                profile_data["phone"] = phone
+            if date_of_birth:
+                profile_data["date_of_birth"] = date_of_birth
+            
+            # Add business details
+            if landlord_type:
+                profile_data["account_type"] = landlord_type
+            if company_name:
+                profile_data["company_name"] = company_name
+            if company_address:
+                profile_data["company_address"] = company_address
+            
+            # Add bank details (verification happens during disbursement)
+            if bank_account_number:
+                profile_data["bank_account_number"] = bank_account_number
+            if bank_name:
+                profile_data["bank_name"] = bank_name
+            if account_name:
+                profile_data["account_name"] = account_name
+            if bank_code:
+                profile_data["bank_code"] = bank_code
+            if bank_statement_url:
+                profile_data["bank_statement_url"] = bank_statement_url
+            
+            # Add verification documents
+            if id_document_url:
+                profile_data["id_document_url"] = id_document_url
+            if selfie_url:
+                profile_data["selfie_photo_url"] = selfie_url
+            if nin_document_url:
+                profile_data["nin_document_url"] = nin_document_url
+            
+            # Add BVN
+            if bvn:
+                profile_data["bvn"] = bvn
+            
+            # Add guarantor details
+            if guarantor_name:
+                profile_data["guarantor_name"] = guarantor_name
+            if guarantor_phone:
+                profile_data["guarantor_phone"] = guarantor_phone
+            if guarantor_address:
+                profile_data["guarantor_address"] = guarantor_address
+            if guarantor_id_url:
+                profile_data["guarantor_id_url"] = guarantor_id_url
+            
+            # Add insurance details
+            if insurance_document_url:
+                profile_data["insurance_document_url"] = insurance_document_url
+            
+            # ✅ Filter to columns that actually exist on landlord_profiles.
+            # Onboarding-only fields (full_name, phone, guarantor_*, insurance_*,
+            # company_address, nin_document_url) live on landlord_onboarding
+            # and would raise PGRST204 if pushed here.
+            safe_profile_data = _filter_to_landlord_profiles_columns(profile_data)
+            supabase_admin.table("landlord_profiles").update(safe_profile_data).eq("id", current_user["id"]).execute()
+            print(f"✅ [ONBOARDING/submit] landlord_profiles updated with all details")
+
+        # Bank verification is now performed during disbursement, not onboarding
+        # This reduces onboarding friction while ensuring proper Nomba verification
 
         # ── 2. Upsert landlord_onboarding record ──────────────────────────────
         onboarding_check = supabase_admin.table("landlord_onboarding").select("*").eq(

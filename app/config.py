@@ -46,11 +46,18 @@ class Settings(BaseSettings):
     # links land on the correct domain instead of localhost.
     FRONTEND_URL: str | None = None
     
-    # Paystack (Optional)
-    PAYSTACK_SECRET_KEY: str | None = None
-    PAYSTACK_PUBLIC_KEY: str | None = None
-    PAYSTACK_WEBHOOK_URL: str | None = None  # Local: https://abc123.ngrok.io, Cloud: https://nuloafrica.com
-    PAYSTACK_API_URL: str = "https://api.paystack.co"
+    # ---------------------------------------------------------------
+    # Paystack -- DEPRECATED for the hackathon (2026-07-05)
+    # Hackathon payment flow uses Nomba virtual accounts.
+    # These fields are kept as optional/None for backwards-compat with
+    # any local env that still has them set; the Paystack code path
+    # has been replaced by app/routes/payments.py (410 Gone shim) and
+    # app/routes/payments-backup.py (preserved for reference only).
+    # ---------------------------------------------------------------
+    PAYSTACK_SECRET_KEY: str | None = None   # DEPRECATED: see payments.py shim
+    PAYSTACK_PUBLIC_KEY: str | None = None   # DEPRECATED
+    PAYSTACK_WEBHOOK_URL: str | None = None  # DEPRECATED
+    PAYSTACK_API_URL: str = "https://api.paystack.co"  # DEPRECATED
     
     # Environment
     ENV: str = "local"  # local | development | production
@@ -75,6 +82,10 @@ class Settings(BaseSettings):
     # Step 3 (Property Information). When False, landlords can skip this step
     # without errors. Default: True for backward compatibility.
     ENABLE_PROPERTY_STEP: bool = True
+    
+    # DEMO_MODE: When True, skips actual Nomba bank transfers for testing
+    # with fictional bank accounts. Set to False in production for real transfers.
+    DEMO_MODE: bool = False
     
     @property
     def cors_origins(self) -> List[str]:

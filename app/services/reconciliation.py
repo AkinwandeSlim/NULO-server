@@ -35,40 +35,137 @@ class ReconciliationEngine:
         'MONTHLY': 1           # 1 day grace for monthly (modern tenants)
     }
     
+    # Number of payment periods per year by frequency
+    PAYMENT_PERIODS_PER_YEAR = {
+        'ANNUAL': 1,
+        'SEMI_ANNUAL': 2,
+        'QUARTERLY': 4,
+        'MONTHLY': 12
+    }
+    
+    @staticmethod
+    def calculate_per_payment_amount(
+        total_rent: int,
+        payment_frequency: str,
+        lease_duration_months: int
+    ) -> int:
+        """
+        Calculate the amount due per payment period based on total rent and frequency.
+        
+        Args:
+            total_rent: Total rent for the entire lease (in kobo)
+            payment_frequency: 'ANNUAL', 'SEMI_ANNUAL', 'QUARTERLY', 'MONTHLY'
+            lease_duration_months: Total lease duration in months
+        
+        Returns:
+            Amount due per payment period (in kobo)
+            
+        Example:
+            total_rent = 1,200,000 (₦1.2M)
+            payment_frequency = 'MONTHLY'
+            lease_duration_months = 12
+            Returns: 100,000 (₦100K per month)
+        """
+        if payment_frequency not in ReconciliationEngine.PAYMENT_PERIODS_PER_YEAR:
+            raise ValueError(
+                f"Invalid frequency: {payment_frequency}. "
+                f"Must be one of {list(ReconciliationEngine.PAYMENT_PERIODS_PER_YEAR.keys())}"
+            )
+        
+        periods_per_year = ReconciliationEngine.PAYMENT_PERIODS_PER_YEAR[payment_frequency]
+        total_periods = (lease_duration_months * periods_per_year) // 12
+        
+        if total_periods == 0:
+            total_periods = 1  # Fallback for edge cases
+        
+        return total_rent // total_periods
+    
+    @staticmethod
+    def calculate_cumulative_balance(
+        total_rent: int,
+        total_paid: int
+    ) -> Dict[str, Any]:
+        """
+        Calculate cumulative payment status and outstanding balance.
+        
+        Args:
+            total_rent: Total rent for the entire lease (in kobo)
+            total_paid: Total amount paid so far (in kobo)
+        
+        Returns:
+            {
+                "total_rent": 1200000,
+                "total_paid": 100000,
+                "outstanding_balance": 1100000,
+                "payment_percentage": 8.33,
+                "is_fully_paid": false
+            }
+        """
+        outstanding_balance = total_rent - total_paid
+        payment_percentage = (total_paid / total_rent * 100) if total_rent > 0 else 0
+        is_fully_paid = outstanding_balance <= 0
+        
+        return {
+            "total_rent": total_rent,
+            "total_paid": total_paid,
+            "outstanding_balance": max(0, outstanding_balance),
+            "payment_percentage": round(payment_percentage, 2),
+            "is_fully_paid": is_fully_paid
+        }
+    
     @staticmethod
     def reconcile(
         agreement_id: str,
-        expected_amount: int,
+        total_rent: int,
         received_amount: int,
         payment_frequency: str,
+        lease_duration_months: int,
         next_due_date: datetime,
+        cumulative_paid: int = 0,
         current_date: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
-        Reconcile a payment against expected amount
+        Reconcile a payment against expected per-payment amount (NOT total rent).
         
         Args:
             agreement_id: Agreement UUID
-            expected_amount: Expected payment amount in kobo
+            total_rent: Total rent for entire lease (in kobo)
             received_amount: Actual received amount in kobo
             payment_frequency: 'ANNUAL', 'SEMI_ANNUAL', 'QUARTERLY', 'MONTHLY'
+            lease_duration_months: Total lease duration in months
             next_due_date: When payment was due (datetime or date object)
+            cumulative_paid: Total amount paid so far (in kobo, for tracking balance)
             current_date: Current date (defaults to now)
         
         Returns:
             {
                 "agreement_id": "uuid",
                 "reconciliation_status": "FULL_PAYMENT|PARTIAL_PAYMENT|OVERPAYMENT|UNDERPAYMENT|PENDING",
+                "per_payment_amount": 100000,  # Amount due per period
                 "variance": -50000,  # negative = under, positive = over
                 "variance_percent": -3.33,
                 "grace_status": "EARLY|WITHIN_GRACE|AFTER_GRACE",
                 "matched": true,
                 "notes": "Payment within tolerance",
-                "grace_days": 7
+                "grace_days": 7,
+                "cumulative_balance": {
+                    "total_rent": 1200000,
+                    "total_paid": 100000,
+                    "outstanding_balance": 1100000,
+                    "payment_percentage": 8.33
+                }
             }
         
         Raises:
             ValueError: If frequency is invalid or amounts are negative
+        
+        Example:
+            total_rent = 1,200,000 (₦1.2M annual)
+            payment_frequency = 'MONTHLY'
+            lease_duration_months = 12
+            per_payment_amount = 100,000 (₦100K per month)
+            received_amount = 100,000
+            Result: FULL_PAYMENT (matched against per-payment, not total)
         """
         
         # Validate inputs
@@ -78,8 +175,13 @@ class ReconciliationEngine:
                 f"Must be one of {list(ReconciliationEngine.GRACE_DAYS.keys())}"
             )
         
-        if expected_amount < 0 or received_amount < 0:
+        if total_rent < 0 or received_amount < 0:
             raise ValueError("Amounts cannot be negative")
+        
+        # Calculate per-payment amount (THIS IS THE KEY FIX)
+        per_payment_amount = ReconciliationEngine.calculate_per_payment_amount(
+            total_rent, payment_frequency, lease_duration_months
+        )
         
         # Use current date if not provided
         if current_date is None:
@@ -105,10 +207,10 @@ class ReconciliationEngine:
         else:
             grace_status = "AFTER_GRACE"
         
-        # Calculate variance
-        variance = received_amount - expected_amount
+        # Calculate variance against PER-PAYMENT amount (not total rent)
+        variance = received_amount - per_payment_amount
         variance_percent = (
-            (variance / expected_amount * 100) if expected_amount > 0 else 0
+            (variance / per_payment_amount * 100) if per_payment_amount > 0 else 0
         )
         
         # Determine reconciliation status and matched flag
@@ -123,7 +225,7 @@ class ReconciliationEngine:
             matched = True
             notes = (
                 f"Payment matched within {ReconciliationEngine.TOLERANCE_PERCENT}% tolerance. "
-                f"Expected NGN {expected_amount:,}, received NGN {received_amount:,}"
+                f"Expected NGN {per_payment_amount:,}, received NGN {received_amount:,}"
             )
         
         elif variance < 0 and abs(variance_percent) > ReconciliationEngine.TOLERANCE_PERCENT:
@@ -133,7 +235,7 @@ class ReconciliationEngine:
             shortfall = abs(variance)
             notes = (
                 f"Underpayment of NGN {shortfall:,}. "
-                f"Expected NGN {expected_amount:,}, received NGN {received_amount:,}. "
+                f"Expected NGN {per_payment_amount:,}, received NGN {received_amount:,}. "
                 f"Shortfall: {abs(variance_percent):.2f}%"
             )
         
@@ -154,21 +256,31 @@ class ReconciliationEngine:
             matched = False
             notes = "Payment amount is unusually different from expected"
         
+        # Calculate cumulative balance
+        new_cumulative_paid = cumulative_paid + received_amount
+        cumulative_balance = ReconciliationEngine.calculate_cumulative_balance(
+            total_rent, new_cumulative_paid
+        )
+        
         return {
             "agreement_id": agreement_id,
             "reconciliation_status": status,
+            "per_payment_amount": per_payment_amount,
+            "total_rent": total_rent,
             "variance": variance,
             "variance_percent": round(variance_percent, 2),
             "grace_status": grace_status,
             "matched": matched,
             "notes": notes,
             "grace_days": grace_days,
-            "expected_amount": expected_amount,
+            "expected_amount": per_payment_amount,  # Changed to per-payment amount
             "received_amount": received_amount,
             "payment_frequency": payment_frequency,
+            "lease_duration_months": lease_duration_months,
             "due_date": next_due_date.isoformat(),
             "grace_until": grace_until_date.isoformat(),
-            "reconciled_at": datetime.utcnow().isoformat()
+            "reconciled_at": datetime.utcnow().isoformat(),
+            "cumulative_balance": cumulative_balance
         }
     
     @staticmethod

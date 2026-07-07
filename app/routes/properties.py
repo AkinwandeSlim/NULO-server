@@ -34,6 +34,79 @@ router = APIRouter(prefix="/properties")
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ============================================================================
+# VALIDATION HELPERS
+# ============================================================================
+
+# Allowed payment_frequency values per the DB check constraint
+# (properties_payment_frequency_check) in newupdateDB.csv line 1060.
+# Must stay in sync with docs/sql/migrations/001_add_payment_frequency_to_properties.sql:
+#   CHECK (payment_frequency IN ('MONTHLY', 'ANNUAL', 'SEMI_ANNUAL', 'QUARTERLY'))
+_VALID_PAYMENT_FREQUENCIES = ("MONTHLY", "QUARTERLY", "SEMI_ANNUAL", "ANNUAL")
+
+# Legacy alias map: maps older / UI-friendly values to the canonical DB values.
+# 'YEARLY' was used by the frontend before the DB values were aligned. We accept
+# it as an input and normalize it to 'ANNUAL' so older clients keep working.
+_LEGACY_FREQUENCY_ALIASES = {
+    "YEARLY": "ANNUAL",
+    "ANNUALLY": "ANNUAL",
+    "EVERY_12_MONTHS": "ANNUAL",
+    "SEMI-ANNUAL": "SEMI_ANNUAL",
+    "SEMIANNUAL": "SEMI_ANNUAL",
+    "EVERY_6_MONTHS": "SEMI_ANNUAL",
+    "BIANNUAL": "SEMI_ANNUAL",
+    "EVERY_3_MONTHS": "QUARTERLY",
+    "QUARTER": "QUARTERLY",
+}
+
+
+def _normalize_payment_frequency(value) -> str:
+    """
+    Coerce a payment_frequency input to one of the valid DB-allowed values.
+
+    Accepts:
+      - Canonical DB values: MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL
+      - Legacy aliases (mapped automatically): YEARLY -> ANNUAL, etc.
+
+    Falls back to MONTHLY for missing/empty/unknown input so existing rows
+    and partial submissions keep working. The DB will still reject any
+    bad value that slips through (check constraint), but this avoids
+    500-ing the entire create flow.
+    """
+    if value is None:
+        return "MONTHLY"
+    candidate = str(value).strip().upper()
+    if not candidate:
+        return "MONTHLY"
+    # Legacy alias -> canonical
+    if candidate in _LEGACY_FREQUENCY_ALIASES:
+        return _LEGACY_FREQUENCY_ALIASES[candidate]
+    if candidate in _VALID_PAYMENT_FREQUENCIES:
+        return candidate
+    return "MONTHLY"
+
+
+# ============================================================================
+# NUBAN AUTO-PROVISION HELPER (Stage 3 polish)
+# ============================================================================
+
+async def _auto_provision_nuban_for_property(property_id: str, landlord_id: str):
+    """
+    Background task placeholder for auto-provisioning NUBANs.
+
+    NOTE: NUBANs are for AGREEMENTS (signed leases between landlord + tenant),
+    not for properties themselves. This helper is kept for compatibility
+    but currently only logs a message. To provision a NUBAN, use the
+    /agreements/{agreement_id}/provision-nomba endpoint after creating
+    a signed agreement.
+    """
+    print(
+        f"🏦 [NUBAN-AUTO] Placeholder: Auto-provisioning NUBANs for properties "
+        f"is not supported. NUBANs are for signed agreements only. | "
+        f"property_id={property_id} | landlord_id={landlord_id}"
+    )
+
+
+# ============================================================================
 # IMAGE UPLOAD HELPER WITH TIMEOUT
 # ============================================================================
 
@@ -743,6 +816,7 @@ async def create_property(
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
     price: int = Form(...),
+    payment_frequency: str = Form("MONTHLY"),
     beds: int = Form(...),
     baths: int = Form(...),
     sqft: Optional[int] = Form(None),
@@ -754,6 +828,11 @@ async def create_property(
     utilities_included: Optional[bool] = Form(False),
     available_from: Optional[str] = Form(None),
     lease_duration: Optional[str] = Form("12 months"),
+    # Stage 3 polish: opt-in to auto-provision a Nomba NUBAN for this property
+    # right after creation. When "true", the route will call
+    # /provision-nomba for the new property id (fire-and-forget so a Nomba
+    # hiccup never blocks the property create flow).
+    generate_nuban: Optional[str] = Form("false"),
     images: List[UploadFile] = File([]),
     current_user: dict = Depends(get_current_landlord)
 ):
@@ -895,6 +974,7 @@ async def create_property(
             "latitude": latitude,
             "longitude": longitude,
             "price": price,
+            "payment_frequency": _normalize_payment_frequency(payment_frequency),
             "beds": beds,
             "baths": baths,
             "sqft": sqft,
@@ -938,7 +1018,25 @@ async def create_property(
             landlord_email=landlord_email,
             property_title=title,
         )
-        
+
+        # Stage 3 polish: opt-in to auto-provision a Nomba NUBAN for this
+        # property. Coerce the form value to a bool, then schedule a
+        # background task so a Nomba hiccup never blocks the create flow.
+        if isinstance(generate_nuban, str):
+            wants_nuban = generate_nuban.strip().lower() in ("true", "1", "yes", "on")
+        else:
+            wants_nuban = bool(generate_nuban)
+        if wants_nuban:
+            background_tasks.add_task(
+                _auto_provision_nuban_for_property,
+                property_id=created_property["id"],
+                landlord_id=landlord_id,
+            )
+            print(
+                f"🏦 [CREATE] NUBAN auto-provision scheduled | property_id="
+                f"{created_property['id']} | landlord_id={landlord_id}"
+            )
+
         return created_property
         
     except HTTPException as he:
@@ -1341,6 +1439,10 @@ async def update_property(
         lease_duration = property_data.get("lease_duration")
         if lease_duration is not None:
             update_data["lease_duration"] = lease_duration
+
+        payment_frequency = property_data.get("payment_frequency")
+        if payment_frequency is not None:
+            update_data["payment_frequency"] = _normalize_payment_frequency(payment_frequency)
 
         rules = property_data.get("rules")
         if rules is not None:

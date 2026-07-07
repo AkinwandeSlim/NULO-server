@@ -179,10 +179,20 @@ async def get_diagnostics():
     import os
     
     # Safe attribute access with defaults
-    twilio_sid = getattr(settings, 'TWILIO_ACCOUNT_SID', None)
     twilio_configured = bool(twilio_sid)
+    # Paystack key check is DEPRECATED for the hackathon (2026-07-05).
+    # The payments route is a 410 Gone shim; the live gateway is Nomba.
+    # We still surface the field name so the diagnostics payload schema
+    # is stable for any client dashboards, but it always reports False
+    # because Paystack is no longer the active payment provider.
     paystack_key = getattr(settings, 'PAYSTACK_SECRET_KEY', None)
-    paystack_configured = bool(paystack_key)
+    paystack_configured = False  # DEPRECATED: hackathon uses Nomba
+    # Nomba: surface sub-account / parent account presence as the new
+    # "is the payment gateway wired" signal. These come from
+    # app/services/nomba_client.NombaClient via the nomba router.
+    nomba_sub = os.environ.get("NOMBA_SUB_ACCOUNT_ID", "")
+    nomba_parent = os.environ.get("NOMBA_PARENT_ACCOUNT_ID", "")
+    nomba_configured = bool(nomba_sub and nomba_parent)
     
     return {
         "system": {
@@ -209,6 +219,9 @@ async def get_diagnostics():
         },
         "payments": {
             "paystack_configured": paystack_configured,
-            "status": "✅ Configured" if paystack_configured else "⏳ Not configured"
+            "paystack_status": "DEPRECATED -- hackathon uses Nomba",
+            "nomba_configured": nomba_configured,
+            "nomba_sub_account_configured": bool(nomba_sub),
+            "nomba_status": "Configured" if nomba_configured else "Not configured",
         }
     }

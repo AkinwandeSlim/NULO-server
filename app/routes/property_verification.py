@@ -54,9 +54,11 @@ async def get_pending_properties(
         offset = (page - 1) * limit
         
         # Query pending properties without nested select (FK relationship may not exist)
+        # Exclude soft-deleted properties so the admin queue mirrors marketplace visibility
         result = supabase_admin.table('properties')\
             .select('*', count='exact')\
             .eq('verification_status', 'pending')\
+            .is_('deleted_at', 'null')\
             .order('created_at', desc=True)\
             .range(offset, offset + limit)\
             .execute()
@@ -93,6 +95,7 @@ async def get_pending_properties(
         count_result = supabase_admin.table('properties')\
             .select('id', count='exact')\
             .eq('verification_status', 'pending')\
+            .is_('deleted_at', 'null')\
             .execute()
         
         logger.info(f"✅ [PROPERTIES] Found {len(result.data or [])} pending properties")
@@ -133,9 +136,11 @@ async def get_all_properties(
         offset = (page - 1) * limit
         
         # Query properties without nested select (FK relationship may not exist)
+        # Exclude soft-deleted properties so admin view mirrors marketplace visibility
         query = supabase_admin.table('properties')\
-            .select('*', count='exact')
-        
+            .select('*', count='exact')\
+            .is_('deleted_at', 'null')
+
         # Add filter if specified
         if verification_status:
             query = query.eq('verification_status', verification_status)
@@ -210,13 +215,14 @@ async def get_property_stats(
         user_email = current_user.get('email') if isinstance(current_user, dict) else getattr(current_user, 'email', 'Unknown')
         logger.info(f"🏠 [PROPERTIES] Admin {user_email} fetching property stats")
         
-        # Get all properties
+        # Get all non-deleted properties
         result = supabase_admin.table('properties')\
-            .select('id, verification_status, created_at')\
+            .select('id, verification_status, created_at, deleted_at')\
+            .is_('deleted_at', 'null')\
             .execute()
-        
+
         properties = result.data or []
-        
+
         # Count by status
         stats = {
             'total': len(properties),
@@ -487,4 +493,109 @@ async def bulk_property_action(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Bulk action failed: {str(e)}"
+        )
+
+
+# ============================================================================
+# DELETE ENDPOINT (admin)
+# ============================================================================
+
+@router.delete("/{property_id}")
+async def delete_property_admin(
+    property_id: str,
+    current_user: UserResponse = Depends(get_current_admin)
+) -> Dict[str, Any]:
+    """
+    Admin-initiated soft delete of a property listing.
+
+    Behavior:
+      • Sets deleted_at = now() (same soft-delete pattern as landlord flow)
+      • Blocks delete if the property has any ACTIVE or SIGNED agreements
+        to prevent orphaning in-flight tenant data
+      • Invalidates the landlord dashboard server cache so the deletion is
+        reflected on the next landlord overview request
+    """
+    try:
+        admin_id = current_user.get('id') if isinstance(current_user, dict) else getattr(current_user, 'id', None)
+        admin_email = current_user.get('email') if isinstance(current_user, dict) else getattr(current_user, 'email', 'Unknown')
+
+        logger.info(f"🏠 [PROPERTIES] Admin {admin_email} attempting to delete property {property_id}")
+
+        # 1. Verify the property exists and is not already deleted
+        prop_check = supabase_admin.table('properties')\
+            .select('id, title, landlord_id, deleted_at')\
+            .eq('id', property_id)\
+            .single()\
+            .execute()
+
+        if not prop_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Property {property_id} not found"
+            )
+
+        if prop_check.data.get('deleted_at'):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This property has already been deleted."
+            )
+
+        property_title = prop_check.data.get('title', 'Property')
+        landlord_id = prop_check.data.get('landlord_id')
+
+        # 2. Block delete if there are active or signed agreements referencing this property
+        active_agreements = supabase_admin.table('agreements')\
+            .select('id, status')\
+            .eq('property_id', property_id)\
+            .in_('status', ['ACTIVE', 'SIGNED'])\
+            .execute()
+
+        if active_agreements.data and len(active_agreements.data) > 0:
+            count = len(active_agreements.data)
+            logger.warning(
+                f"⚠️ [PROPERTIES] Blocked delete: property {property_id} has {count} active/signed agreement(s)"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot delete '{property_title}': it has {count} active/signed "
+                    f"agreement(s). Resolve the agreement(s) before deleting this property."
+                )
+            )
+
+        # 3. Soft delete — set deleted_at only (do NOT touch verification_status,
+        #    matching the landlord soft-delete pattern in properties.py)
+        now = datetime.now(timezone.utc).isoformat()
+        supabase_admin.table('properties')\
+            .update({'deleted_at': now})\
+            .eq('id', property_id)\
+            .execute()
+
+        # 4. Invalidate landlord dashboard server cache so the landlord
+        #    sees the property gone from their listings immediately
+        if landlord_id:
+            cache_key = f"dashboard_{landlord_id}"
+            _dashboard_cache.pop(cache_key, None)
+        for k in [k for k in list(_dashboard_cache.keys()) if k.startswith("dashboard_")]:
+            _dashboard_cache.pop(k, None)
+
+        logger.info(
+            f"✅ [PROPERTIES] Property {property_id} ('{property_title}') soft-deleted by admin {admin_email}"
+        )
+
+        return {
+            'success': True,
+            'message': f"Property '{property_title}' has been deleted. It is now hidden from the marketplace and the landlord's listings.",
+            'property_id': property_id,
+            'deleted_at': now
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"❌ [PROPERTIES] Failed to delete property {property_id}: {error_msg}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to delete property. Please try again."
         )

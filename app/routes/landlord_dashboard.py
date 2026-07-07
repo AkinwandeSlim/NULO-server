@@ -272,6 +272,11 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     #   - properties_vacant  = verification_status='approved' AND status='vacant'
     #                          (live inventory available to tenants)
     #   - properties_occupied = verification_status='approved' AND status='occupied'
+    #
+    # IMPORTANT: properties.status is the source of truth BUT may be stale for
+    # older agreements signed before the nomba webhook sync was added.
+    # We also fetch ACTIVE/SIGNED agreement property_ids as a reliable fallback
+    # and use whichever count is higher.
     try:
         properties_result = supabase_admin.table("properties") \
             .select("id, status, verification_status, view_count, price, deleted_at") \
@@ -281,20 +286,63 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         properties = properties_result.data or []
 
         stats["total_properties"] = len(properties)
+
+        # Build a set of property IDs with active agreements (reliable fallback)
+        active_agreement_property_ids: set = set()
+        try:
+            agr_result = supabase_admin.table("agreements") \
+                .select("property_id") \
+                .eq("landlord_id", landlord_id) \
+                .in_("status", ["ACTIVE", "SIGNED"]) \
+                .execute()
+            for agr in (agr_result.data or []):
+                pid = agr.get("property_id")
+                if pid:
+                    active_agreement_property_ids.add(pid)
+
+            # Backfill: sync properties.status→'occupied' for any that are still
+            # marked 'vacant' despite having an active agreement (stale data fix).
+            for prop in properties:
+                if (
+                    prop.get("id") in active_agreement_property_ids
+                    and prop.get("status") != "occupied"
+                    and prop.get("verification_status") == "approved"
+                    and not prop.get("deleted_at")
+                ):
+                    try:
+                        supabase_admin.table("properties") \
+                            .update({"status": "occupied"}) \
+                            .eq("id", prop["id"]) \
+                            .execute()
+                        prop["status"] = "occupied"  # update in-memory for counting below
+                        logger.info(
+                            "Backfilled property status to occupied | property=%s", prop["id"]
+                        )
+                    except Exception as bf_err:
+                        logger.warning(
+                            "Could not backfill property status | property=%s | error=%s",
+                            prop["id"], bf_err,
+                        )
+        except Exception as agr_err:
+            logger.warning("Could not fetch active agreements for occupancy backfill: %s", agr_err)
+
         for prop in properties:
             v_status = prop.get("verification_status", "pending")
             p_status = prop.get("status", "vacant")
             if v_status == "pending":
                 stats["properties_pending"] += 1
             elif v_status == "approved":
-                # Newly approved properties count as vacant by default --
-                # they don't get marked "occupied" until a tenant signs
-                # an agreement.
-                if p_status == "vacant":
+                # A property is occupied if its status is 'occupied' OR it has
+                # an active/signed agreement (handles any remaining stale rows).
+                is_occupied = (
+                    p_status == "occupied"
+                    or prop.get("id") in active_agreement_property_ids
+                )
+                if is_occupied:
+                    stats["properties_occupied"] += 1
+                else:
                     stats["properties_vacant"] += 1
                     stats["active_listings"] += 1
-                elif p_status == "occupied":
-                    stats["properties_occupied"] += 1
             elif v_status == "rejected":
                 # Track rejected properties separately so the overview can
                 # display them as a labelled badge -- the landlord needs
@@ -1073,3 +1121,54 @@ async def mark_notification_as_read(
     except Exception as e:
         logger.error(f"Error marking notification as read: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# STUB: Future Analytics Dashboard (Stage 3+)
+# ============================================================================
+# This endpoint is a placeholder for a dedicated analytics dashboard
+# (monthly_revenue_chart, occupancy_trend, payment_reliability_score, etc.).
+# It is intentionally lightweight -- the goal is to give the frontend a
+# stable contract so the analytics work can be slotted in later without
+# re-architecting. The shape will not change; the data will.
+#
+# To activate, replace the body of get_dashboard_analytics() with real
+# aggregations over agreements, virtual_account_transfers, and
+# transactions. The frontend integration lives at:
+#   client/lib/api/landlordDashboard.ts -> getAnalyticsSummary()
+
+@router.get("/dashboard/analytics")
+async def get_dashboard_analytics(
+    current_user=Depends(get_current_user),
+    period: str = Query("30d", description="Aggregation window: 7d / 30d / 90d / 1y"),
+):
+    """
+    STUB: Future analytics summary for landlord dashboards.
+
+    Returns a placeholder shape that mirrors what the real analytics
+    endpoint will produce, so client code can be written against a
+    stable contract today.
+    """
+    if current_user.get("user_type") != "landlord":
+        raise HTTPException(status_code=403, detail="Access denied. Landlord access required.")
+
+    return {
+        "placeholder": True,
+        "period": period,
+        "landlord_id": current_user["id"],
+        "data": {
+            "monthly_revenue_chart": None,
+            "occupancy_trend": None,
+            "payment_reliability_score": None,
+            "disbursement_summary": None,
+            "tenant_engagement": None,
+        },
+        "_todo": [
+            "Aggregate transactions by month for revenue chart",
+            "Compute occupancy rate from active agreements vs properties",
+            "Score tenant on-time payment history (0-100)",
+            "Sum disbursements by status (pending/released/failed)",
+            "Track tenant portal logins / payment confirmations",
+        ],
+    }
+
