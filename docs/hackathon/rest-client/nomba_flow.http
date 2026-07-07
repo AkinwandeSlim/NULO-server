@@ -1,0 +1,94 @@
+### 0. Health (no auth)
+GET http://localhost:8000/api/v1/health/nomba
+
+### 1. Provision virtual account  (tenant or landlord JWT)
+POST http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/provision-nomba
+Authorization: Bearer {{tenantJwt}}
+Content-Type: application/json
+
+{}
+
+### 2. Payment status BEFORE  (expect reconciliation_status = PENDING)
+GET http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/payment-status
+Authorization: Bearer {{tenantJwt}}
+
+### 3. Webhook FULL payment  (paste body from simulator full_payment)
+# Body MUST be the exact JSON the simulator printed for full_payment.
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: 96n8z+rBJ872dk0Ep1+xB/RZoShlwhBwJism6Jcn+Vc=
+nomba-timestamp: 2026-07-01T10:00:00Z
+
+### 4. Webhook REPLAY (idempotency -> already_processed)
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigFull}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/full_payment.json
+
+### 5. Webhook BAD signature -> 401
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: invalidsignature==
+nomba-timestamp: {{ts}}
+
+< ./payloads/full_payment.json
+
+### 6. Webhook UNDERPAYMENT
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigUnder}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/underpayment.json
+
+### 7. Webhook OVERPAYMENT
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigOver}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/overpayment.json
+
+### 8. Webhook MISDIRECTED (unknown agreement)
+POST http://localhost:8000/api/v1/webhooks/nomba/transfer
+Content-Type: application/json
+nomba-signature: {{sigMisdir}}
+nomba-timestamp: {{ts}}
+
+< ./payloads/misdirected.json
+
+
+# @name statusAfter
+
+### 9. Payment status AFTER  (expect FULL_PAYMENT; note transfer_history[0].id)
+GET http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/payment-status
+Authorization: Bearer {{tenantJwt}}
+
+### 10. Lookup + verify landlord bank  (landlord JWT)
+POST http://localhost:8000/api/v1/disbursements/lookup-bank
+Authorization: Bearer {{landlordJwt}}
+Content-Type: application/json
+
+{
+  "account_number": "0000000000",
+  "bank_code": "035"
+}
+
+
+# @name disburse
+
+### 11. Disburse to landlord  (source_transfer_id auto-pulled from request 9)
+POST http://localhost:8000/api/v1/agreements/8b565c14-79f7-4b0d-b84f-19cfbb2b18e8/disburse
+Authorization: Bearer {{landlordJwt}}
+Content-Type: application/json
+
+{
+  "source_transfer_id": "{{statusAfter.response.body.$.transfer_history[0].id}}",
+  "retry_count": 0
+}
+
+### 12. Disbursement status  (merchant_tx_ref auto-pulled from request 11)
+GET http://localhost:8000/api/v1/disbursements/{{disburse.response.body.$.merchant_tx_ref}}
+Authorization: Bearer {{landlordJwt}}
