@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     
     # CORS
-    ALLOWED_ORIGINS: str = "http://localhost:3000,https://nuloafrica.vercel.app"
+    ALLOWED_ORIGINS: str = "http://localhost:3000,https://nuloafrica.vercel.app,https://nuloafrica.com,https://www.nuloafrica.com"
 
     # Frontend URL used for Supabase auth email redirects (signup, password reset).
     # Falls back to the first allowed CORS origin if unset. Set this in production
