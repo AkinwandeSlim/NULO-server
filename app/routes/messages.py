@@ -20,6 +20,7 @@ Session 2026-03-12 fixes applied:
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -39,16 +40,28 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _db(fn):
+async def _db(fn, max_retries=2):
     """
     Run a synchronous Supabase call in the default executor so it does not
     block the async event loop (Architecture Rule 6).
+    Includes retry logic for transient connection errors.
 
     Usage:
         result = await _db(lambda: supabase_admin.table(...).execute())
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fn)
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return await loop.run_in_executor(None, fn)
+        except (httpx.RemoteProtocolError, httpx.ConnectError, OSError) as e:
+            if attempt == max_retries:
+                raise
+            print(f"[MESSAGES] Connection error on attempt {attempt + 1}/{max_retries + 1}, retrying: {type(e).__name__}")
+            await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+        except Exception:
+            # Non-connection errors should not be retried
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +320,12 @@ async def create_conversation(
     then send the opening message. Works for both tenant and landlord initiators.
 
     Idempotent: calling twice for the same (tenant, landlord, property) triplet
-    returns the existing conversation rather than creating a duplicate, thanks to
-    the UNIQUE(tenant_id, landlord_id, property_id) DB constraint.
+    returns the existing conversation rather than creating a duplicate.
+
+    FIX-UPSERT: replaced SELECT-then-INSERT (race-prone) with a true upsert:
+      INSERT ... ON CONFLICT (tenant_id, landlord_id, property_id) DO NOTHING
+    followed by a SELECT to pick up the existing row when a conflict is suppressed.
+    This eliminates the 23505 duplicate-key error under concurrent or rapid calls.
 
     FIX-5: All [DEBUG] prints removed.
     FIX-6: Role resolved via _resolve_user_role() -- single indexed users query.
@@ -343,33 +360,44 @@ async def create_conversation(
                 ),
             )
 
-        # Find-or-create conversation
-        existing = await _db(
+        # ── True upsert: INSERT ... ON CONFLICT DO NOTHING ─────────────────
+        # supabase-py's .upsert(..., on_conflict="col1,col2,col3", ignore_duplicates=True)
+        # maps to:  INSERT INTO conversations (...) VALUES (...)
+        #           ON CONFLICT (tenant_id, landlord_id, property_id) DO NOTHING
+        #
+        # When a conflict is suppressed PostgREST returns an empty data list
+        # (no row in the response) because DO NOTHING returns nothing.
+        # We therefore always do a follow-up SELECT to get the real id -- that
+        # SELECT always succeeds because by this point the row definitely exists.
+        await _db(
+            lambda: supabase_admin.table("conversations").upsert(
+                {
+                    "tenant_id": tenant_id,
+                    "landlord_id": landlord_id,
+                    "property_id": data.property_id,
+                    "status": "active",
+                },
+                on_conflict="tenant_id,landlord_id,property_id",
+                ignore_duplicates=True,
+            ).execute()
+        )
+
+        # Always fetch the definitive row (works for both new and conflicted rows)
+        row_resp = await _db(
             lambda: supabase_admin.table("conversations")
             .select("id")
             .eq("tenant_id", tenant_id)
             .eq("landlord_id", landlord_id)
             .eq("property_id", data.property_id)
+            .single()
             .execute()
         )
-
-        if existing.data:
-            conversation_id = existing.data[0]["id"]
-        else:
-            conv_resp = await _db(
-                lambda: supabase_admin.table("conversations").insert({
-                    "tenant_id": tenant_id,
-                    "landlord_id": landlord_id,
-                    "property_id": data.property_id,
-                    "status": "active",
-                }).execute()
+        if not row_resp.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to resolve conversation after upsert",
             )
-            if not conv_resp.data:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to create conversation",
-                )
-            conversation_id = conv_resp.data[0]["id"]
+        conversation_id = row_resp.data["id"]
 
         # Send opening message
         now = _utcnow()
@@ -447,6 +475,7 @@ async def find_conversation(
     """
     try:
         user_id = current_user["id"]
+        print(f"🔍 [FIND CONVERSATION] user_id={user_id}, partner_id={partner_id}, property_id={property_id}")
 
         as_tenant, as_landlord = await asyncio.gather(
             _db(lambda: supabase_admin.table("conversations")
@@ -463,7 +492,14 @@ async def find_conversation(
                 .execute()),
         )
 
+        print(f"🔍 [FIND CONVERSATION] as_tenant: {len(as_tenant.data or [])} results")
+        print(f"🔍 [FIND CONVERSATION] as_landlord: {len(as_landlord.data or [])} results")
+        
         found = (as_tenant.data or []) + (as_landlord.data or [])
+        print(f"🔍 [FIND CONVERSATION] total found: {len(found)}")
+        if found:
+            print(f"🔍 [FIND CONVERSATION] returning conversation: {found[0]['id']}")
+        
         return {"conversation": found[0] if found else None}
 
     except Exception as e:

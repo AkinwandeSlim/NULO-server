@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..database import supabase, supabase_admin
 from ..middleware.auth import get_current_user
+from ..services.agreement_service import AgreementService
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,20 @@ router = APIRouter(prefix="/tenant", tags=["tenant-dashboard"])
 
 CACHE_TTL = 60  # 1 minute (faster updates)
 dashboard_cache = {}  # key: tenant_id, value: (data, timestamp)
+
+
+def invalidate_tenant_cache(tenant_id: str) -> None:
+    """
+    Drop the cached tenant dashboard for a given tenant.
+
+    Call this whenever something happens that should reflect immediately
+    on the tenant dashboard (e.g. agreement signed by either party,
+    application status change, new payment, etc.) so the next
+    GET /tenant/dashboard call returns fresh data instead of stale.
+    """
+    if tenant_id and tenant_id in dashboard_cache:
+        dashboard_cache.pop(tenant_id, None)
+        logger.info(f"[TENANT DASHBOARD] Cache invalidated for user {tenant_id}")
 
 
 # ============================================================================
@@ -212,8 +227,21 @@ class TenantAgreement(BaseModel):
     rent_amount: int = Field(..., description="Monthly rent in NGN")
     deposit_amount: int = Field(..., description="Security deposit in NGN")
     status: str = Field(..., description="Agreement status (pending/active/terminated)")
+    raw_status: Optional[str] = Field(None, description="Raw agreement status from the database")
+    tenant_signed_at: Optional[str] = Field(None, description="Tenant signature timestamp")
+    landlord_signed_at: Optional[str] = Field(None, description="Landlord signature timestamp")
     lease_start_date: Optional[str] = Field(None, description="Lease start date")
     lease_end_date: Optional[str] = Field(None, description="Lease end date")
+    payment_frequency: Optional[str] = Field(None, description="Payment frequency (MONTHLY/QUARTERLY/SEMI_ANNUAL/ANNUAL)")
+    expected_payment_amount: Optional[int] = Field(None, description="Expected payment amount")
+    total_received_amount: Optional[int] = Field(None, description="Total received amount")
+    reconciliation_status: Optional[str] = Field(None, description="Reconciliation status")
+    virtual_account_number: Optional[str] = Field(None, description="Virtual account number")
+    virtual_account_name: Optional[str] = Field(None, description="Virtual account name")
+    nomba_account_ref: Optional[str] = Field(None, description="Nomba account reference")
+    disbursement_status: Optional[str] = Field(None, description="Disbursement status")
+    disbursement_merchant_tx_ref: Optional[str] = Field(None, description="Disbursement merchant transaction reference")
+    disbursement_amount: Optional[int] = Field(None, description="Disbursement amount")
     created_at: str = Field(..., description="Agreement creation timestamp")
     updated_at: str = Field(..., description="Last update timestamp")
 
@@ -230,6 +258,9 @@ class TenantAgreement(BaseModel):
                 "status": "active",
                 "lease_start_date": "2024-03-01",
                 "lease_end_date": "2025-02-28",
+                "payment_frequency": "MONTHLY",
+                "expected_payment_amount": 800000,
+                "total_received_amount": 0,
                 "created_at": "2024-02-18T12:00:00Z",
                 "updated_at": "2024-02-20T14:00:00Z"
             }]
@@ -329,7 +360,7 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
                 lambda: supabase_admin.table("applications").select("id, status, property_id").eq("user_id", tenant_id).execute()
             )
             agreements_future = executor.submit(
-                lambda: supabase_admin.table("agreements").select("id, status").eq("tenant_id", tenant_id).execute()
+                lambda: supabase_admin.table("agreements").select("id, status, tenant_signed_at, landlord_signed_at").eq("tenant_id", tenant_id).execute()
             )
             transactions_future = executor.submit(
                 lambda: supabase_admin.table("transactions").select("id, status").eq("tenant_id", tenant_id).execute()
@@ -392,8 +423,11 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
         # Agreements
         agreements = agreements_result.data or []
         for agr in agreements:
-            if agr.get("status") in ["ACTIVE", "SIGNED"]: stats["activeAgreements"] +=1
-            elif agr.get("status") == "PENDING_TENANT": stats["pendingSignatures"] +=1
+            effective_status = AgreementService.derive_effective_status(agr)
+            if effective_status in ["ACTIVE", "SIGNED"]:
+                stats["activeAgreements"] += 1
+            elif effective_status == "PENDING_TENANT":
+                stats["pendingSignatures"] += 1
             
         # Payments
         transactions = transactions_result.data or []
@@ -650,7 +684,10 @@ def fetch_agreements(tenant_id: str) -> List[dict]:
         result = supabase_admin.table("agreements") \
             .select(
                 "id, property_id, landlord_id, rent_amount, deposit_amount, status, "
-                "lease_start_date, lease_end_date, created_at, updated_at"
+                "tenant_signed_at, landlord_signed_at, lease_start_date, lease_end_date, "
+                "payment_frequency, expected_payment_amount, total_received_amount, "
+                "reconciliation_status, virtual_account_number, virtual_account_name, "
+                "nomba_account_ref, created_at, updated_at"
             ) \
             .eq("tenant_id", tenant_id) \
             .order("created_at", desc=True).execute()
@@ -669,7 +706,7 @@ def fetch_agreements(tenant_id: str) -> List[dict]:
         
         if property_ids:
             props = supabase_admin.table("properties") \
-                .select("id, title") \
+                .select("id, title, payment_frequency") \
                 .in_("id", property_ids).execute()
             prop_map = {p["id"]: p for p in (props.data or [])}
         
@@ -682,6 +719,9 @@ def fetch_agreements(tenant_id: str) -> List[dict]:
         for agr in result.data:
             prop = prop_map.get(agr.get("property_id"), {})
             landlord = landlord_map.get(agr.get("landlord_id"), {})
+            # Prioritize property's payment_frequency over agreement's
+            payment_frequency = prop.get("payment_frequency") or agr.get("payment_frequency")
+            effective_status = AgreementService.derive_effective_status(agr)
             agreements.append({
                 "id": agr.get("id"),
                 "property_id": agr.get("property_id"),
@@ -690,9 +730,19 @@ def fetch_agreements(tenant_id: str) -> List[dict]:
                 "landlord_name": landlord.get("full_name"),
                 "rent_amount": agr.get("rent_amount", 0),
                 "deposit_amount": agr.get("deposit_amount", 0),
-                "status": agr.get("status"),
+                "status": effective_status,
+                "raw_status": agr.get("status"),
+                "tenant_signed_at": agr.get("tenant_signed_at"),
+                "landlord_signed_at": agr.get("landlord_signed_at"),
                 "lease_start_date": agr.get("lease_start_date"),
                 "lease_end_date": agr.get("lease_end_date"),
+                "payment_frequency": payment_frequency,
+                "expected_payment_amount": agr.get("expected_payment_amount"),
+                "total_received_amount": agr.get("total_received_amount"),
+                "reconciliation_status": agr.get("reconciliation_status"),
+                "virtual_account_number": agr.get("virtual_account_number"),
+                "virtual_account_name": agr.get("virtual_account_name"),
+                "nomba_account_ref": agr.get("nomba_account_ref"),
                 "created_at": agr.get("created_at"),
                 "updated_at": agr.get("updated_at")
             })

@@ -97,7 +97,8 @@ class AIService:
         ================
         - Monthly Rent: ₦{monthly_rent:,}
         - Annual Rent: ₦{monthly_rent * 12:,}
-        - Security Deposit: ₦{monthly_rent * 2:,} (2 months standard - refundable)
+        - Security Deposit: ₦0 (MVP: No caution fee for transparency)
+        - Platform Fee: ₦0 (MVP: No platform fee for transparency)
         - Lease Duration: {lease_duration}
         - Payment Structure: Annual upfront payment (Nigerian market standard)
         - Payment Due: Commencement date

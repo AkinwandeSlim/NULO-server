@@ -31,6 +31,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
 from app.database import supabase_admin
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
 from app.services.notification_service import notification_service
+from app.routes.tenant_dashboard import invalidate_tenant_cache
+from app.routes.landlord_dashboard import invalidate_landlord_cache
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
@@ -123,7 +125,7 @@ def _fetch_agreement_participants(agreement: dict) -> tuple:
 
     try:
         r = supabase_admin.table("properties").select(
-            "id, title, location, city, state, address, full_address, price, images"
+            "id, title, location, city, state, address, full_address, price, images, payment_frequency"
         ).eq("id", agreement["property_id"]).execute()
         property_data = r.data[0] if r.data else None
     except Exception as e:
@@ -297,8 +299,8 @@ async def get_agreements(
         try:
             if property_ids:
                 properties_resp = supabase_admin.table("properties").select(
-                    "id, title, location, city, state, address, full_address, price, images"
-                ).in_("id", property_ids).execute()
+                "id, title, location, city, state, address, full_address, price, images, payment_frequency"
+            ).in_("id", property_ids).execute()
                 properties_map = {p["id"]: p for p in properties_resp.data}
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch properties failed: {e}")
@@ -315,11 +317,17 @@ async def get_agreements(
                 .order("created_at", desc=True) \
                 .execute()
                 logger.info(f"[AGREEMENTS] Fetched {len(disbursements_resp.data)} disbursements")
-                # Keep only the latest disbursement per agreement
+                # Keep only the latest disbursement per agreement.
+                # But prefer a 'released' row over a 'failed' row — if we already
+                # have a successful release, a stale failed row must not overwrite it.
                 for d in disbursements_resp.data:
-                    if d["agreement_id"] not in disbursements_map:
-                        disbursements_map[d["agreement_id"]] = d
-                        logger.info(f"[AGREEMENTS] Agreement {d['agreement_id']} has disbursement status: {d.get('status')}")
+                    aid = d["agreement_id"]
+                    if aid not in disbursements_map:
+                        disbursements_map[aid] = d
+                    elif d.get("status") == "released":
+                        # Always let a released row win over any earlier failed entry
+                        disbursements_map[aid] = d
+                    logger.info(f"[AGREEMENTS] Agreement {aid} has disbursement status: {disbursements_map[aid].get('status')}")
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch disbursements failed: {e}")
 
@@ -327,11 +335,18 @@ async def get_agreements(
         enhanced = []
         for agreement in agreements:
             disbursement = disbursements_map.get(agreement.get("id"))
+            property_data = properties_map.get(agreement.get("property_id"))
+            # Prioritize property's payment_frequency over agreement's
+            payment_frequency = (
+                (property_data.get("payment_frequency") if property_data else None)
+                    or agreement.get("payment_frequency")
+                )
             enhanced.append({
                 **agreement,
                 "tenant": tenants_map.get(agreement.get("tenant_id")),
                 "landlord": landlords_map.get(agreement.get("landlord_id")),
-                "property": properties_map.get(agreement.get("property_id")),
+                "property": property_data,
+                "payment_frequency": payment_frequency,
                 "disbursement_status": disbursement.get("status") if disbursement else None,
                 "disbursement_merchant_tx_ref": disbursement.get("nomba_transfer_ref") if disbursement else None,
                 "disbursement_amount": disbursement.get("amount") if disbursement else None,
@@ -560,7 +575,9 @@ async def get_agreement(
 
         enriched = _enrich(agreement)
 
-        # Fetch latest disbursement status for this agreement
+        # Fetch latest disbursement status for this agreement.
+        # Prefer 'released' over 'failed' — a stale failed row must not
+        # mask a successful release that happened afterwards.
         disbursement = None
         try:
             disbursement_resp = supabase_admin.table("transactions").select(
@@ -568,10 +585,12 @@ async def get_agreement(
             ).eq("agreement_id", agreement_id) \
             .eq("transaction_type", "nomba_disbursement") \
             .order("created_at", desc=True) \
-            .limit(1) \
-            .maybe_single() \
             .execute()
-            disbursement = disbursement_resp.data if disbursement_resp.data else None
+            rows = disbursement_resp.data or []
+            # Pick the best row: prefer 'released', then 'pending', then latest
+            released_row = next((r for r in rows if r.get("status") == "released"), None)
+            pending_row  = next((r for r in rows if r.get("status") == "pending"),  None)
+            disbursement = released_row or pending_row or (rows[0] if rows else None)
             if disbursement:
                 logger.info(f"[AGREEMENTS] Agreement {agreement_id} has disbursement status: {disbursement.get('status')}")
         except Exception as e:
@@ -714,6 +733,16 @@ async def sign_agreement(
             )
 
         logger.info(f"✅ [AGREEMENTS] Agreement {agreement_id} signed by {user_type} {user_id}")
+
+        # ── Invalidate dashboard caches so the tenant/landlord sees the
+        #     new signed status immediately (otherwise the stat cards keep
+        #     showing the stale 60s-cached values for up to a minute).
+        try:
+            invalidate_tenant_cache(str(agreement["tenant_id"]))
+            invalidate_landlord_cache(str(agreement["landlord_id"]))
+        except Exception as cache_err:
+            logger.warning(f"[AGREEMENTS] Cache invalidation failed (non-fatal): {cache_err}")
+
         return {
             "success": True,
             "agreement": enriched,
@@ -879,8 +908,8 @@ def generate_agreement_terms(property_data: dict, agreement_data: dict) -> str:
     Called by agreement_service.auto_generate_agreement().
     """
     monthly_rent = property_data.get("price", 0)
-    security_deposit = property_data.get("security_deposit", int(monthly_rent * 0.5))
-    platform_fee = int(monthly_rent * 0.05)
+    security_deposit = 0  # MVP: Caution fee set to 0 for transparency
+    platform_fee = 0  # MVP: Platform fee set to 0% for transparency
 
     return f"""
 RESIDENTIAL LEASE AGREEMENT

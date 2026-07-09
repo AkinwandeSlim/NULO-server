@@ -24,6 +24,38 @@ logger = logging.getLogger(__name__)
 
 class AgreementService:
     """Centralized service for agreement generation and management"""
+
+    @staticmethod
+    def derive_effective_status(agreement: Optional[Dict[str, Any]]) -> str:
+        """Normalize agreement state from signature timestamps when the DB status is stale."""
+        if not agreement:
+            return "PENDING_TENANT"
+
+        raw_status = str(agreement.get("status") or "").upper()
+        tenant_signed = bool(agreement.get("tenant_signed_at"))
+        landlord_signed = bool(agreement.get("landlord_signed_at"))
+
+        if raw_status in {"TERMINATED", "EXPIRED", "CANCELLED", "CANCELED"}:
+            return raw_status
+
+        if tenant_signed and landlord_signed:
+            if raw_status in {"ACTIVE", "SIGNED"}:
+                return raw_status
+            return "SIGNED"
+
+        if tenant_signed and not landlord_signed:
+            return "PENDING_LANDLORD"
+
+        if landlord_signed and not tenant_signed:
+            return "PENDING_TENANT"
+
+        if raw_status in {"ACTIVE", "SIGNED"}:
+            return raw_status
+
+        if raw_status in {"PENDING_LANDLORD", "PENDING_TENANT", "PENDING"}:
+            return raw_status
+
+        return raw_status or "PENDING_TENANT"
     
     @staticmethod
     async def generate_enhanced_agreement_terms(
@@ -358,9 +390,10 @@ Signatures below constitute acceptance of all terms and conditions.
             "lease_end_date": lease_dates["lease_end_date"],
             "lease_duration": lease_dates["lease_duration"],
             "rent_amount": property_data.get("price", 0),
-            "deposit_amount": property_data.get("price", 0) * 2,
-            "platform_fee": 0,
+            "deposit_amount": 0,  # MVP: Caution fee set to 0 for transparency
+            "platform_fee": 0,  # MVP: Platform fee set to 0% for transparency
             "service_charge": 0,
+            "payment_frequency": property_data.get("payment_frequency", "MONTHLY"),
             "terms": terms,
             "agreement_source": "manual_template",  # Updated after generation
             "generation_metadata": {},             # Updated after generation
@@ -536,8 +569,7 @@ Signatures below constitute acceptance of all terms and conditions.
                 logger.error(f"❌ [AGREEMENT SERVICE] Landlord {user_id} does not own agreement {agreement_id}")
                 return None
             
-            # Update signature
-            update_data = {}
+            # Update signature and status based on signing flow
             if user_type == "tenant":
                 update_data = {
                     "tenant_signed_at": datetime.now().isoformat(),
@@ -548,12 +580,9 @@ Signatures below constitute acceptance of all terms and conditions.
                     "landlord_signed_at": datetime.now().isoformat(),
                     "landlord_signature_ip": ip_address
                 }
-            
-            # Check if both parties have signed
-            if agreement.get("landlord_signed_at") and user_type == "tenant":
-                update_data["status"] = "SIGNED"
-            elif agreement.get("tenant_signed_at") and user_type == "landlord":
-                update_data["status"] = "SIGNED"
+
+            merged_agreement = {**agreement, **update_data}
+            update_data["status"] = AgreementService.derive_effective_status(merged_agreement)
             
             # Update agreement
             update_response = supabase_admin.table("agreements").update(update_data).eq(

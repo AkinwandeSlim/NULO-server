@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from ..database import supabase, supabase_admin
 from ..middleware.auth import get_current_user
 from ..models.landlord_onboarding import LandlordOnboardingResponse
+from ..services.agreement_service import AgreementService
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,20 @@ router = APIRouter(prefix="/landlord", tags=["landlord-dashboard"])
 # (approve/reject) reflect in the overview much faster.
 _dashboard_cache = {}
 CACHE_TTL = 60  # 60 seconds
+
+
+def invalidate_landlord_cache(landlord_id: str) -> None:
+    """
+    Drop the cached landlord dashboard for a given landlord.
+
+    Call this whenever something happens that should reflect immediately
+    on the landlord dashboard (e.g. agreement signed, application
+    status change, new payment received, etc.) so the next
+    GET /landlord/dashboard call returns fresh data instead of stale.
+    """
+    if landlord_id and landlord_id in _dashboard_cache:
+        _dashboard_cache.pop(landlord_id, None)
+        logger.info(f"[LANDLORD DASHBOARD] Cache invalidated for user {landlord_id}")
 
 
 # ============================================================================
@@ -287,24 +302,39 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
 
         stats["total_properties"] = len(properties)
 
-        # Build a set of property IDs with active agreements (reliable fallback)
+        # Build a set of property IDs with ACTIVE agreements (payment received)
+        # NOTE: SIGNED agreements are NOT considered occupied - only ACTIVE agreements
+        # (where payment has been received) should mark a property as occupied
         active_agreement_property_ids: set = set()
+        # Track properties that have a SIGNED (fully-signed) agreement but no
+        # payment yet — these are "awaiting payment" and should NOT be occupied.
+        signed_pending_payment_property_ids: set = set()
         try:
-            agr_result = supabase_admin.table("agreements") \
-                .select("property_id") \
+            # Fetch all agreements (any status) to detect SIGNED-but-not-ACTIVE
+            # so we can correctly demote stale "occupied" properties.
+            all_agr_result = supabase_admin.table("agreements") \
+                .select("id, property_id, status, tenant_signed_at, landlord_signed_at") \
                 .eq("landlord_id", landlord_id) \
-                .in_("status", ["ACTIVE", "SIGNED"]) \
                 .execute()
-            for agr in (agr_result.data or []):
+            for agr in (all_agr_result.data or []):
                 pid = agr.get("property_id")
-                if pid:
+                if not pid:
+                    continue
+                agr_status = (agr.get("status") or "").upper()
+                tenant_signed = bool(agr.get("tenant_signed_at"))
+                landlord_signed = bool(agr.get("landlord_signed_at"))
+                if agr_status == "ACTIVE":
                     active_agreement_property_ids.add(pid)
+                elif agr_status == "SIGNED" or (tenant_signed and landlord_signed):
+                    # Fully signed but payment not yet received
+                    signed_pending_payment_property_ids.add(pid)
 
             # Backfill: sync properties.status→'occupied' for any that are still
-            # marked 'vacant' despite having an active agreement (stale data fix).
+            # marked 'vacant' despite having an ACTIVE agreement (stale data fix).
             for prop in properties:
+                prop_id = prop.get("id")
                 if (
-                    prop.get("id") in active_agreement_property_ids
+                    prop_id in active_agreement_property_ids
                     and prop.get("status") != "occupied"
                     and prop.get("verification_status") == "approved"
                     and not prop.get("deleted_at")
@@ -312,19 +342,43 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
                     try:
                         supabase_admin.table("properties") \
                             .update({"status": "occupied"}) \
-                            .eq("id", prop["id"]) \
+                            .eq("id", prop_id) \
                             .execute()
                         prop["status"] = "occupied"  # update in-memory for counting below
                         logger.info(
-                            "Backfilled property status to occupied | property=%s", prop["id"]
+                            "Backfilled property status to occupied | property=%s", prop_id
                         )
                     except Exception as bf_err:
                         logger.warning(
                             "Could not backfill property status | property=%s | error=%s",
-                            prop["id"], bf_err,
+                            prop_id, bf_err,
+                        )
+                # ✅ Reverse backfill: if property.status is 'occupied' but there is
+                # NO ACTIVE agreement (e.g., tenant has not paid yet, agreement
+                # only SIGNED, or previous agreement expired), demote it back to
+                # 'vacant' so the dashboard shows accurate counts.
+                elif (
+                    prop.get("status") == "occupied"
+                    and prop_id not in active_agreement_property_ids
+                    and prop.get("verification_status") == "approved"
+                    and not prop.get("deleted_at")
+                ):
+                    try:
+                        supabase_admin.table("properties") \
+                            .update({"status": "vacant"}) \
+                            .eq("id", prop_id) \
+                            .execute()
+                        prop["status"] = "vacant"  # update in-memory for counting below
+                        logger.info(
+                            "Demoted stale occupied→vacant (no ACTIVE agreement) | property=%s", prop_id
+                        )
+                    except Exception as bf_err:
+                        logger.warning(
+                            "Could not demote stale occupied property | property=%s | error=%s",
+                            prop_id, bf_err,
                         )
         except Exception as agr_err:
-            logger.warning("Could not fetch active agreements for occupancy backfill: %s", agr_err)
+            logger.warning("Could not fetch agreements for occupancy backfill: %s", agr_err)
 
         for prop in properties:
             v_status = prop.get("verification_status", "pending")
@@ -794,9 +848,11 @@ async def get_landlord_dashboard(
             try:
                 result = supabase_admin.table("agreements") \
                     .select(
-                        "id, tenant_id, property_id, status, "
-                        "lease_start_date, lease_end_date, rent_amount, "
-                        "deposit_amount, created_at, updated_at"
+                        "id, tenant_id, property_id, status, tenant_signed_at, landlord_signed_at, "
+                        "lease_start_date, lease_end_date, rent_amount, deposit_amount, "
+                        "payment_frequency, expected_payment_amount, total_received_amount, "
+                        "reconciliation_status, virtual_account_number, virtual_account_name, "
+                        "nomba_account_ref, created_at, updated_at"
                     ) \
                     .eq("landlord_id", landlord_id) \
                     .in_("status", ["ACTIVE", "SIGNED", "PENDING_LANDLORD", "PENDING_TENANT", "EXPIRED"]) \
@@ -817,13 +873,17 @@ async def get_landlord_dashboard(
                     tenants_map = {t["id"]: t for t in (t_res.data or [])}
                 if property_ids:
                     p_res = supabase_admin.table("properties") \
-                        .select("id, title") \
+                        .select("id, title, payment_frequency") \
                         .in_("id", property_ids).execute()
                     props_map = {p["id"]: p for p in (p_res.data or [])}
 
                 for row in rows:
                     row["tenant"] = tenants_map.get(row.get("tenant_id"), {})
                     row["property"] = props_map.get(row.get("property_id"), {})
+                    row["raw_status"] = row.get("status")
+                    row["status"] = AgreementService.derive_effective_status(row)
+                    # Prioritize property's payment_frequency over agreement's
+                    row["payment_frequency"] = row["property"].get("payment_frequency") or row.get("payment_frequency")
                 return rows
             except Exception as e:
                 logger.error("Failed to get agreements: %s", str(e))

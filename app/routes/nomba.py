@@ -6,6 +6,9 @@
 # Rule 18: supabase_admin only
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -514,6 +517,143 @@ async def nomba_health():
         "nomba_auth": auth_ok,
         "webhook_url": "https://api.nuloafrica.com/api/v1/webhooks/nomba/transfer",
         "environment": "test" if "sandbox" in nomba_client.base_url else "live",
+    }
+
+
+# ============================================================
+# ROUTE 5: Simulate payment (demo purpose only
+# POST /api/v1/agreements/{agreement_id}/simulate-payment
+# ============================================================
+
+@router.post("/agreements/{agreement_id}/simulate-payment")
+async def simulate_payment(
+    agreement_id: str,
+    current_user=Depends(get_current_user),
+):
+    """
+    Simulate a payment to the agreement's virtual account for demo purposes.
+    """
+    # Step 1: Fetch agreement
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("agreements")
+            .select("*")
+            .eq("id", agreement_id)
+            .single()
+            .execute(),
+    )
+    agreement = result.data
+    if not agreement:
+        raise HTTPException(404, "Agreement not found")
+
+    # Step 2: Check authorization
+    if current_user["id"] not in (
+        agreement["tenant_id"], agreement["landlord_id"]
+    ):
+        raise HTTPException(403, "Not authorized")
+
+    # Step 3: Check virtual account must exist
+    if not agreement.get("virtual_account_number"):
+        raise HTTPException(
+            400, "No virtual account provisioned yet")
+
+    # Step 4: Build a simulated payment payload
+    expected_amount = float(agreement.get("expected_payment_amount") or 0) or float(agreement.get("rent_amount", 0) * 1)
+    request_id = f"demo-payment-{agreement_id[:8]}-{int(datetime.now(timezone.utc).timestamp())}"
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    sub_account_ref = f"{agreement_id}-SUB"
+
+    # Build payload
+    payload = {
+        "event_type": "payment_success",
+        "requestId": request_id,
+        "data": {
+            "merchant": {
+                "walletId": "demo-wallet-001",
+                "walletBalance": 1000000,
+                "userId": os.environ.get("NOMBA_SUB_ACCOUNT_ID", "demo-sub-account"),
+            },
+            "terminal": {},
+            "transaction": {
+                "aliasAccountNumber": agreement.get("virtual_account_number"),
+                "fee": 10,
+                "sessionId": f"demo-session-{agreement_id[:8]}",
+                "type": "vact_transfer",
+                "transactionId": f"demo-txn-{agreement_id[:8]}",
+                "aliasAccountName": agreement.get("virtual_account_name"),
+                "responseCode": "",
+                "originatingFrom": "api",
+                "transactionAmount": expected_amount,
+                "narration": "Demo rent payment",
+                "time": timestamp,
+                "aliasAccountReference": sub_account_ref,
+                "aliasAccountType": "VIRTUAL",
+            },
+            "customer": {
+                "bankCode": "058",
+                "senderName": f"Demo Tenant",
+                "bankName": "GTBank",
+                "accountNumber": "0123456789",
+            },
+        },
+    }
+
+    # Generate valid signature
+    SECRET = "NombaHackathon2026"
+    t = payload["data"]["transaction"]
+    m = payload["data"]["merchant"]
+    hashing_payload = (
+        f"{payload['event_type']}:{payload['requestId']}:{m['userId']}:{m['walletId']}:"
+        f"{t['transactionId']}:{t['type']}:{t['time']}:{t['responseCode']}:{timestamp}"
+    )
+    digest = hmac.new(SECRET.encode(), hashing_payload.encode(), hashlib.sha256).digest()
+    signature = base64.b64encode(digest).decode()
+
+    # Now manually call the webhook handler logic directly
+    # We can't use a mock Request object or directly trigger _reconcile_payment
+    # But wait - just create a transfer and call _reconcile_payment
+    # Alternatively we can manually call the webhook code directly
+
+    # Create transfer row
+    transfer_insert = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: supabase_admin
+            .table("virtual_account_transfers")
+            .insert({
+                "nomba_request_id": request_id,
+                "nomba_transaction_id": f"demo-txn-id-{agreement_id[:8]}",
+                "account_ref": sub_account_ref,
+                "account_number": agreement.get("virtual_account_number"),
+                "amount_received": expected_amount,
+                "sender_name": "Demo Tenant",
+                "sender_bank": "GTBank",
+                "currency": "NGN",
+                "event_type": "payment_success",
+                "transaction_type": "vact_transfer",
+                "raw_payload": payload,
+                "signature_valid": True,
+            })
+            .execute(),
+    )
+    transfer_row = transfer_insert.data[0] if transfer_insert.data else {}
+
+    # Now reconcile it
+    await _reconcile_payment(
+        transfer_row,
+        sub_account_ref,
+        expected_amount,
+    )
+
+    logger.info(
+        "Simulated payment processed | agreement=%s | amount=%.2f",
+        agreement_id, expected_amount,
+    )
+
+    return {
+        "status": "simulated",
+        "amount": expected_amount,
+        "agreement_id": agreement_id,
     }
 
 

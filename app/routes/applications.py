@@ -1,6 +1,7 @@
 """
 Application routes
 """
+import asyncio
 import logging
 from pydantic import ValidationError
 from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
@@ -162,49 +163,76 @@ async def create_application(
         # Create mock escrow transaction (skip for now - implement in payment phase)
         # TODO: Implement in Priority 8 (Paystack integration)
         
-        # Increment application count on property
-        supabase_admin.table("properties").update({
-            "application_count": supabase_admin.table("properties").select("application_count").eq(
+        # FIX #2 — single atomic increment instead of read-then-write (N+1)
+        # Fallback to the old pattern if the RPC doesn't exist yet in the DB.
+        try:
+            supabase_admin.rpc(
+                "increment_application_count",
+                {"property_id_input": application_data.property_id},
+            ).execute()
+        except Exception as rpc_err:
+            logger.warning(f"⚠️ [APP] increment_application_count RPC unavailable, falling back: {rpc_err}")
+            # Fallback: read current count then write (safe enough for low traffic)
+            count_resp = supabase_admin.table("properties").select("application_count").eq(
                 "id", application_data.property_id
-            ).single().execute().data.get("application_count", 0) + 1
-        }).eq("id", application_data.property_id).execute()
-        
-        # Send notification to landlord
-        logger.info(f"📧 [APP] About to call notification service for application {application['id']}")
-        
-        # TODO: Temporarily disabled to isolate notification issue
+            ).single().execute()
+            current_count = (count_resp.data or {}).get("application_count", 0) or 0
+            supabase_admin.table("properties").update(
+                {"application_count": current_count + 1}
+            ).eq("id", application_data.property_id).execute()
+
+        # FIX #4 — fetch landlord + tenant details in parallel so both
+        # round-trips happen concurrently instead of sequentially.
         from app.services.notification_service import notification_service
-        
-        # Get landlord details for notification
-        landlord_response = supabase_admin.table("users").select(
-            "full_name, email, phone_number"
-        ).eq("id", property_data["landlord_id"]).single().execute()
-        
-        landlord_details = landlord_response.data or {}
-        
-        # Get tenant details for notification
-        tenant_response = supabase_admin.table("users").select(
-            "full_name, email, phone_number"
-        ).eq("id", tenant_id).single().execute()
-        
-        tenant_details = tenant_response.data or {}
-        
-        await notification_service.notify_application_submitted(
-            application_id=application["id"],
-            property_id=application_data.property_id,
-            property_title=property_data["title"],
-            tenant_id=tenant_id,
-            tenant_name=tenant_details.get("full_name", "Unknown"),
-            tenant_email=tenant_details.get("email"),
-            tenant_phone=tenant_details.get("phone_number"),
-            landlord_id=property_data["landlord_id"],
-            landlord_name=landlord_details.get("full_name", "Landlord"),
-            landlord_email=landlord_details.get("email"),
-            landlord_phone=landlord_details.get("phone_number"),
-            monthly_income=application_data.monthly_income,
-            employment_status=application_data.employment_status,
-            message=application_data.message or "No additional message provided",
+
+        loop = asyncio.get_event_loop()
+
+        def _fetch_landlord():
+            return supabase_admin.table("users").select(
+                "full_name, email, phone_number"
+            ).eq("id", property_data["landlord_id"]).single().execute()
+
+        def _fetch_tenant():
+            return supabase_admin.table("users").select(
+                "full_name, email, phone_number"
+            ).eq("id", tenant_id).single().execute()
+
+        landlord_response, tenant_response = await asyncio.gather(
+            loop.run_in_executor(None, _fetch_landlord),
+            loop.run_in_executor(None, _fetch_tenant),
         )
+
+        landlord_details = landlord_response.data or {}
+        tenant_details   = tenant_response.data or {}
+
+        logger.info(f"📧 [APP] Queuing fire-and-forget notification for application {application['id']}")
+
+        # FIX #3 — fire-and-forget: schedule notifications without awaiting
+        # them, so the tenant receives an HTTP 200 immediately after the
+        # application row is committed rather than waiting for email + SMS.
+        async def _send_notifications():
+            try:
+                await notification_service.notify_application_submitted(
+                    application_id=application["id"],
+                    property_id=application_data.property_id,
+                    property_title=property_data["title"],
+                    tenant_id=tenant_id,
+                    tenant_name=tenant_details.get("full_name", "Unknown"),
+                    tenant_email=tenant_details.get("email"),
+                    tenant_phone=tenant_details.get("phone_number"),
+                    landlord_id=property_data["landlord_id"],
+                    landlord_name=landlord_details.get("full_name", "Landlord"),
+                    landlord_email=landlord_details.get("email"),
+                    landlord_phone=landlord_details.get("phone_number"),
+                    monthly_income=application_data.monthly_income,
+                    employment_status=application_data.employment_status,
+                    message=application_data.message or "No additional message provided",
+                )
+            except Exception as notif_err:
+                # Notification failures must never roll back a successful submission
+                logger.error(f"❌ [APP] Background notification failed: {notif_err}")
+
+        asyncio.create_task(_send_notifications())
         
         return {
             "success": True,
@@ -238,7 +266,7 @@ async def get_my_applications(
         user_id = current_user["id"]
         
         response = supabase_admin.table("applications").select(
-            "*, property:properties(id, title, location, price, landlord_id)"
+            "*, property:properties(id, title, location, price, landlord_id, payment_frequency)"
         ).eq("user_id", user_id).order("created_at", desc=True).execute()
         
         return {
@@ -264,7 +292,7 @@ async def get_received_applications(
         user_id = current_user["id"]
         
         response = supabase_admin.table("applications").select(
-            "*, property:properties!inner(id, title, location, price), user:users!user_id(id, full_name, email, phone_number, trust_score)"
+            "*, property:properties!inner(id, title, location, price, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score)"
         ).eq("property.landlord_id", user_id).order("created_at", desc=True).execute()
         
         return {
@@ -343,8 +371,8 @@ async def get_applications(current_user: dict = Depends(get_current_user)):
         if user_type == "tenant":
             # Fetch tenant's applications
             response = supabase_admin.table("applications").select(
-                "*, property:properties(id, title, location, price, landlord_id)"
-            ).eq("user_id", user_id).order("created_at", desc=True).execute()
+            "*, property:properties(id, title, location, price, landlord_id, payment_frequency)"
+        ).eq("user_id", user_id).order("created_at", desc=True).execute()
             
         elif user_type == "landlord":
             # Fetch applications for landlord's properties
@@ -488,7 +516,7 @@ async def get_application(
 
         # Fetch application with full property and user details
         app_response = supabase_admin.table("applications").select(
-            "*, property:properties(id, title, description, property_type, address, full_address, location, city, state, price, beds, baths, sqft, images, amenities, furnished, pet_friendly, landlord_id), user:users!user_id(id, full_name, email, phone_number, trust_score, avatar_url, user_type)"
+            "*, property:properties(id, title, description, property_type, address, full_address, location, city, state, price, beds, baths, sqft, images, amenities, furnished, pet_friendly, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score, avatar_url, user_type)"
         ).eq("id", application_id).single().execute()
 
         if not app_response.data:
@@ -707,7 +735,7 @@ async def approve_application(
         
         # Fetch application with property and tenant
         app_response = supabase_admin.table("applications").select(
-            "*, property:properties(id, title, landlord_id, price), user:users!user_id(id, full_name, email, phone_number)"
+            "*, property:properties(id, title, landlord_id, price, payment_frequency), user:users!user_id(id, full_name, email, phone_number)"
         ).eq("id", application_id).single().execute()
         
         if not app_response.data:
@@ -748,7 +776,7 @@ async def approve_application(
         
         # Fetch the updated application with full details
         updated_app_response = supabase_admin.table("applications").select(
-            "*, property:properties!inner(id, title, location, price, landlord_id), user:users!user_id(id, full_name, email, phone_number, trust_score)"
+            "*, property:properties!inner(id, title, location, price, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score)"
         ).eq("id", application_id).single().execute()
         
         if not updated_app_response.data:
@@ -849,7 +877,7 @@ async def reject_application(
         
         # Fetch application with property and tenant
         app_response = supabase_admin.table("applications").select(
-            "*, property:properties(id, title, landlord_id, price), user:users!user_id(id, full_name, email, phone_number)"
+            "*, property:properties(id, title, landlord_id, price, payment_frequency), user:users!user_id(id, full_name, email, phone_number)"
         ).eq("id", application_id).single().execute()
         
         if not app_response.data:
@@ -923,7 +951,7 @@ async def reject_application(
 
         # Fetch the updated application with full details
         updated_app_response = supabase_admin.table("applications").select(
-            "*, property:properties!inner(id, title, location, price, landlord_id), user:users!user_id(id, full_name, email, phone_number, trust_score)"
+            "*, property:properties!inner(id, title, location, price, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score)"
         ).eq("id", application_id).single().execute()
 
         if not updated_app_response.data:

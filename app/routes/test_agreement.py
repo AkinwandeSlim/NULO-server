@@ -128,10 +128,10 @@ async def generate_agreement_simple(payload: TestAgreementRequest):
         lease_start = now.date()
         lease_end = (now + timedelta(days=30 * payload.lease_duration_months)).date()
 
-        # Security deposit = 2 months (matches the rest of the app's
-        # "caution fee = 2 months" rule from the QA checklist).
-        deposit = int(payload.monthly_rent * 2)
-        platform_fee = int(payload.monthly_rent * 0.05)
+        # MVP: Caution fee set to 0 for transparency
+        deposit = 0
+        # MVP: Platform fee set to 0% for transparency
+        platform_fee = 0
 
         agreement = {
             "id": preview_id,

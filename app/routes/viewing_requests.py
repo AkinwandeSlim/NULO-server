@@ -97,23 +97,37 @@ async def get_landlord_viewing_requests(
             query = query.eq("status", status_filter)
         response = query.order("created_at", desc=True).execute()
 
+        # Batch fetch all unique property IDs and tenant IDs to avoid N+1 queries
+        property_ids = list({req["property_id"] for req in response.data if req.get("property_id")})
+        tenant_ids = list({req["tenant_id"] for req in response.data if req.get("tenant_id")})
+
+        # Fetch all properties in one query
+        properties_map = {}
+        if property_ids:
+            try:
+                props_response = supabase_admin.table("properties").select("*").in_("id", property_ids).execute()
+                properties_map = {p["id"]: p for p in (props_response.data or [])}
+            except Exception as props_error:
+                logger.warning(f"Could not fetch properties: {props_error}")
+
+        # Fetch all tenants in one query
+        tenants_map = {}
+        if tenant_ids:
+            try:
+                tenants_response = supabase_admin.table("users").select(
+                    "id, full_name, email, phone_number, avatar_url"
+                ).in_("id", tenant_ids).execute()
+                tenants_map = {t["id"]: t for t in (tenants_response.data or [])}
+            except Exception as tenants_error:
+                logger.warning(f"Could not fetch tenants: {tenants_error}")
+
         viewing_requests = []
         for req in response.data:
             try:
-                property_response = supabase_admin.table("properties").select("*").eq(
-                    "id", req["property_id"]
-                ).execute()
-                property_data = property_response.data[0] if property_response.data else None
-
-                tenant_response = supabase_admin.table("users").select(
-                    "id, full_name, email, phone_number, avatar_url"
-                ).eq("id", req["tenant_id"]).execute()
-                tenant_data = tenant_response.data[0] if tenant_response.data else None
-
                 viewing_requests.append({
                     "id": req["id"],
-                    "property": property_data,
-                    "tenant": tenant_data,
+                    "property": properties_map.get(req["property_id"]),
+                    "tenant": tenants_map.get(req["tenant_id"]),
                     "tenant_name": req.get("tenant_name"),
                     "preferred_date": req["preferred_date"],
                     "time_slot": req["time_slot"],
