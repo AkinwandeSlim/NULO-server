@@ -12,3 +12,6 @@ build/
 *.swo
 *~
 .DS_Store
+# Dangerous database cleanup scripts - should not be in public repo
+scripts/clean_database_for_demo.py
+scripts/reset_test_data.py
