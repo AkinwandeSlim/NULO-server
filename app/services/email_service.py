@@ -111,7 +111,7 @@ class EmailService:
                     <p>Please arrive on time. If you need to reschedule, contact the landlord as soon as possible.</p>
 
                     <p>
-                        <a href="{self.base_url}/tenant/viewings/{viewing_id}"
+                        <a href="{self.base_url}/tenant/viewings"
                             style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
                             View Details
                         </a>
@@ -141,7 +141,7 @@ Time: {time}
 
 Please arrive on time. If you need to reschedule, contact the landlord as soon as possible.
 
-View Details: {self.base_url}/tenant/viewings/{viewing_id}
+View Details: {self.base_url}/tenant/viewings
 
 ---
 NuloAfrica - Zero Agency Fee Rental Platform
@@ -263,7 +263,7 @@ NuloAfrica - Zero Agency Fee Rental Platform
                     <p>Please confirm you're still planning to attend. If you need to reschedule or cancel, let the landlord know right away.</p>
 
                     <p>
-                        <a href="{self.base_url}/tenant/viewings/{viewing_id}"
+                        <a href="{self.base_url}/tenant/viewings"
                             style="background-color: #FF7A00; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
                             View Viewing Details
                         </a>
@@ -293,7 +293,7 @@ Time: {time}
 
 Please confirm you're still planning to attend.
 
-View Details: {self.base_url}/tenant/viewings/{viewing_id}
+View Details: {self.base_url}/tenant/viewings
 
 ---
 NuloAfrica - Zero Agency Fee Rental Platform

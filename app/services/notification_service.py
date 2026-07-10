@@ -249,7 +249,7 @@ class NotificationService:
                 f"Your viewing request for {property_title} on {date} at {time_slot} "
                 f"has been sent to the landlord. You'll be notified once they respond."
             ),
-            link=f"/tenant/viewings/{viewing_id}",
+            link="/tenant/viewings",
             data={"viewing_id": viewing_id, "date": date, "time": time_slot},
         )
 
@@ -343,7 +343,7 @@ class NotificationService:
                 f"Your viewing for {property_title} on {date} at {time_slot} "
                 f"has been confirmed. Please arrive on time."
             ),
-            link=f"/tenant/viewings/{viewing_id}",
+            link="/tenant/viewings",
             data={"viewing_id": viewing_id, "date": date, "time": time_slot},
         )
 
@@ -410,7 +410,7 @@ class NotificationService:
                 f"{'1 hour' if hours == 1 else '24 hours'}. "
                 f"Date: {date} at {time_slot}."
             ),
-            link=f"/tenant/viewings/{viewing_id}",
+            link="/tenant/viewings",
             data={"viewing_id": viewing_id, "hours_until": hours},
         )
 

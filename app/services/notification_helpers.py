@@ -13,7 +13,7 @@ Usage:
         notif_type="visit",          # must match your DB check constraint
         title="Viewing Confirmed! ✓",
         message="Your viewing for ...",
-        link="/tenant/viewings/xyz",
+        link="/tenant/viewings",
         data={"viewing_id": "xyz"},
     )
 """
