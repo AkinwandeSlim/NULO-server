@@ -66,7 +66,7 @@ class TokenCache:
 
 
 # Global token cache instance
-token_cache = TokenCache(ttl_seconds=300)  # 5-minute TTL
+token_cache = TokenCache(ttl_seconds=30)  # 30-second TTL for demo
 
 
 async def with_token_cache(validation_func):

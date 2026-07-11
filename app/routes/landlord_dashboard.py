@@ -18,11 +18,10 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/landlord", tags=["landlord-dashboard"])
 
-# 🚀 OPTIMIZATION: Simple in-memory cache for dashboard data (60s TTL)
-# Reduced from 5 minutes to 60s so REG-08 (deletion) and admin actions
-# (approve/reject) reflect in the overview much faster.
+# 🚀 OPTIMIZATION: Simple in-memory cache for dashboard data (DISABLED for demo)
+# Cache disabled to ensure immediate data updates during demo
 _dashboard_cache = {}
-CACHE_TTL = 60  # 60 seconds
+CACHE_TTL = 0  # Disabled for demo - always fetch fresh data
 
 
 def invalidate_landlord_cache(landlord_id: str) -> None:

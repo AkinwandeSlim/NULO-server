@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tenant", tags=["tenant-dashboard"])
 
-CACHE_TTL = 60  # 1 minute (faster updates)
+CACHE_TTL = 0  # Disabled for demo - always fetch fresh data
 dashboard_cache = {}  # key: tenant_id, value: (data, timestamp)
 
 
