@@ -1,17 +1,56 @@
+# ── Python ───────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environment ──────────────────────────────
+venv/
+.venv/
+
+# ── Environment & secrets ────────────────────────────
 .env
 .env.local
 .env.*.local
-node_modules/
-dist/
-build/
+
+# ── Runtime logs ─────────────────────────────────────
+*.log
+serverlog.txt
+serverlog.txt.*
+
+# ── Test / evaluation artifacts ──────────────────────
+eval_*
+eval_mock_output.txt
+eval_report_*.json
+.deepeval/
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+
+# ── Ad-hoc scripts never meant for repo ──────────────
+test_propflow_backend.py
+memory_saver_source.py
+
+# ── Data files / generated outputs ───────────────────
+*.csv
+*.xlsx
+*.parquet
+
+# ── IDEs ─────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
-# Dangerous database cleanup scripts - should not be in public repo
+
+# ── Node / frontend build artifacts ──────────────────
+node_modules/
+.next/
+
+# ── Dangerous database cleanup scripts ───────────────
 scripts/clean_database_for_demo.py
 scripts/reset_test_data.py

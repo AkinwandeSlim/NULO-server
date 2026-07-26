@@ -117,69 +117,33 @@ async def create_application(
                 detail="You have already applied for this property"
             )
         
-        # Create application with correct schema
-        # NB: applications_status_check constraint allows
-        #     ('submitted', 'under_review', 'approved', 'rejected', 'withdrawn')
-        # We use 'submitted' here so the row stores a value that matches the
-        # CHECK constraint. (Previously the code wrote 'pending', which the DB
-        # silently coerced — then the reject endpoint would refuse because
-        # 'pending' was not in its allowlist, surfacing as "Cannot be
-        # rejected". See LAPP-05 in QA checklist.)
-        app_dict = {
-            "user_id": tenant_id,  # Correct field name from database schema
-            "property_id": application_data.property_id,
-            "viewing_id": application_data.viewing_id,
-            "status": "submitted",
-            "message": application_data.message,
-            "move_in_date": application_data.move_in_date,
-            "lease_duration": application_data.lease_duration,
-            "employment_status": application_data.employment_status,
-            "employer_name": application_data.employer_name,
-            "monthly_income": application_data.monthly_income,
-            "number_of_occupants": application_data.number_of_occupants,
-            "has_pets": application_data.has_pets,
-            "pet_details": application_data.pet_details,
-            "references": application_data.references or {},
-            "documents": application_data.documents or [],
-            "emergency_contact_name": application_data.emergency_contact_name,
-            "emergency_contact_phone": application_data.emergency_contact_phone,
-            "viewed_by_landlord": False
-        }
-        
-        app_response = supabase_admin.table("applications").insert(app_dict).execute()
-        
-        if not app_response.data:
-            logger.error(f"❌ [APP] Failed to create application - insert returned no data")
-            logger.error(f"❌ [APP] Insert dict: {app_dict}")
-            if hasattr(app_response, 'error') and app_response.error:
-                logger.error(f"❌ [APP] Supabase error: {app_response.error}")
+        # ── Delegate to shared Application Service for DB insert + count increment ─
+        from app.services.application_service import application_service
+
+        application = await application_service.submit_application(
+            tenant_id=tenant_id,
+            property_id=application_data.property_id,
+            viewing_id=application_data.viewing_id,
+            message=application_data.message,
+            employment_status=application_data.employment_status,
+            employer_name=application_data.employer_name,
+            monthly_income=application_data.monthly_income,
+            move_in_date=application_data.move_in_date,
+            lease_duration=application_data.lease_duration,
+            number_of_occupants=application_data.number_of_occupants,
+            has_pets=application_data.has_pets or False,
+            pet_details=application_data.pet_details or "",
+            references=application_data.references,
+            documents=application_data.documents,
+            emergency_contact_name=application_data.emergency_contact_name or "",
+            emergency_contact_phone=application_data.emergency_contact_phone or "",
+        )
+
+        if not application:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to create application: check server logs"
+                detail="Failed to create application"
             )
-        
-        application = app_response.data[0]
-        
-        # Create mock escrow transaction (skip for now - implement in payment phase)
-        # TODO: Implement in Priority 8 (Paystack integration)
-        
-        # FIX #2 — single atomic increment instead of read-then-write (N+1)
-        # Fallback to the old pattern if the RPC doesn't exist yet in the DB.
-        try:
-            supabase_admin.rpc(
-                "increment_application_count",
-                {"property_id_input": application_data.property_id},
-            ).execute()
-        except Exception as rpc_err:
-            logger.warning(f"⚠️ [APP] increment_application_count RPC unavailable, falling back: {rpc_err}")
-            # Fallback: read current count then write (safe enough for low traffic)
-            count_resp = supabase_admin.table("properties").select("application_count").eq(
-                "id", application_data.property_id
-            ).single().execute()
-            current_count = (count_resp.data or {}).get("application_count", 0) or 0
-            supabase_admin.table("properties").update(
-                {"application_count": current_count + 1}
-            ).eq("id", application_data.property_id).execute()
 
         # FIX #4 — fetch landlord + tenant details in parallel so both
         # round-trips happen concurrently instead of sequentially.
@@ -212,6 +176,10 @@ async def create_application(
         # application row is committed rather than waiting for email + SMS.
         async def _send_notifications():
             try:
+                # PropFlow workflow context — if the application was created via
+                # PropFlow, the propflow_thread_id is embedded in the row so the
+                # notification can carry context for the banner → PropFlow bridge.
+                app_propflow_id = application.get("propflow_thread_id") or None
                 await notification_service.notify_application_submitted(
                     application_id=application["id"],
                     property_id=application_data.property_id,
@@ -227,6 +195,7 @@ async def create_application(
                     monthly_income=application_data.monthly_income,
                     employment_status=application_data.employment_status,
                     message=application_data.message or "No additional message provided",
+                    propflow_thread_id=app_propflow_id,
                 )
             except Exception as notif_err:
                 # Notification failures must never roll back a successful submission
@@ -785,13 +754,39 @@ async def approve_application(
                 detail="Failed to fetch updated application"
             )
         
-        # Send notification to tenant
+        # ── PropFlow bridge: if application was created via PropFlow, resume workflow ──
+        # PropFlow handles agreement generation + notifications internally.
+        propflow_thread_id = application.get("propflow_thread_id")
+        if propflow_thread_id:
+            try:
+                from app.propflow.graph import propflow_graph
+                graph = propflow_graph()
+                thread_config = {"configurable": {"thread_id": propflow_thread_id}}
+                graph.update_state(thread_config, {"application_status": "approved"})
+                resume_result = await graph.ainvoke(None, config=thread_config)
+                logger.info(
+                    f"🔄 [PROPFLOW] Resumed workflow {propflow_thread_id} after manual "
+                    f"approval → stage={resume_result.get('current_stage', 'unknown')}"
+                )
+                return {
+                    "success": True,
+                    "application": updated_app_response.data,
+                    "propflow_resumed": True,
+                    "message": "Application approved. PropFlow workflow resumed \u2014 agreement will be generated automatically.",
+                }
+            except Exception as propflow_err:
+                logger.warning(
+                    f"⚠️ [APP] PropFlow resume failed for {propflow_thread_id}, "
+                    f"falling back to manual flow: {propflow_err}"
+                )
+
+        # ─ Manual flow (non-PropFlow or PropFlow resume failed) ─
         from app.services.notification_service import notification_service
-        
+
         landlord_name = current_user.get("full_name", "Landlord")
         landlord_email = current_user.get("email")
         landlord_phone = current_user.get("phone_number")
-        
+
         await notification_service.notify_application_approved(
             application_id=application_id,
             property_id=property_data.get("id"),
@@ -802,50 +797,29 @@ async def approve_application(
             tenant_phone=tenant_data.get("phone_number"),
             landlord_name=landlord_name,
         )
-        
+
         # Auto-generate rental agreement (NuloGuide Stage 5)
         logger.info(f"🔥 [APP] Auto-generating agreement for approved application {application_id}")
         logger.info(f"🔥 [APP] Property data: {property_data}")
         logger.info(f"🔥 [APP] Tenant data: {tenant_data}")
-        
-        # Use centralized agreement service
+
         from app.services.agreement_service import agreement_service
-        
+
         agreement = await agreement_service.auto_generate_agreement(
             application_id=application_id,
             property_data=property_data,
             tenant_data=tenant_data,
-            landlord_name=landlord_name
+            landlord_name=landlord_name,
+            landlord_email=landlord_email,
+            landlord_phone=landlord_phone,
         )
-        
+
         if agreement:
             agreement_id = agreement['id']
             logger.info(f"✅ [APP] Auto-generated agreement {agreement_id} for application {application_id}")
-            
-            # Send notification about agreement creation
-            try:
-                await notification_service.notify_agreement_created(
-                    agreement_id=agreement_id,
-                    application_id=application_id,
-                    property_title=property_data.get("title", "Property"),
-                    tenant_id=tenant_data.get("id"),
-                    tenant_name=tenant_data.get("full_name", "Tenant"),
-                    tenant_email=tenant_data.get("email"),
-                    tenant_phone=tenant_data.get("phone_number"),
-                    landlord_id=landlord_id,
-                    landlord_name=landlord_name,
-                    landlord_email=landlord_email,
-                    landlord_phone=landlord_phone,
-                )
-                logger.info(f"✅ [APP] Agreement notification sent for {agreement_id}")
-            except Exception as e:
-                logger.error(f"❌ [APP] Failed to send agreement notification: {e}")
         else:
             logger.error(f"❌ [APP] Failed to auto-generate agreement for application {application_id}")
-        
-        # TODO: Update property status to rented (implement in agreement phase)
-        # TODO: Update trust scores (+5 bonus for both)
-        
+
         return {
             "success": True,
             "application": updated_app_response.data,
@@ -963,6 +937,36 @@ async def reject_application(
             updated_app_response_data = application
         else:
             updated_app_response_data = updated_app_response.data
+
+        # ── PropFlow bridge: if application was created via PropFlow, resume workflow ──
+        propflow_thread_id = application.get("propflow_thread_id")
+        if propflow_thread_id:
+            try:
+                from app.propflow.graph import propflow_graph
+                graph = propflow_graph()
+                thread_config = {"configurable": {"thread_id": propflow_thread_id}}
+                graph.update_state(thread_config, {
+                    "application_status": "rejected",
+                    "rejection_reason": rejection_data.reason,
+                    "current_stage": "rejected",
+                })
+                resume_result = await graph.ainvoke(None, config=thread_config)
+                logger.info(
+                    f"🔄 [PROPFLOW] Resumed workflow {propflow_thread_id} after manual "
+                    f"rejection → stage={resume_result.get('current_stage', 'unknown')}"
+                )
+            except Exception as propflow_err:
+                logger.warning(
+                    f"⚠️ [APP] PropFlow resume failed on reject for {propflow_thread_id}: "
+                    f"{propflow_err}. Rejection itself succeeded."
+                )
+
+            return {
+                "success": True,
+                "application": updated_app_response_data,
+                "propflow_resumed": True,
+                "message": "Application rejected. PropFlow workflow has been notified.",
+            }
 
         # Send notification to tenant — wrapped in its own try/except so a
         # notification-side failure (e.g. SMS gateway down) cannot roll back

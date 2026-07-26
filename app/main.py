@@ -17,10 +17,11 @@ from app.routes import (
     landlord_onboarding, landlord_dashboard, tenant_dashboard, notifications, admin_dashboard,
     admin_landlord_users, admin_tenant_users, locations, agreements, maintenance, health,
     engagement, banner_dismissals, payments, license, groq_agreement, nomba, disbursements,
-    admin_transactions,
+    admin_transactions, subscribers, propflow,
 )
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -52,9 +53,18 @@ def setup_logging():
     # Create console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    
-    # Add handler to logger
     logger.addHandler(console_handler)
+
+    # File handler with auto-rotation (5MB per file, keep 3 backups)
+    log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "serverlog.txt")
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
     
     return logger
 
@@ -235,6 +245,8 @@ app.include_router(disbursements.router, prefix="/api/v1", tags=["Nomba Disburse
 app.include_router(license.router, prefix="/api/v1", tags=["License Management"])
 app.include_router(groq_agreement.router, tags=["Groq AI Agreement"])
 app.include_router(admin_transactions.router, prefix="/api/v1", tags=["Admin Transactions"])
+app.include_router(subscribers.router, prefix="/api/v1", tags=["Landing Subscribers"])
+app.include_router(propflow.router, prefix="/api/v1", tags=["PropFlow AI Agent"])
 
 # Test / preview endpoints (NO AUTH) — useful for QA spot-checks of
 # generated PDFs without going through the full sign flow. Exposed under
@@ -253,7 +265,7 @@ async def startup_event():
         supabase_url=settings.SUPABASE_URL,
         cors_origins=settings.cors_origins
     ))
-    
+
     # Check license status
     from app.license import LicenseService
     is_valid, message = LicenseService.check_license_valid()
@@ -265,12 +277,25 @@ async def startup_event():
         license_message=message,
         expiry_date=status_info.get('expiry_date', 'N/A')
     ))
-    
- 
+
+    # Initialize PropFlow persistent checkpointer (Postgres or MemorySaver fallback)
+    try:
+        from app.propflow.checkpointer import init_checkpointer
+        await init_checkpointer()
+    except Exception as exc:
+        logger.warning("[STARTUP] PropFlow checkpointer init skipped: %s", exc)
+
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("👋 Nulo Africa API shutting down...")
+
+    # Close PropFlow checkpointer connection pool
+    try:
+        from app.propflow.checkpointer import close_checkpointer
+        await close_checkpointer()
+    except Exception as exc:
+        logger.warning("[SHUTDOWN] Checkpointer close warning: %s", exc)
 
 if __name__ == "__main__":
     import uvicorn

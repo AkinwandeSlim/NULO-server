@@ -14,16 +14,13 @@ import os
 import re
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
 from app.database import supabase_admin
 from app.middleware.auth import get_current_user
 from app.services.nomba_client import NombaAPIError, nomba_client
-from app.services.nomba_helpers import (
-    calculate_expected_amount,
-    calculate_next_due_date,
-    classify_payment,
-)
+from app.services.nomba_helpers import classify_payment
+from app.services.payment_service import PaymentServiceError, payment_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,6 +36,10 @@ async def provision_nomba(
     agreement_id: str,
     background_tasks: BackgroundTasks,     # Rule 5: before Depends
     current_user=Depends(get_current_user),
+    propflow_thread_id: str = Query(
+        default=None,
+        description="Optional PropFlow workflow thread ID for context-aware resume",
+    ),
 ):
     # Fetch agreement -- Rule 6: run_in_executor
     result = await asyncio.get_event_loop().run_in_executor(
@@ -75,199 +76,26 @@ async def provision_nomba(
             "frequency": agreement.get("payment_frequency"),
         }
 
-    # Get landlord name + property hint -- Rule 1: .eq('id', ...) for shared PK tables
-    # Banking convention: account name = beneficiary (landlord), not payer (tenant)
-    # Query users table for full_name (shared PK pattern), fallback to landlord_profiles
-    user_result = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: supabase_admin
-            .table("users")
-            .select("full_name, email")
-            .eq("id", agreement["landlord_id"])
-            .single()
-            .execute(),
-    )
-    user = user_result.data or {}
-
-    # Fetch property title for disambiguation (landlord may have multiple properties)
-    property_title = ""
-    if agreement.get("property_id"):
-        prop_result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("properties")
-                .select("title")
-                .eq("id", agreement["property_id"])
-                .single()
-                .execute(),
-        )
-        if prop_result.data and prop_result.data.get("title"):
-            property_title = prop_result.data["title"][:20].strip()
-
-    # Build account name: landlord name with optional property hint
-    # Nomba prefixes with "Nomba / " automatically, so we just provide the name part
-    landlord_name = (
-        user.get("full_name")
-        or user.get("email")
-        or "NuloAfrica Landlord"
-    ).strip()
-
-    if property_title:
-        raw_name = f"{landlord_name} {property_title}"
-    else:
-        raw_name = landlord_name
-
-    # Sanitize: only allow ASCII letters/digits and single spaces.
-    # Nomba rejects ANY special character (including '-' and '.'), so we
-    # strip everything that is not A-Z/0-9/space, then collapse runs of
-    # spaces to a single space and trim.
-    sanitized = []
-    for char in raw_name.strip():
-        if char.isascii() and (char.isalnum() or char == " "):
-            sanitized.append(char)
-    clean_name = " ".join("".join(sanitized).split())  # collapse whitespace
-
-    # Nomba spec: accountName must be 8-64 chars.
-    # Strip whitespace, pad short names, truncate long names.
-    account_name = clean_name[:64]
-    if len(account_name) < 8:
-        # Pad to satisfy the 8-char minimum (e.g. "Adaeze Okafor" -> "Adaeze Okafor NuloAfrica")
-        account_name = (account_name + " NuloAfrica")[:64]
-
-    # Nomba spec: accountRef must be 16-64 chars. agreement.id is a UUID
-    # (36 chars) so it always satisfies this -- no padding needed.
-    if not (16 <= len(agreement_id) <= 64):
-        raise HTTPException(
-            400,
-            f"agreement_id must be 16-64 chars (got {len(agreement_id)})",
-        )
-
-    frequency = agreement.get("payment_frequency") or "MONTHLY"
-    expected_amount = calculate_expected_amount(
-        float(agreement["rent_amount"]), frequency
-    )
-
-    # Sub-account is REQUIRED for VA provisioning. Without it, the VA would be
-    # scoped to the parent account, and Nomba's webhook redirect service would
-    # look up the parent's webhook URL config -- which is NOT registered for
-    # our hackathon submission. Result: silent 404 "No redirect configuration"
-    # on every inbound payment. Hard-fail fast here so callers see the issue
-    # instead of producing broken VAs.
-    if not nomba_client.sub_account_id:
-        raise HTTPException(
-            500,
-            "NOMBA_SUB_ACCOUNT_ID is not set; cannot provision a sub-account-"
-            "scoped VA (Path B). Configure the env var and retry.",
-        )
-
-    # Nomba spec: accountRef must be 16-64 chars. We append "-SUB" (4 chars)
-    # to a UUID (36 chars) for a total of 41 chars -- well within the spec.
-    # The suffix lets us tag which VAs are sub-account-scoped at lookup time
-    # (see disbursements.py auto-pick of the sub-account transfer endpoint).
-    sub_account_ref = f"{agreement_id}-SUB"
-
-    # Log exact payload being sent to Nomba for debug visibility
-    logger.info(
-        "Nomba VA provision attempt (Path B sub-account) | agreement=%s | "
-        "account_ref=%s | account_name=%r (len=%d) | expected_local=%.2f",
-        agreement_id, sub_account_ref, account_name, len(account_name), expected_amount,
-    )
-
-    # RECOVERY: If a previous provisioning call succeeded on Nomba's side
-    # but failed on ours (e.g. server crash between Nomba 200 and our DB
-    # write), the VA is orphaned on Nomba with our accountRef. Nomba will
-    # then reject the next create with "accountRef already exists". We
-    # try to fetch the existing VA first and use it.
-    #
-    # Path B (sub-account) stores accountRef = {uuid}-SUB on Nomba, so the
-    # recovery GET must use the suffixed ref. get_virtual_account() returns
-    # None cleanly on 404 (nomba_client.py:443-444), so if Nomba 404s on the
-    # suffixed ref via the parent-header GET, recovery simply falls through
-    # to the Path-B creation call below. The header stays as the parent
-    # per the PRD's golden rule (header is always the parent).
-    data = None
+    # ── Delegate to shared Payment Service (Nomba sandbox first, mock fallback) ─
     try:
-        existing = await nomba_client.get_virtual_account(sub_account_ref)
-        if existing and not existing.get("expired", False):
-            logger.info(
-                "Recovered existing Nomba VA for agreement=%s | nuban=%s",
-                agreement_id, existing.get("bankAccountNumber"),
-            )
-            data = existing
-    except NombaAPIError as exc:
-        # GET failed for a non-404 reason -- log but try create anyway,
-        # create will fail with the real reason if there's a problem.
-        logger.warning(
-            "GET virtual_account failed during recovery | agreement=%s | err=%s",
-            agreement_id, exc,
+        result = await payment_service.provision_virtual_account(
+            agreement_id=agreement_id,
+            propflow_workflow_id=propflow_thread_id,
         )
+    except PaymentServiceError as exc:
+        raise HTTPException(400, str(exc))
 
-    if data is None:
-        try:
-            # Path B: provision under the sub-account. accountRef is the
-            # suffixed value (sub_account_ref) so the on-Nomba record matches
-            # the aliasAccountReference that webhooks will echo back.
-            # create_virtual_account_for_subaccount does not take
-            # expected_amount (body is exactly {accountRef, accountName});
-            # expected_amount is still persisted locally to
-            # agreements.expected_payment_amount below.
-            data = await nomba_client.create_virtual_account_for_subaccount(
-                sub_account_id=nomba_client.sub_account_id,
-                account_ref=sub_account_ref,
-                account_name=account_name,
-            )
-        except NombaAPIError as exc:
-            # Surface the FULL Nomba error in the response so callers can see
-            # the actual validation message (the underlying response_body is
-            # already attached to the NombaAPIError string in the client).
-            logger.error(
-                "Nomba provisioning failed | agreement=%s | full_error=%s",
-                agreement_id, exc,
-            )
-            raise HTTPException(502, f"Nomba provisioning failed: {exc}")
-
-    next_due = None
-    if agreement.get("lease_start_date"):
-        start = date.fromisoformat(str(agreement["lease_start_date"]))
-        next_due = calculate_next_due_date(start, frequency)
-
-    # Write to agreements table
-    await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: supabase_admin
-            .table("agreements")
-            .update({
-                "virtual_account_number": data["bankAccountNumber"],
-                "virtual_account_name": data["bankAccountName"],
-                "nomba_account_ref": data["accountRef"],
-                "expected_payment_amount": expected_amount,
-                "payment_frequency": frequency,
-                "next_payment_due_date": str(next_due) if next_due else None,
-                "reconciliation_status": "PENDING",
-                "total_received_amount": 0,
-            })
-            .eq("id", agreement_id)
-            .execute(),
-    )
-
-    logger.info(
-        "Virtual account provisioned | agreement=%s | nuban=%s | freq=%s | expected=%.2f",
-        agreement_id, data["bankAccountNumber"], frequency, expected_amount,
-    )
-
+    # Fire-and-forget notification to tenant (non-blocking)
     background_tasks.add_task(
-        _notify_tenant_account_ready, agreement_id, data
+        _notify_tenant_account_ready,
+        agreement_id,
+        {
+            "bankAccountNumber": result["virtual_account_number"],
+            "bankAccountName": result["virtual_account_name"],
+        },
     )
 
-    return {
-        "status": "provisioned",
-        "virtual_account_number": data["bankAccountNumber"],
-        "virtual_account_name": data["bankAccountName"],
-        "bank_name": data.get("bankName"),
-        "expected_amount": expected_amount,
-        "frequency": frequency,
-        "next_due_date": str(next_due) if next_due else None,
-    }
+    return result
 
 
 # ============================================================
@@ -864,15 +692,47 @@ async def _reconcile_payment(
         agreement["id"], amount_received, expected, new_status,
     )
 
-    # Auto-disbursement: if status is FULL_PAYMENT and account_ref ends with -SUB
-    if new_status == "FULL_PAYMENT" and account_ref.upper().endswith("-SUB"):
+    # ── PropFlow Enhancement: Send SMS for payment anomalies ─────────────────
+    if new_status in ["UNDERPAYMENT", "OVERPAYMENT"]:
         try:
-            await _auto_disburse_to_landlord(agreement["id"], transfer_row.get("id"), amount_received)
-        except Exception as exc:
-            logger.error(
-                "Auto-disbursement failed | agreement=%s | error=%s",
-                agreement["id"], exc,
+            from app.propflow.services.qwen_client import qwen_client
+            
+            # Generate anomaly SMS via Qwen
+            anomaly_type = "underpayment" if new_status == "UNDERPAYMENT" else "overpayment"
+            anomaly_sms = await qwen_client.generate_anomaly_sms(
+                expected=expected,
+                actual=amount_received,
+                anomaly_type=anomaly_type
             )
+            
+            logger.info(
+                f"PropFlow anomaly SMS generated | agreement={agreement['id']} | "
+                f"type={anomaly_type} | sms_length={len(anomaly_sms)} chars"
+            )
+            
+            # TODO: Connect to SMS provider (Nomba SMS, Twilio, etc.)
+            # For now, log the generated SMS
+            logger.info(f"Anomaly SMS: {anomaly_sms}")
+            
+        except Exception as sms_exc:
+            logger.warning(
+                f"PropFlow SMS generation failed | agreement={agreement['id']} | error={sms_exc}"
+            )
+
+    # Auto-disbursement: DISABLED — landlord must explicitly release funds
+    # via the "Release Funds" button (manual route) or "Confirm Payment" (PropFlow).
+    # This ensures:
+    #   1. Landlord explicitly acknowledges receipt before funds move
+    #   2. Tenant notification fires on acknowledgment, not silently
+    #   3. Admin sees a clear audit trail: reconciled → released → completed
+    # if new_status == "FULL_PAYMENT" and account_ref.upper().endswith("-SUB"):
+    #     try:
+    #         await _auto_disburse_to_landlord(agreement["id"], transfer_row.get("id"), amount_received)
+    #     except Exception as exc:
+    #         logger.error(
+    #             "Auto-disbursement failed | agreement=%s | error=%s",
+    #             agreement["id"], exc,
+    #         )
 
 
 async def _auto_disburse_to_landlord(agreement_id: str, source_transfer_id: str, amount_received: float):

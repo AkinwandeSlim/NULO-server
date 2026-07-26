@@ -15,6 +15,7 @@ KEY CHANGE:
 - Frontend always shows one consistent agreement
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -405,18 +406,32 @@ Signatures below constitute acceptance of all terms and conditions.
         application_id: str,
         property_data: Dict[str, Any],
         tenant_data: Dict[str, Any],
-        landlord_name: str
+        landlord_name: str,
+        propflow_workflow_id: Optional[str] = None,
+        landlord_email: Optional[str] = None,
+        landlord_phone: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Auto-generate agreement for approved application
         Enhanced with seamless AI integration
+
+        Args:
+            application_id: The approved application ID
+            property_data: Property details dict
+            tenant_data: Tenant user data dict
+            landlord_name: Landlord's full name
+            propflow_workflow_id: Optional LangGraph thread ID for PropFlow
+                                  context-aware resume. When provided, it is
+                                  stored in generation_metadata on the
+                                  agreement row and linked via the
+                                  application's propflow_thread_id.
         """
         try:
             logger.info(f"🔥 [AGREEMENT SERVICE] Auto-generating enhanced agreement for application {application_id}")
-            
+
             # Calculate standard lease dates
             lease_dates = AgreementService.calculate_standard_lease_dates()
-            
+
             # Generate enhanced agreement terms (AI first, fallback to template)
             terms_result = await AgreementService.generate_enhanced_agreement_terms(
                 property_data=property_data,
@@ -425,7 +440,7 @@ Signatures below constitute acceptance of all terms and conditions.
                 lease_dates=lease_dates,
                 application={"id": application_id}
             )
-            
+
             # Create agreement dictionary
             agreement_dict = AgreementService.create_agreement_dict(
                 application_id=application_id,
@@ -436,10 +451,14 @@ Signatures below constitute acceptance of all terms and conditions.
                 lease_dates=lease_dates,
                 terms=terms_result["terms"]
             )
-            
+
             # Add generation metadata
             agreement_dict["agreement_source"] = terms_result["source"]
-            agreement_dict["generation_metadata"] = terms_result["metadata"]
+            metadata = terms_result["metadata"]
+            if propflow_workflow_id:
+                metadata["propflow_workflow_id"] = propflow_workflow_id
+                agreement_dict["propflow_thread_id"] = propflow_workflow_id
+            agreement_dict["generation_metadata"] = metadata
             
             logger.info(f"🔥 [AGREEMENT SERVICE] Inserting enhanced agreement (source: {terms_result['source']})")
             
@@ -449,6 +468,31 @@ Signatures below constitute acceptance of all terms and conditions.
             if agreement_response.data:
                 agreement_id = agreement_response.data[0]['id']
                 logger.info(f"✅ [AGREEMENT SERVICE] Enhanced agreement {agreement_id} created ({terms_result['source']})")
+
+                # ── Notification side-effect ────────────────────────────────────
+                # Fire agreement-created notification so both tenant and landlord
+                # get in-app + email alerts. This runs for both manual route and
+                # PropFlow paths since both call this service.
+                try:
+                    from app.services.notification_service import notification_service
+                    landlord_id = property_data.get("landlord_id", "")
+                    await notification_service.notify_agreement_created(
+                        agreement_id=agreement_id,
+                        application_id=application_id,
+                        property_title=property_data.get("title", "Property"),
+                        tenant_id=tenant_data.get("id", ""),
+                        tenant_name=tenant_data.get("full_name", "Tenant"),
+                        tenant_email=tenant_data.get("email"),
+                        tenant_phone=tenant_data.get("phone_number"),
+                        landlord_id=landlord_id,
+                        landlord_name=landlord_name,
+                        landlord_email=landlord_email,
+                        landlord_phone=landlord_phone,
+                    )
+                    logger.info(f"✅ [AGREEMENT SERVICE] Agreement notification sent for {agreement_id}")
+                except Exception as notif_err:
+                    logger.warning(f"⚠️ [AGREEMENT SERVICE] Agreement notification failed (non-fatal): {notif_err}")
+
                 return agreement_response.data[0]
             else:
                 logger.error(f"❌ [AGREEMENT SERVICE] Failed to insert agreement: {agreement_response}")

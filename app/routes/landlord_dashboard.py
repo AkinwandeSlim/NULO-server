@@ -622,7 +622,7 @@ def get_recent_activity(landlord_id: str, limit: int = 10) -> List[dict]:
             })
         
         # Get recent applications with optimized queries
-        applications_result = supabase_admin.table("applications").select("id, user_id, property_id, created_at").in_("property_id", property_ids).order("created_at", desc=True).limit(limit).execute()
+        applications_result = supabase_admin.table("applications").select("id, user_id, property_id, propflow_thread_id, created_at").in_("property_id", property_ids).order("created_at", desc=True).limit(limit).execute()
         
         for app in applications_result.data or []:
             tenant_name = tenants.get(app["user_id"], "Unknown")
@@ -805,7 +805,7 @@ async def get_landlord_dashboard(
                 result = supabase_admin.table("applications") \
                     .select(
                         "id, property_id, user_id, status, "
-                        "created_at, viewed_by_landlord"
+                        "propflow_thread_id, created_at, viewed_by_landlord"
                     ) \
                     .in_("property_id", property_ids) \
                     .neq("status", "withdrawn") \

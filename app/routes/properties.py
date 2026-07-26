@@ -31,7 +31,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 router = APIRouter(prefix="/properties")
-executor = ThreadPoolExecutor(max_workers=4)
+# Increased thread pool for better handling of concurrent database requests
+# Helps prevent WinError 10035 socket exhaustion under load
+executor = ThreadPoolExecutor(max_workers=8)
 
 # ============================================================================
 # VALIDATION HELPERS
@@ -406,7 +408,7 @@ async def search_properties(
         
         # Execute query with timeout handling and retry logic
         query_start = time.time()
-        max_retries = 2
+        max_retries = 3
         retry_count = 0
         response = None
         last_error = None
@@ -414,23 +416,32 @@ async def search_properties(
         # Retry loop with exponential backoff
         while retry_count <= max_retries:
             try:
-                response = query.execute()
+                # Execute in thread pool to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(executor, lambda: query.execute()),
+                    timeout=30.0  # 30 second timeout per attempt
+                )
                 break  # Success, exit retry loop
-            except Exception as query_error:
+            except (asyncio.TimeoutError, Exception) as query_error:
                 last_error = query_error
-                is_timeout = "timed out" in str(query_error).lower() or "timeout" in str(query_error).lower()
+                error_str = str(query_error).lower()
+                is_timeout = "timed out" in error_str or "timeout" in error_str
+                is_socket_error = "winerror 10035" in error_str or "10035" in error_str or "non-blocking socket" in error_str
                 
-                if is_timeout and retry_count < max_retries:
-                    # Retry on timeout with exponential backoff
-                    wait_time = 0.5 * (2 ** retry_count)  # 0.5s, 1s, 2s
-                    print(f"⏱️ [QUERY TIMEOUT] Retry {retry_count + 1}/{max_retries} after {wait_time}s...")
+                # Retry on timeout or socket errors
+                if (is_timeout or is_socket_error) and retry_count < max_retries:
+                    wait_time = 0.5 * (2 ** retry_count)  # 0.5s, 1s, 2s, 4s
+                    error_type = "SOCKET ERROR" if is_socket_error else "QUERY TIMEOUT"
+                    print(f"⏱️ [{error_type}] Retry {retry_count + 1}/{max_retries} after {wait_time}s... Error: {query_error}")
                     await asyncio.sleep(wait_time)
                     retry_count += 1
                 else:
-                    # Final attempt failed or non-timeout error - calculate duration before raising
+                    # Final attempt failed or non-retryable error
                     query_duration = time.time() - query_start
-                    if is_timeout:
-                        print(f"❌ [QUERY TIMEOUT] All retries exhausted after {query_duration:.1f}s")
+                    if is_timeout or is_socket_error:
+                        error_type = "SOCKET ERROR" if is_socket_error else "QUERY TIMEOUT"
+                        print(f"❌ [{error_type}] All retries exhausted after {query_duration:.1f}s")
                     raise query_error
         
         # Calculate query duration after successful query or all retries exhausted

@@ -1,0 +1,1048 @@
+"""
+PropFlow API Routes
+===================
+FastAPI endpoints for the PropFlow AI agent system.
+
+Endpoints:
+  POST /api/v1/propflow/chat          - Start new PropFlow conversation
+  POST /api/v1/propflow/select/{id}   - Tenant selects a property from matches
+  POST /api/v1/propflow/resume/{id}   - Resume workflow (landlord approval)
+  GET  /api/v1/propflow/status/{id}   - Check workflow status
+  GET  /api/v1/propflow/threads       - List threads (tenant/landlord multi-tenant)
+  GET  /api/v1/propflow/health        - PropFlow health check
+"""
+
+import asyncio
+import logging
+import traceback
+import uuid
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
+from pydantic import BaseModel, Field
+
+from app.middleware.auth import get_current_user
+from app.database import get_supabase_admin
+from app.propflow.graph import propflow_graph
+from app.propflow.state import PropFlowState
+from app.propflow.config import propflow_settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/propflow", tags=["PropFlow AI Agent"])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REQUEST/RESPONSE MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ChatRequest(BaseModel):
+    """Start new PropFlow conversation."""
+    message: str = Field(..., description="User's rental inquiry message")
+    use_memory: bool = Field(default=True, description="Whether to use persistent memory")
+    mock_mode: bool = Field(default=False, description="Use mock responses (testing)")
+
+class ChatResponse(BaseModel):
+    """PropFlow chat response."""
+    success: bool
+    workflow_id: str
+    current_stage: str
+    response_message: str
+    extracted_intent: Optional[Dict[str, Any]] = None
+    matched_properties: Optional[list] = None
+    application_id: Optional[str] = None
+    error_message: Optional[str] = None
+
+class ResumeRequest(BaseModel):
+    """Resume PropFlow workflow — landlord decision OR tenant lease signing."""
+    decision: str = Field(
+        ...,
+        description="'approved' or 'rejected' (landlord) | 'signed' (tenant)"
+    )
+    rejection_reason: Optional[str] = Field(None, description="Reason if rejected")
+
+class ResumeResponse(BaseModel):
+    """PropFlow resume response."""
+    success: bool
+    workflow_id: str
+    current_stage: str
+    response_message: str
+    agreement_id: Optional[str] = None
+    virtual_account_number: Optional[str] = None
+    error_message: Optional[str] = None
+
+class StatusResponse(BaseModel):
+    """PropFlow workflow status."""
+    success: bool
+    workflow_id: str
+    current_stage: str
+    tenant_id: str
+    created_at: datetime
+    last_updated: datetime
+    extracted_intent: Optional[Dict[str, Any]] = None
+    selected_property_id: Optional[str] = None
+    application_id: Optional[str] = None
+    landlord_briefing: Optional[str] = None
+    error_log: list[str] = []
+
+
+class SelectRequest(BaseModel):
+    """Tenant selects a property from matched results."""
+    property_index: int = Field(..., ge=0, description="Index of the selected property in the matches list")
+
+
+class SelectResponse(BaseModel):
+    """PropFlow property selection response."""
+    success: bool
+    workflow_id: str
+    current_stage: str
+    response_message: str
+    application_id: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class ThreadInfoResponse(BaseModel):
+    """Summary info for a PropFlow thread in multi-tenant listing."""
+    thread_id: str
+    tenant_id: str
+    tenant_name: Optional[str] = None
+    tenant_phone: Optional[str] = None
+    landlord_id: Optional[str] = None
+    property_title: Optional[str] = None
+    current_stage: str = ""
+    status: str = "active"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ThreadListResponse(BaseModel):
+    """PropFlow thread list response."""
+    success: bool
+    threads: List[ThreadInfoResponse] = []
+    total: int = 0
+    error_message: Optional[str] = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTE HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/chat", response_model=ChatResponse)
+async def start_propflow_chat(
+    request: ChatRequest,
+    current_user = Depends(get_current_user),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Start new PropFlow conversation.
+    
+    Process user's rental inquiry through the AI agent workflow:
+    1. Extract intent (Qwen + Nigerian Pidgin support)
+    2. Match properties (database search)
+    3. Create application (if property found)
+    4. Generate landlord briefing (Qwen AI)
+    """
+    try:
+        # Validate user is tenant
+        if current_user.get("user_type") != "tenant":
+            raise HTTPException(
+                status_code=403,
+                detail="PropFlow is only available to tenants"
+            )
+
+        # Create initial PropFlow state
+        workflow_id = f"propflow-{uuid.uuid4().hex[:12]}"
+
+        initial_state = PropFlowState(
+            workflow_id=workflow_id,
+            tenant_id=uuid.UUID(current_user["id"]),
+            raw_inquiry_text=request.message,  # ✅ Correct field name
+            current_stage="intent_extraction",
+            error_log=[],
+            # Initialize all optional fields as None
+            extracted_intent=None,
+            extraction_confidence=None,
+            property_matches=None,
+            selected_property_id=None,
+            application_id=None,
+            application_status=None,
+            agreement_id=None,
+            agreement_status=None,
+            agreement_pdf_oss_key=None,
+            nomba_account_ref=None,
+            nomba_virtual_account_number=None,
+            expected_payment_amount=None,
+            reconciliation_status=None,
+            disbursement_merchant_tx_ref=None,
+            prior_tenant_memories=None,
+            prior_landlord_memories=None,
+            landlord_briefing=None,
+            is_returning_tenant=None,
+            disbursement_amount=None,
+            platform_fee=None,
+            rejection_reason=None,
+            landlord_id=None
+        )
+        
+        print(f"[PROPFLOW] Starting workflow {workflow_id} for user {current_user['id']}")
+        print(f"📝 [PROPFLOW] User message: {request.message}")
+        
+        # Process through PropFlow graph
+        if request.mock_mode:
+            print("[PROPFLOW] Running in MOCK MODE")
+            
+        config = {"configurable": {"thread_id": workflow_id}}
+        result = await propflow_graph().ainvoke(initial_state, config=config)
+        
+        print(f"[PROPFLOW] Workflow completed: {result['current_stage']}")
+        
+        # Generate response message based on current stage
+        response_message = _generate_response_message(result)
+        
+        return ChatResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage=result["current_stage"],
+            response_message=response_message,
+            extracted_intent=result.get("extracted_intent"),
+            matched_properties=result.get("property_matches"),  # ✅ Correct field name
+            application_id=str(result["application_id"]) if result.get("application_id") else None,
+        )
+        
+    except Exception as e:
+        print(f"[PROPFLOW] Chat failed: {e}")
+        traceback.print_exc()
+        return ChatResponse(
+            success=False,
+            workflow_id=workflow_id if 'workflow_id' in locals() else "unknown",
+            current_stage="error",
+            response_message="I'm sorry, I encountered an error processing your request. Please try again.",
+            error_message=str(e)
+        )
+
+
+@router.post("/select/{workflow_id}", response_model=SelectResponse)
+async def select_property(
+    workflow_id: str,
+    request: SelectRequest,
+    current_user = Depends(get_current_user),
+):
+    """
+    Tenant selects a property from the matched results list.
+    Resumes the workflow after INTERRUPT #1.
+
+    Steps:
+      1. Retrieve the paused graph state from the checkpointer
+      2. Get the property_matches list from the state
+      3. Update state with the selected property's ID + landlord_id
+      4. Resume the graph -> continues to create_application
+    """
+    try:
+        graph = propflow_graph()
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+
+        # Step 1: Get property_matches directly from checkpoint (get_state
+        # can lose channel_values during reconstruction — read raw instead).
+        # Use async aget_tuple so httpx (not requests.Session) handles SSL.
+        saved = await graph.checkpointer.aget_tuple(thread_config)
+        if saved:
+            channel_values = saved.checkpoint.get("channel_values", {})
+            matches = channel_values.get("property_matches", []) or []
+        else:
+            matches = []
+
+        if not matches:
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="error",
+                response_message="No properties found to select from. Please start a new search.",
+                error_message="No property_matches in workflow state",
+            )
+
+        if request.property_index < 0 or request.property_index >= len(matches):
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="error",
+                response_message=f"Invalid selection. Please choose between 1 and {len(matches)}.",
+                error_message=f"property_index {request.property_index} out of range (0-{len(matches)-1})",
+            )
+
+        # Step 2: Get the selected property
+        selected = matches[request.property_index]
+        selected_id = uuid.UUID(selected["id"])
+        landlord_id = uuid.UUID(selected["landlord_id"]) if selected.get("landlord_id") else None
+
+        # Step 3: Inject selection into the paused state
+        graph.update_state(
+            thread_config,
+            {
+                "selected_property_id": selected_id,
+                "landlord_id": landlord_id,
+                "current_stage": "property_selected",
+            },
+        )
+
+        # Step 4: Resume the graph -> proceeds to create_application
+        result = await graph.ainvoke(None, config=thread_config)
+
+        response_message = _generate_response_message(result)
+
+        return SelectResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage=result.get("current_stage", "unknown"),
+            response_message=response_message,
+            application_id=str(result.get("application_id")) if result.get("application_id") else None,
+        )
+
+    except Exception as e:
+        print(f"[ERROR] [PROPFLOW] Select failed: {e}")
+        return SelectResponse(
+            success=False,
+            workflow_id=workflow_id,
+            current_stage="error",
+            response_message="Failed to process your property selection. Please try again.",
+            error_message=str(e),
+        )
+
+
+@router.post("/resume/{workflow_id}", response_model=ResumeResponse)
+async def resume_propflow_workflow(
+    workflow_id: str,
+    request: ResumeRequest,
+    current_user = Depends(get_current_user)
+):
+    """
+    Resume a paused PropFlow workflow.
+    Smart detection of which INTERRUPT the graph is paused at:
+
+    INTERRUPT #2 (before create_agreement) — Landlord decision:
+        { decision: "approved" }
+        { decision: "rejected", rejection_reason: "..." }
+
+    INTERRUPT #3 (before provision_nomba_dva) — Tenant signing:
+        { decision: "signed" }
+    """
+    try:
+        graph = propflow_graph()
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+
+        # Step 1: Read workflow state from checkpoint directly (get_state()
+        # can lose channel_values during reconstruction — read raw instead).
+        # Use async aget_tuple so httpx (not requests.Session) handles SSL.
+        saved = await graph.checkpointer.aget_tuple(thread_config)
+        if not saved:
+            return ResumeResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="expired",
+                response_message="Workflow not found or has expired.",
+                error_message="No checkpoint found for this thread_id",
+            )
+
+        channel_values = saved.checkpoint.get("channel_values", {})
+        workflow_stage = channel_values.get("current_stage", "")
+        if not workflow_stage or workflow_stage in ("idle", "unknown"):
+            return ResumeResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="expired",
+                response_message=(
+                    "This PropFlow session has expired — the server was restarted, "
+                    "which cleared in-progress workflows. "
+                    "You can still review this application from the Applications page."
+                ),
+                error_message="Workflow state not found in checkpointer (MemorySaver lost on restart)",
+            )
+
+        # Step 2: Determine which interrupt we're at
+        # Use current_stage from channel_values for gate detection.
+        # next_nodes is intentionally empty — versions_seen.keys() would give
+        # ALL nodes, not just the next one. current_stage fallback is reliable.
+        next_nodes: list[str] = []
+        is_at_landlord_gate = workflow_stage == "awaiting_landlord_approval"
+        is_at_signing_gate = workflow_stage in ("agreement_drafted", "awaiting_landlord_signature")
+        is_at_payment_gate = workflow_stage in ("nomba_provisioned", "payment_confirmed")
+
+        print(f"🏠 [PROPFLOW] Resume for {workflow_id}: decision={request.decision}, "
+              f"next_nodes={next_nodes}, workflow_stage={workflow_stage}")
+
+        # Role verification
+        workflow_tenant_id = str(channel_values.get("tenant_id", ""))
+        workflow_landlord_id = str(channel_values.get("landlord_id", ""))
+        caller_id = current_user["id"]
+        caller_type = current_user.get("user_type", "")
+
+        # ── ROLE VERIFICATION ────────────────────────────────────────────────
+        # Each gate requires specific role matching — the caller must be the
+        # correct party (landlord or tenant) for the workflow they're resuming.
+        # These checks prevent any authenticated user from acting on any thread.
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Step 3: Handle based on which gate we're at
+        if is_at_landlord_gate:
+            # ── ROLE CHECK: Only workflow landlord can approve/reject ──────
+            if caller_type != "landlord" or caller_id != workflow_landlord_id:
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Only the landlord assigned to this application can approve or reject it.",
+                    error_message=(
+                        f"Role verification failed at landlord gate: "
+                        f"caller={caller_id} ({caller_type}) "
+                        f"≠ workflow_landlord={workflow_landlord_id}"
+                    ),
+                )
+
+            # ── LANDLORD APPROVAL / REJECTION ─────────────────────────────
+            if request.decision == "approved":
+                graph.update_state(
+                    thread_config,
+                    {"application_status": "approved"}
+                )
+                # Fire notification via existing service
+                try:
+                    await _notify_application_decision(
+                        str(channel_values.get("application_id", "")),
+                        str(channel_values.get("selected_property_id", "")),
+                        "approved",
+                        landlord_name=current_user.get("full_name", "Landlord"),
+                    )
+                except Exception as notify_err:
+                    print(f"PROPFLOW Approval notification failed: {notify_err}")
+            elif request.decision == "rejected":
+                graph.update_state(
+                    thread_config,
+                    {
+                        "application_status": "rejected",
+                        "rejection_reason": request.rejection_reason or "Not specified by landlord",
+                        "current_stage": "rejected",
+                    }
+                )
+                # Fall through to graph.ainvoke(None) below, which will execute
+                # create_agreement_node. The guard there will detect
+                # application_status != "approved", set current_stage="rejected",
+                # and the graph's conditional edge _route_after_agreement will
+                # route to END (cleanly terminating rather than proceeding to
+                # Nomba DVA provisioning).
+            else:
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Invalid decision. Use 'approved' or 'rejected'.",
+                    error_message=f"Got '{request.decision}' expected 'approved' or 'rejected'",
+                )
+
+        elif is_at_signing_gate:
+            # ── ROLE CHECK: Only workflow tenant or landlord can sign ─────
+            is_tenant_signing = caller_type == "tenant" and caller_id == workflow_tenant_id
+            is_landlord_signing = caller_type == "landlord" and caller_id == workflow_landlord_id
+            if not (is_tenant_signing or is_landlord_signing):
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Only the tenant or landlord involved in this application can sign the lease.",
+                    error_message=(
+                        f"Role verification failed at signing gate: "
+                        f"caller={caller_id} ({caller_type}) "
+                        f"∉ [workflow_tenant={workflow_tenant_id}, workflow_landlord={workflow_landlord_id}]"
+                    ),
+                )
+
+            # ── TENANT / LANDLORD SIGNS LEASE ──────────────────────────────
+            # Uses the existing agreement_service.sign_agreement() which handles:
+            #   Tenant signs  → tenant_signed_at set → status = PENDING_LANDLORD
+            #   Landlord signs → landlord_signed_at set → status = SIGNED
+            # Graph only resumes when BOTH parties have signed.
+            if request.decision != "signed":
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Invalid decision. Use 'signed' to confirm lease signing.",
+                    error_message=f"Got '{request.decision}' expected 'signed'",
+                )
+
+            agreement_id = str(channel_values.get("agreement_id", ""))
+            if not agreement_id:
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="No agreement found to sign.",
+                    error_message="agreement_id missing from paused state",
+                )
+
+            from app.services.agreement_service import agreement_service
+
+            sign_result = await agreement_service.sign_agreement(
+                agreement_id=agreement_id,
+                user_id=current_user["id"],
+                user_type=current_user.get("user_type", "tenant"),
+            )
+
+            if not sign_result:
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Failed to sign the agreement. Please try again.",
+                    error_message="sign_agreement returned None",
+                )
+
+            new_status = sign_result.get("status", "")
+
+            if new_status == "SIGNED":
+                # Both parties signed → resume the graph
+                graph.update_state(
+                    thread_config,
+                    {"agreement_status": "SIGNED"}
+                )
+            else:
+                # Only tenant signed → PENDING_LANDLORD, wait for landlord
+                return ResumeResponse(
+                    success=True,
+                    workflow_id=workflow_id,
+                    current_stage="awaiting_landlord_signature",
+                    response_message="You've signed the lease agreement! Waiting for the landlord to countersign. You'll be notified once it's complete.",
+                )
+        elif is_at_payment_gate:
+            # ── ROLE CHECK: Only workflow landlord can confirm payment ────
+            if caller_type != "landlord" or caller_id != workflow_landlord_id:
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Only the landlord assigned to this application can confirm payment.",
+                    error_message=(
+                        f"Role verification failed at payment gate: "
+                        f"caller={caller_id} ({caller_type}) "
+                        f"≠ workflow_landlord={workflow_landlord_id}"
+                    ),
+                )
+
+            # PAYMENT CONFIRMATION (landlord confirms tenant paid)
+            if request.decision != "confirm_payment":
+                return ResumeResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Use 'confirm_payment' to confirm the tenant has paid.",
+                    error_message=f"Got '{request.decision}' expected 'confirm_payment'",
+                )
+            # Payment confirmed — mock NUBAN (9391...) bypasses the FULL_PAYMENT
+            # check in disburse_landlord_node, so just resume directly.
+            print(f"[PROPFLOW] Payment confirmed for {workflow_id} — resuming graph")
+
+        else:
+            # ---- UNKNOWN STATE (fallback) ----
+            # The current_stage-based fallback above should catch most cases.
+            # If we still land here, the workflow is at a stage that genuinely
+            # doesn't support the requested decision.
+            current_stage = channel_values.get("current_stage", "unknown")
+            stage_hints = {
+                "intent_extraction": "still processing the tenant's search request",
+                "awaiting_tenant_selection": "waiting for the tenant to select a property",
+                "property_selected": "processing property selection",
+                "application_created": "preparing the landlord briefing",
+                "enrich_and_qualify": "generating the AI briefing for the landlord",
+                "agreement_drafted": "lease agreement created — tenant needs to sign first",
+                "awaiting_landlord_signature": "tenant signed — landlord must sign via Agreements page",
+                "nomba_provisioned": "payment account created — awaiting tenant payment",
+                "awaiting_full_payment": "awaiting payment confirmation",
+                "disbursement_complete": "this tenancy is already active",
+                "rejected": "this application was already rejected",
+                "expired": "this session has expired",
+            }
+            hint = stage_hints.get(current_stage, f"at stage '{current_stage}'")
+            return ResumeResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage=current_stage,
+                response_message=f"Workflow is {hint} and cannot process '{request.decision}' here.",
+                error_message=f"No matching interrupt gate. next_nodes={next_nodes}, current_stage={current_stage}",
+            )
+
+        # Step 4: Resume the graph
+        result = await graph.ainvoke(None, config=thread_config)
+        response_message = _generate_response_message(result)
+
+        return ResumeResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage=result.get("current_stage", "unknown"),
+            response_message=response_message,
+            agreement_id=str(result["agreement_id"]) if result.get("agreement_id") else None,
+            virtual_account_number=result.get("nomba_virtual_account_number"),
+        )
+
+    except Exception as e:
+        print(f"[ERROR] [PROPFLOW] Resume failed: {e}")
+        return ResumeResponse(
+            success=False,
+            workflow_id=workflow_id,
+            current_stage="error",
+            response_message="Failed to process your request. Please try again.",
+            error_message=str(e),
+        )
+
+@router.get("/status/{workflow_id}", response_model=StatusResponse)
+async def get_propflow_status(
+    workflow_id: str,
+    current_user = Depends(get_current_user)
+):
+    """Get current status of PropFlow workflow from the persistent checkpointer."""
+    try:
+        graph = propflow_graph()
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+
+        try:
+            state = graph.get_state(thread_config)
+        except Exception:
+            return StatusResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="not_found",
+                tenant_id=current_user["id"],
+                created_at=datetime.utcnow(),
+                last_updated=datetime.utcnow(),
+                error_log=["Workflow not found in checkpointer"],
+            )
+
+        values = state.values
+        workflow_stage = values.get("current_stage", "")
+        if not workflow_stage or workflow_stage in ("idle", "unknown"):
+            # MemorySaver was wiped on restart — empty default returned
+            return StatusResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="expired",
+                tenant_id=current_user["id"],
+                created_at=datetime.utcnow(),
+                last_updated=datetime.utcnow(),
+                error_log=["Workflow expired — server restart cleared in-progress state"],
+            )
+
+        return StatusResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage=values.get("current_stage", "unknown"),
+            tenant_id=current_user["id"],
+            created_at=datetime.utcnow(),
+            last_updated=datetime.utcnow(),
+            extracted_intent=values.get("extracted_intent"),
+            selected_property_id=str(values["selected_property_id"]) if values.get("selected_property_id") else None,
+            application_id=str(values["application_id"]) if values.get("application_id") else None,
+            landlord_briefing=values.get("landlord_briefing"),
+            error_log=values.get("error_log", []),
+        )
+
+    except Exception as e:
+        print(f"[ERROR] [PROPFLOW] Status check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get workflow status: {str(e)}")
+
+
+@router.post("/simulate-payment/{workflow_id}")
+async def simulate_propflow_payment(
+    workflow_id: str,
+    current_user = Depends(get_current_user)
+):
+    """
+    Simulate a tenant payment for demo purposes.
+    Creates a fake payment record and marks the agreement as FULL_PAYMENT,
+    so the landlord can then call /resume/{id} with confirm_payment.
+    """
+    try:
+        graph = propflow_graph()
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+
+        try:
+            state = graph.get_state(thread_config)
+        except Exception:
+            return {"success": False, "error": "Workflow not found"}
+
+        values = state.values
+        agreement_id = values.get("agreement_id")
+        virtual_account = values.get("nomba_virtual_account_number")
+        expected_amount = values.get("expected_payment_amount")
+
+        if not agreement_id:
+            return {"success": False, "error": "No agreement in this workflow yet"}
+
+        loop = asyncio.get_event_loop()
+        supabase_admin = get_supabase_admin()
+
+        await loop.run_in_executor(
+            None,
+            lambda: supabase_admin.table("agreements")
+            .update({
+                "total_received_amount": float(expected_amount or 0),
+                "reconciliation_status": "FULL_PAYMENT",
+                "status": "ACTIVE",
+            })
+            .eq("id", str(agreement_id))
+            .execute(),
+        )
+
+        logger.info(
+            f"[PROPFLOW] Simulated payment for agreement={agreement_id} "
+            f"amount=NGN {expected_amount:,.0f}"
+        )
+
+        return {
+            "success": True,
+            "message": f"Payment of NGN {expected_amount:,.0f} received! The landlord can now confirm and complete the tenancy.",
+            "agreement_id": str(agreement_id) if agreement_id else None,
+            "virtual_account": virtual_account,
+            "amount": expected_amount,
+        }
+
+    except Exception as e:
+        print(f"[ERROR] [PROPFLOW] Simulate payment failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@router.get("/health")
+async def propflow_health_check():
+    """PropFlow system health check."""
+    try:
+        health_status = {
+            "service": "PropFlow AI Agent",
+            "status": "healthy",
+            "version": "3.1.0",
+            "timestamp": datetime.utcnow().isoformat(),
+            "components": {
+                "langgraph": "✅ Loaded",
+                "qwen_client": "✅ Ready",
+                "database": "✅ Connected",
+                "mem0": "✅ Available" if propflow_settings.ENABLE_MEM0_MEMORY else "⚠️ Disabled",
+                "nomba": "✅ Mock Ready"
+            },
+            "demo_users": {
+                "tenant": "slimmedia0705@gmail.com",
+                "landlord": "raphawellnessoptimization@gmail.com"
+            },
+            "endpoints": [
+                "POST /api/v1/propflow/chat",
+                "POST /api/v1/propflow/select/{workflow_id}",
+                "POST /api/v1/propflow/resume/{workflow_id}",
+                "GET /api/v1/propflow/status/{workflow_id}",
+                "GET /api/v1/propflow/threads",
+                "GET /api/v1/propflow/health"
+            ]
+        }
+
+        return health_status
+
+    except Exception as e:
+        return {
+            "service": "PropFlow AI Agent",
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+@router.get("/threads", response_model=ThreadListResponse)
+async def list_propflow_threads(
+    current_user = Depends(get_current_user),
+    status: Optional[str] = Query(None, description="Filter by status: active, completed, error"),
+    limit: int = Query(20, ge=1, le=100, description="Max results to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+):
+    """
+    List PropFlow threads for the current user.
+
+    - **Tenants** see their own threads (created when they started a chat)
+    - **Landlords** see threads for properties they own (when a tenant selected
+      one of their properties)
+    - **Admins** see all threads
+
+    Each thread shows the current stage, tenant info, and (if applicable)
+    the property title from the linked application.
+    """
+    try:
+        user_id = current_user["id"]
+        user_type = current_user.get("user_type", "")
+        supabase_admin = get_supabase_admin()
+        loop = asyncio.get_event_loop()
+
+        # Build query based on user role
+        if user_type == "tenant":
+            query = supabase_admin.table("propflow_threads") \
+                .select("*") \
+                .eq("tenant_id", user_id)
+        elif user_type == "landlord":
+            query = supabase_admin.table("propflow_threads") \
+                .select("*") \
+                .eq("landlord_id", user_id)
+        else:
+            # Admin or other — list all threads
+            query = supabase_admin.table("propflow_threads") \
+                .select("*")
+
+        if status:
+            query = query.eq("status", status)
+
+        # Get total count first
+        count_result = await loop.run_in_executor(
+            None,
+            lambda: query.execute(),
+        )
+        all_threads = count_result.data or []
+
+        # Paginate client-side (PostgREST range doesn't work with count easily)
+        paginated = all_threads[offset:offset + limit]
+
+        # Enrich with tenant name + property title
+        threads = []
+        for t in paginated:
+            tid = t.get("tenant_id", "")
+            tenant_name = None
+            tenant_phone = None
+            property_title = None
+
+            # Fetch tenant name from users table
+            if tid:
+                try:
+                    user_res = await loop.run_in_executor(
+                        None,
+                        lambda: supabase_admin.table("users")
+                        .select("full_name, phone_number")
+                        .eq("id", tid)
+                        .single()
+                        .execute(),
+                    )
+                    if user_res.data:
+                        tenant_name = user_res.data.get("full_name")
+                        tenant_phone = user_res.data.get("phone_number")
+                except Exception:
+                    pass
+
+            # Try to get property title via applications.propflow_thread_id
+            thread_id = t.get("thread_id", "")
+            if thread_id:
+                try:
+                    app_res = await loop.run_in_executor(
+                        None,
+                        lambda: supabase_admin.table("applications")
+                        .select("property:properties!inner(title)")
+                        .eq("propflow_thread_id", thread_id)
+                        .maybe_single()
+                        .execute(),
+                    )
+                    if app_res.data:
+                        prop = app_res.data.get("property", {})
+                        if prop:
+                            property_title = prop.get("title") if isinstance(prop, dict) else str(prop)
+                except Exception:
+                    pass
+
+            threads.append(ThreadInfoResponse(
+                thread_id=thread_id,
+                tenant_id=tid,
+                tenant_name=tenant_name,
+                tenant_phone=tenant_phone,
+                landlord_id=str(t.get("landlord_id")) if t.get("landlord_id") else None,
+                property_title=property_title,
+                current_stage=t.get("current_stage", ""),
+                status=t.get("status", "active"),
+                created_at=t.get("created_at"),
+                updated_at=t.get("updated_at"),
+            ))
+
+        return ThreadListResponse(
+            success=True,
+            threads=threads,
+            total=len(all_threads),
+        )
+
+    except Exception as e:
+        logger.error("[PROPFLOW] Thread listing failed: %s", e)
+        return ThreadListResponse(
+            success=False,
+            error_message=str(e),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _notify_application_decision(
+    application_id: str,
+    property_id: str,
+    decision: str,
+    rejection_reason: str = "",
+    landlord_name: str = "Landlord",
+):
+    """Update applications table + fire notifications via existing notification_service."""
+    loop = asyncio.get_event_loop()
+    supabase_admin = get_supabase_admin()
+
+    app_result = await loop.run_in_executor(
+        None,
+        lambda: supabase_admin.table("applications")
+        .select("*, property:properties!inner(id, title, location), user:users!user_id(id, full_name, email, phone_number)")
+        .eq("id", application_id)
+        .single()
+        .execute(),
+    )
+    if not app_result.data:
+        logger.warning(f"[PROPFLOW] Application {application_id} not found")
+        return
+
+    app = app_result.data
+    prop = app.get("property") or {}
+    tenant = app.get("user") or {}
+
+    if decision == "approved":
+        await loop.run_in_executor(
+            None,
+            lambda: supabase_admin.table("applications")
+            .update({"status": "approved", "viewed_by_landlord": True})
+            .eq("id", application_id)
+            .execute(),
+        )
+    else:
+        await loop.run_in_executor(
+            None,
+            lambda: supabase_admin.table("applications")
+            .update({"status": "rejected"})
+            .eq("id", application_id)
+            .execute(),
+        )
+
+    try:
+        from app.services.notification_service import notification_service
+        if decision == "approved":
+            await notification_service.notify_application_approved(
+                application_id=application_id,
+                property_id=property_id,
+                property_title=prop.get("title", "Property"),
+                tenant_id=str(tenant.get("id", "")),
+                tenant_name=tenant.get("full_name", "Tenant"),
+                tenant_email=tenant.get("email"),
+                tenant_phone=tenant.get("phone_number"),
+                landlord_name=landlord_name,
+            )
+        else:
+            await notification_service.notify_application_rejected(
+                application_id=application_id,
+                property_id=property_id,
+                property_title=prop.get("title", "Property"),
+                tenant_id=str(tenant.get("id", "")),
+                tenant_name=tenant.get("full_name", "Tenant"),
+                tenant_email=tenant.get("email"),
+                tenant_phone=tenant.get("phone_number"),
+                rejection_reason=rejection_reason,
+            )
+        logger.info(f"[PROPFLOW] Notification sent for {application_id}")
+    except Exception as exc:
+        logger.warning(f"[PROPFLOW] Notification unavailable: {exc}")
+
+
+def _safe_amount(val: Any) -> float | None:
+    """Safely convert a value to float. Returns None if unparseable."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _generate_response_message(result: Dict[str, Any], user_type: str = "tenant") -> str:
+    """Generate user-friendly response message based on workflow stage and caller role."""
+    stage = result.get("current_stage", "unknown")
+    
+    if stage == "intent_extracted":
+        intent = result.get("extracted_intent", {})
+        location = intent.get("location", "Lagos")
+        bedrooms = intent.get("bedrooms", "")
+        budget = _safe_amount(intent.get("budget_monthly"))
+
+        budget_text = f" with budget ₦{budget:,.0f}/month" if budget else ""
+        bedroom_text = f"{bedrooms}-bedroom " if bedrooms else ""
+
+        return f"I understand you're looking for a {bedroom_text}apartment in {location}{budget_text}. Let me search for available properties..."
+
+    elif stage == "awaiting_tenant_selection":
+        matches = result.get("property_matches", []) or []
+        if not matches:
+            return "I couldn't find any properties matching your criteria. Would you like to adjust your requirements or budget?"
+
+        lines = [f"I found {len(matches)} properties that match your request. Which one do you prefer?"]
+        for i, p in enumerate(matches):
+            title = p.get("title", "Property")
+            price = _safe_amount(p.get("price"))
+            price_str = f"₦{price:,.0f}/month" if price else "Price N/A"
+            location = p.get("location", "")
+            beds = p.get("beds", "?")
+            lines.append(f"  {i+1}. {title} — {price_str} ({beds} bed, {location})")
+        lines.append("Reply with the number you'd like, or tap one of the options above.")
+        return "\n".join(lines)
+    
+    elif stage == "property_matched":
+        property_count = len(result.get("property_matches", []) or [])
+        if property_count > 0:
+            return f"Great! I found {property_count} property(ies) that match your criteria. Creating your application now..."
+        else:
+            return "I couldn't find any properties matching your criteria. Would you like to adjust your requirements or budget?"
+    
+    elif stage == "application_created":
+        return "Perfect! I've submitted your application to the landlord. They'll review your profile and get back to you soon."
+
+    elif stage == "agreement_drafted":
+        return "The landlord has approved your application! A lease agreement has been drafted and is ready for your review. Please sign to proceed with payment setup."
+
+    elif stage == "enrich_and_qualify" or stage == "awaiting_landlord_approval":
+        return "Your application has been enriched with your profile details and sent to the landlord for review. You'll receive a notification once they make a decision."
+    
+    elif stage == "nomba_provisioned":
+        account_number = result.get("nomba_virtual_account_number")
+        amount = _safe_amount(result.get("expected_payment_amount"))
+        amount_text = f"₦{amount:,.0f}" if amount else "the agreed amount"
+        
+        if account_number:
+            return f"🎉 Your application was approved! Please make payment of {amount_text} to account: {account_number} to activate your tenancy."
+        else:
+            return "Your application was approved! Payment details will be shared with you shortly."
+    
+    elif stage == "disbursement_complete":
+        return "🎉 Payment received and processed! Your tenancy is now active. Welcome to your new home!"
+    
+    elif stage == "rejected":
+        reason = result.get("rejection_reason", "Landlord requirements not met")
+        return f"Unfortunately, your application was not approved. Reason: {reason}. Don't worry, I can help you find other suitable properties!"
+    
+    elif stage == "awaiting_landlord_signature":
+        return "You've signed the lease! Now waiting for the landlord to countersign. You'll be notified once the tenancy is confirmed."
+
+    elif stage == "no_properties_found":
+        intent = result.get("extracted_intent", {})
+        location = intent.get("location", "your selected area")
+        bedrooms = intent.get("bedrooms", "")
+        budget = _safe_amount(intent.get("budget_monthly"))
+        budget_text = f" of ₦{budget:,.0f}/month" if budget else ""
+        bedroom_text = f"{bedrooms}-bedroom " if bedrooms else ""
+
+        return (
+            f"I searched for a {bedroom_text}apartment in {location}{budget_text}, but unfortunately "
+            f"I couldn't find any properties that match your criteria. "
+            f"Would you like to adjust your requirements — perhaps a different location, "
+            f"number of bedrooms, or budget range?"
+        )
+
+    else:
+        return "I'm processing your request. This may take a moment..."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXPORT ROUTER
+# ═══════════════════════════════════════════════════════════════════════════════
+

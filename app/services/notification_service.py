@@ -988,6 +988,7 @@ class NotificationService:
         monthly_income: Optional[int] = None,
         employment_status: Optional[str] = None,
         message: Optional[str] = None,
+        propflow_thread_id: Optional[str] = None,  # LangGraph thread ID for PropFlow workflow context
     ):
         """Notify landlord when a tenant submits an application"""
         logger.info(f"📧 [NOTIF] notify_application_submitted for application {application_id}")
@@ -1028,9 +1029,9 @@ class NotificationService:
             f"You have received a new rental application for '{property_title}' "
             f"from {tenant_name}. Click to review and respond."
         )
-        
-        logger.info(f"� [NOTIF] Creating notification with message: {notification_message}")
-        
+
+        logger.info(f"📧 [NOTIF] Creating notification with message: {notification_message}")
+
         create_notification(
             user_id=landlord_id,
             notif_type="application_submitted",
@@ -1043,6 +1044,7 @@ class NotificationService:
                 "property_title": property_title,
                 "tenant_name": tenant_name,
                 "tenant_id": tenant_id,
+                "propflow_thread_id": propflow_thread_id,  # context-aware PropFlow resume
             },
         )
 

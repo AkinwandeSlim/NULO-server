@@ -345,6 +345,7 @@ class NombaClient:
         sub_account_id: str,
         account_ref: str,
         account_name: str,
+        expected_amount: Optional[float] = None,
     ) -> dict:
         """
         Create a Nomba virtual NUBAN for a sub-account (HACKATHON 2026 FIX).
@@ -383,6 +384,8 @@ class NombaClient:
             "accountRef": account_ref,
             "accountName": account_name,
         }
+        if expected_amount is not None:
+            payload["expectedAmount"] = expected_amount
 
         headers = await self._headers()
         # Sub-account goes in the URL path; parent stays in the auth header.

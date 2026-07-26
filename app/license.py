@@ -67,7 +67,7 @@ class LicenseConfig:
             
             return LicenseStatus.ACTIVE
         except Exception as e:
-            print(f"❌ Error getting license status: {str(e)}")
+            print(f"[LICENSE] Error getting license status: {str(e)}")
             return LicenseStatus.UNDEFINED
     
     @staticmethod
@@ -98,7 +98,7 @@ class LicenseConfig:
             new_expiry = expiry + timedelta(days=days)
             return new_expiry.isoformat()
         except Exception as e:
-            print(f"❌ Error extending license: {str(e)}")
+            print(f"[LICENSE] Error extending license: {str(e)}")
             # If parse fails, create new expiry from today
             from datetime import timezone
             return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
@@ -155,7 +155,7 @@ class LicenseConfig:
                 "message": message
             }
         except Exception as e:
-            print(f"❌ Error calculating time remaining: {str(e)}")
+            print(f"[LICENSE] Error calculating time remaining: {str(e)}")
             return {
                 "days": -1,
                 "hours": -1,
@@ -208,7 +208,7 @@ class LicenseService:
             
             return license_data
         except Exception as e:
-            print(f"❌ Error getting license: {str(e)}")
+            print(f"[LICENSE] Error getting license: {str(e)}")
             # Return safe default on error (don't break app)
             license_data = {
                 "license_key": LICENSE_KEY,
@@ -245,7 +245,7 @@ class LicenseService:
             
             return True, "License active"
         except Exception as e:
-            print(f"❌ License check error: {str(e)}")
+            print(f"[LICENSE] Check error: {str(e)}")
             # On error, allow access but log it
             return True, "License check unavailable (allowing access)"
     
@@ -285,7 +285,7 @@ class LicenseService:
                 return False, "Failed to update license in database"
         
         except Exception as e:
-            print(f"❌ License extension error: {str(e)}")
+            print(f"[LICENSE] License extension error: {str(e)}")
             return False, f"Error extending license: {str(e)}"
     
     @staticmethod
@@ -304,7 +304,7 @@ class LicenseService:
                 "database": "supabase"  # Indicate source
             }
         except Exception as e:
-            print(f"❌ Error getting status info: {str(e)}")
+            print(f"[LICENSE] Error getting status info: {str(e)}")
             return {
                 "error": str(e),
                 "current_time": datetime.utcnow().isoformat(),

@@ -233,7 +233,6 @@ def main():
     print(f"  Deleted {n} agreements (all of them)")
     remaining = count("agreements")
     print(f"  Agreements remaining: {remaining}")
-
     # 13. Reset property status from 'occupied' to 'vacant'
     print("\n[13/13] Resetting property status from 'occupied' to 'vacant'...")
     occupied_count = count("properties", "status=eq.occupied")
@@ -253,6 +252,25 @@ def main():
             print(f"  [ERROR] Failed to reset property status: {resp.status_code}")
     else:
         print("  No occupied properties found - nothing to reset")
+
+    # ── PropFlow: check that landlord_briefing column exists on applications ──
+    # PropFlow's enrich_and_qualify node writes to applications.landlord_briefing.
+    # This column is NOT in the original schema — it must be added via migration
+    # before running PropFlow. We check for it here and warn if missing.
+    print("\n[PROPFLOW CHECK] Verifying applications.landlord_briefing column...")
+    _check_url = f"{SUPABASE_URL}/rest/v1/applications?select=landlord_briefing&limit=0"
+    _check_resp = requests.get(_check_url, headers=headers)
+    if _check_resp.status_code == 400 and "landlord_briefing" in _check_resp.text:
+        print("  [WARN] applications.landlord_briefing column MISSING.")
+        print("  Run this migration before using PropFlow:")
+        print("  ALTER TABLE public.applications ADD COLUMN IF NOT EXISTS")
+        print("    landlord_briefing TEXT;")
+        print("  ALTER TABLE public.applications ADD COLUMN IF NOT EXISTS")
+        print("    propflow_thread_id TEXT;")
+    elif _check_resp.ok:
+        print("  [OK] applications.landlord_briefing column exists.")
+    else:
+        print(f"  [INFO] Could not verify column (status {_check_resp.status_code}) - run migration to be safe.")
 
     # Final verification
     print()
@@ -306,13 +324,29 @@ def main():
     print("=" * 70)
     print()
     print("Next steps for the live demo:")
-    print("  1. As a tenant, apply for a property")
-    print("  2. As a landlord, approve the application and create a SIGNED agreement")
-    print("  3. Trigger Nomba VA provisioning for the agreement")
-    print("  4. Simulate a tenant payment:")
+    print("  1. Run PropFlow migration if not done:")
+    print("     ALTER TABLE public.applications")
+    print("       ADD COLUMN IF NOT EXISTS landlord_briefing TEXT,")
+    print("       ADD COLUMN IF NOT EXISTS propflow_thread_id TEXT;")
+    print()
+    print("  2. Seed the demo tenant profile (if not already done):")
+    print("     python scripts\\seed_propflow_demo.py")
+    print()
+    print("  3. Start the PropFlow demo via chat widget or API:")
+    print("     POST /api/v1/propflow/chat")
+    print("     { message: 'I need 2-bed flat in Lekki, 500k/month' }")
+    print()
+    print("  4. As landlord, approve the application:")
+    print("     POST /api/v1/propflow/resume/{thread_id}")
+    print("     { decision: 'approved' }")
+    print()
+    print("  5. Sign the agreement (tenant + landlord in app)")
+    print()
+    print("  6. Simulate a tenant payment:")
     print("     python scripts\\test_webhook_local.py <agreement-uuid> full_payment")
-    print("  5. Verify the payment reflects in the landlord dashboard")
-    print("  6. Trigger auto-disbursement to the landlord's bank account")
+    print()
+    print("  7. Verify payment reflects in landlord dashboard")
+    print("     and disbursement triggers automatically.")
     print()
 
 
