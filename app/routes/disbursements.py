@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from app.database import supabase_admin
+from app.database import supabase_admin, run_db_sync, run_db_async
 from app.middleware.auth import get_current_user
 from app.services.nomba_client import NombaAPIError, nomba_client
 from app.services.nomba_helpers import (
@@ -86,7 +86,12 @@ async def simulate_payout_webhook(
             .maybe_single()
             .execute(),
     )
-    transaction = tx_result.data
+    # .maybe_single() returns None for 0 rows. Normalize to a dict.
+    transaction = (
+        tx_result
+        if isinstance(tx_result, dict)
+        else (tx_result.data if tx_result else None)
+    )
     if not transaction:
         raise HTTPException(
             404,
@@ -264,8 +269,7 @@ async def disburse_to_landlord(
         raise HTTPException(400, "source_transfer_id is required")
 
     # 1. Fetch agreement
-    agreement_result = await asyncio.get_event_loop().run_in_executor(
-        None,
+    agreement_result = await run_db_async(
         lambda: supabase_admin
             .table("agreements")
             .select("id, landlord_id, tenant_id, platform_fee, expected_payment_amount")
@@ -291,13 +295,12 @@ async def disburse_to_landlord(
     import re
     # Strip -SUB suffix if present to get the agreement ID
     clean_agreement_id = source_transfer_id.replace("-SUB", "") if source_transfer_id.endswith("-SUB") else source_transfer_id
-    
+
     # If the cleaned ID is a valid UUID and matches the agreement_id, use it to lookup the transfer
     # Otherwise, use the agreement_id from the path parameter
     lookup_agreement_id = clean_agreement_id if clean_agreement_id == agreement_id else agreement_id
-    
-    transfer_result = await asyncio.get_event_loop().run_in_executor(
-        None,
+
+    transfer_result = await run_db_async(
         lambda: supabase_admin
             .table("virtual_account_transfers")
             .select("id, amount_received, reconciliation_result, agreement_id, currency, account_ref")
@@ -338,8 +341,7 @@ async def disburse_to_landlord(
     # Idempotency: check if a disbursement already exists for this source transfer
     # Use the actual transfer ID from the lookup, not the source_transfer_id parameter
     actual_transfer_id = transfer.get("id")
-    existing_result = await asyncio.get_event_loop().run_in_executor(
-        None,
+    existing_result = await run_db_async(
         lambda: supabase_admin
             .table("transactions")
             .select("id, nomba_transfer_ref, status, amount")
@@ -359,8 +361,7 @@ async def disburse_to_landlord(
 
     # 3. Fetch landlord bank details (PRD V3.2 OPEN #1: now from landlord_profiles,
     #    the payout-data single source of truth, NOT the legacy landlords table).
-    landlord_result = await asyncio.get_event_loop().run_in_executor(
-        None,
+    landlord_result = await run_db_async(
         lambda: supabase_admin
             .table("landlord_profiles")
             .select("id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at")
@@ -396,8 +397,7 @@ async def disburse_to_landlord(
             
             if lookup_result and lookup_result.get("accountName"):
                 # Verification successful - update landlord_profiles
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
+                await run_db_async(
                     lambda: supabase_admin
                         .table("landlord_profiles")
                         .update({
@@ -422,8 +422,7 @@ async def disburse_to_landlord(
                     agreement["landlord_id"]
                 )
                 # Auto-verify for demo purposes
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
+                await run_db_async(
                     lambda: supabase_admin
                         .table("landlord_profiles")
                         .update({
@@ -471,8 +470,7 @@ async def disburse_to_landlord(
         # All details present — auto-stamp verified_at so this path is only hit once
         now_stamp = datetime.now(timezone.utc).isoformat()
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
+            await run_db_async(
                 lambda: supabase_admin
                     .table("landlord_profiles")
                     .update({"bank_verified_at": now_stamp, "updated_at": now_stamp})
@@ -541,8 +539,7 @@ async def disburse_to_landlord(
                 )
                 # Best-effort: write a reconciliation log entry for traceability
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
+                    await run_db_async(
                         lambda: supabase_admin
                             .table("payment_reconciliation_log")
                             .insert({
@@ -599,7 +596,7 @@ async def disburse_to_landlord(
     now = datetime.now(timezone.utc).isoformat()
 
     # 6. IDEMPOTENCY CHECK: Check if transaction with this nomba_transfer_ref already exists
-    existing_tx = await asyncio.get_event_loop().run_in_executor(
+    existing_tx_result = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: supabase_admin
             .table("transactions")
@@ -608,9 +605,15 @@ async def disburse_to_landlord(
             .maybe_single()
             .execute(),
     )
-    
-    if existing_tx.data:
-        existing_status = existing_tx.data.get("status")
+    # .maybe_single() returns None for 0 rows. Normalize to a dict.
+    existing_tx = (
+        existing_tx_result
+        if isinstance(existing_tx_result, dict)
+        else (existing_tx_result.data if existing_tx_result else None)
+    )
+
+    if existing_tx:
+        existing_status = existing_tx.get("status")
         # Allow retry if the existing transaction is failed
         if existing_status == "failed":
             logger.info(
@@ -623,7 +626,7 @@ async def disburse_to_landlord(
                 lambda: supabase_admin
                     .table("transactions")
                     .delete()
-                    .eq("id", existing_tx.data.get("id"))
+                    .eq("id", existing_tx.get("id"))
                     .execute(),
             )
         else:
@@ -636,8 +639,8 @@ async def disburse_to_landlord(
                 "success": True,
                 "status": existing_status,
                 "merchant_tx_ref": merchant_tx_ref,
-                "amount_ngn": existing_tx.data.get("amount"),
-                "transaction_id": existing_tx.data.get("id"),
+                "amount_ngn": existing_tx.get("amount"),
+                "transaction_id": existing_tx.get("id"),
                 "message": f"Disbursement already initiated (status: {existing_status})",
             }
 
@@ -675,10 +678,25 @@ async def disburse_to_landlord(
     # the parent wallet has 0 spendable balance even though the balance API
     # reports funds (verified live 2026-07-04 with INSUFFICIENT_BALANCE).
     
-    # DEMO MODE: Skip actual Nomba transfer if DEMO_MODE env var is set
+    # DEMO MODE: Skip actual Nomba transfer if DEMO_MODE env var is set.
+    # settings is read once at startup, and uvicorn --reload only watches *.py,
+    # so editing DEMO_MODE in .env won't hot-reload. Re-read .env at request
+    # time as a fallback so a flipped value takes effect without a restart.
     from app.config import settings
     demo_mode = settings.DEMO_MODE
-    
+
+    if not demo_mode:
+        try:
+            from pathlib import Path
+            from dotenv import dotenv_values
+            env_file = Path(__file__).resolve().parents[2] / ".env"  # server/.env
+            vals = dotenv_values(env_file)
+            if str(vals.get("DEMO_MODE", "")).strip().lower() in ("1", "true", "yes", "on"):
+                demo_mode = True
+                logger.info("[DEMO MODE] Re-read .env: DEMO_MODE=true (fallback at request time)")
+        except Exception:
+            pass  # fall back to startup settings
+
     if demo_mode:
         logger.info(
             f"[DEMO MODE] Skipping actual Nomba transfer | ref={merchant_tx_ref} | "
@@ -738,6 +756,28 @@ async def disburse_to_landlord(
                     .execute(),
             )
             raise HTTPException(502, f"Nomba disbursement failed: {exc}")
+        except Exception as exc:
+            # Broad catch: an unexpected failure (e.g. Nomba auth endpoint 404,
+            # socket/SSL noise) must still mark the tx failed. Otherwise the row
+            # stays "pending" and the idempotency check on retry sees it and
+            # short-circuits with "already initiated" — leaving the flow stuck.
+            logger.error(
+                "Disbursement error (unexpected) | agreement=%s | ref=%s | error=%s",
+                agreement_id, merchant_tx_ref, exc,
+            )
+            if tx_row.get("id"):
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: supabase_admin
+                            .table("transactions")
+                            .update({"status": "failed", "notes": f"Disbursement error: {exc}"})
+                            .eq("id", tx_row["id"])
+                            .execute(),
+                    )
+                except Exception:
+                    pass  # best-effort cleanup; surface the original error
+            raise HTTPException(502, f"Disbursement failed: {exc}")
 
     # 8. Update transactions row with nomba_transfer_id and final status
     # transactions_status_check allows pending/held/released/refunded/failed.
@@ -763,6 +803,15 @@ async def disburse_to_landlord(
             .eq("id", tx_row["id"])
             .execute(),
     )
+
+    # 8b. PropFlow graph sync: mark the thread disbursement_complete so the
+    #     workflow reflects the finished release. Best-effort.
+    if tx_status == "released":
+        try:
+            from app.services.propflow_graph_sync import sync_after_release
+            await sync_after_release(agreement_id, supabase_admin)
+        except Exception as sync_err:
+            logger.warning(f"[DISBURSE] Graph release sync failed (non-fatal): {sync_err}")
 
     # 9. Background: notify landlord
     background_tasks.add_task(

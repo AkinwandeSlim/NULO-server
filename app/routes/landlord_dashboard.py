@@ -9,7 +9,7 @@ from uuid import UUID
 import logging
 from datetime import datetime, timedelta
 
-from ..database import supabase, supabase_admin
+from ..database import supabase, supabase_admin, run_db_sync
 from ..middleware.auth import get_current_user
 from ..models.landlord_onboarding import LandlordOnboardingResponse
 from ..services.agreement_service import AgreementService
@@ -701,7 +701,9 @@ async def get_landlord_dashboard(
 
         def fetch_onboarding():
             try:
-                result = supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
+                result = run_db_sync(
+                    lambda: supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
+                )
                 return result.data if result.data else None
             except Exception as e:
                 logger.error(f"Failed to get onboarding: {str(e)}")
@@ -750,16 +752,18 @@ async def get_landlord_dashboard(
         def fetch_viewing_requests():
             # viewing_requests has landlord_id directly
             try:
-                result = supabase_admin.table("viewing_requests") \
-                    .select(
-                        "id, property_id, tenant_id, status, preferred_date, "
-                        "confirmed_date, confirmed_time, time_slot, viewing_type, created_at"
-                    ) \
-                    .eq("landlord_id", landlord_id) \
-                    .in_("status", ["pending", "confirmed", "completed"]) \
-                    .order("created_at", desc=True) \
-                    .limit(50) \
-                    .execute()
+                result = run_db_sync(
+                    lambda: supabase_admin.table("viewing_requests") \
+                        .select(
+                            "id, property_id, tenant_id, status, preferred_date, "
+                            "confirmed_date, confirmed_time, time_slot, viewing_type, created_at"
+                        ) \
+                        .eq("landlord_id", landlord_id) \
+                        .in_("status", ["pending", "confirmed", "completed"]) \
+                        .order("created_at", desc=True) \
+                        .limit(50) \
+                        .execute()
+                )
                 rows = result.data or []
 
                 # Batch-fetch names -- one query per table, not one per row
@@ -769,14 +773,18 @@ async def get_landlord_dashboard(
                 tenants_map = {}
                 props_map = {}
                 if tenant_ids:
-                    t_res = supabase_admin.table("users") \
-                        .select("id, full_name, first_name") \
-                        .in_("id", tenant_ids).execute()
+                    t_res = run_db_sync(
+                        lambda: supabase_admin.table("users") \
+                            .select("id, full_name, first_name") \
+                            .in_("id", tenant_ids).execute()
+                    )
                     tenants_map = {t["id"]: t for t in (t_res.data or [])}
                 if property_ids:
-                    p_res = supabase_admin.table("properties") \
-                        .select("id, title") \
-                        .in_("id", property_ids).execute()
+                    p_res = run_db_sync(
+                        lambda: supabase_admin.table("properties") \
+                            .select("id, title") \
+                            .in_("id", property_ids).execute()
+                    )
                     props_map = {p["id"]: p for p in (p_res.data or [])}
 
                 for row in rows:
@@ -792,9 +800,11 @@ async def get_landlord_dashboard(
             # Must get property_ids for this landlord first, then filter by them.
             try:
                 # Step 1: get this landlord's property IDs
-                props_res = supabase_admin.table("properties") \
-                    .select("id") \
-                    .eq("landlord_id", landlord_id).execute()
+                props_res = run_db_sync(
+                    lambda: supabase_admin.table("properties") \
+                        .select("id") \
+                        .eq("landlord_id", landlord_id).execute()
+                )
                 property_ids = [p["id"] for p in (props_res.data or [])]
 
                 if not property_ids:
@@ -802,16 +812,18 @@ async def get_landlord_dashboard(
 
                 # Step 2: get applications for those properties
                 # Tenant FK is user_id -- there is no tenant_id column on applications
-                result = supabase_admin.table("applications") \
-                    .select(
-                        "id, property_id, user_id, status, "
-                        "propflow_thread_id, created_at, viewed_by_landlord"
-                    ) \
-                    .in_("property_id", property_ids) \
-                    .neq("status", "withdrawn") \
-                    .order("created_at", desc=True) \
-                    .limit(50) \
-                    .execute()
+                result = run_db_sync(
+                    lambda: supabase_admin.table("applications") \
+                        .select(
+                            "id, property_id, user_id, status, "
+                            "propflow_thread_id, created_at, viewed_by_landlord"
+                        ) \
+                        .in_("property_id", property_ids) \
+                        .neq("status", "withdrawn") \
+                        .order("created_at", desc=True) \
+                        .limit(50) \
+                        .execute()
+                )
                 rows = result.data or []
 
                 # Batch-fetch tenant names and property titles
@@ -821,14 +833,18 @@ async def get_landlord_dashboard(
                 tenants_map = {}
                 props_map = {}
                 if tenant_ids:
-                    t_res = supabase_admin.table("users") \
-                        .select("id, full_name") \
-                        .in_("id", tenant_ids).execute()
+                    t_res = run_db_sync(
+                        lambda: supabase_admin.table("users") \
+                            .select("id, full_name") \
+                            .in_("id", tenant_ids).execute()
+                    )
                     tenants_map = {t["id"]: t for t in (t_res.data or [])}
                 if props_to_fetch:
-                    p_res = supabase_admin.table("properties") \
-                        .select("id, title, price") \
-                        .in_("id", props_to_fetch).execute()
+                    p_res = run_db_sync(
+                        lambda: supabase_admin.table("properties") \
+                            .select("id, title, price") \
+                            .in_("id", props_to_fetch).execute()
+                    )
                     props_map = {p["id"]: p for p in (p_res.data or [])}
 
                 for row in rows:
@@ -845,19 +861,21 @@ async def get_landlord_dashboard(
             # agreements table has landlord_id directly
             # DB field names: rent_amount, lease_start_date, lease_end_date
             try:
-                result = supabase_admin.table("agreements") \
-                    .select(
-                        "id, tenant_id, property_id, status, tenant_signed_at, landlord_signed_at, "
-                        "lease_start_date, lease_end_date, rent_amount, deposit_amount, "
-                        "payment_frequency, expected_payment_amount, total_received_amount, "
-                        "reconciliation_status, virtual_account_number, virtual_account_name, "
-                        "nomba_account_ref, created_at, updated_at"
-                    ) \
-                    .eq("landlord_id", landlord_id) \
-                    .in_("status", ["ACTIVE", "SIGNED", "PENDING_LANDLORD", "PENDING_TENANT", "EXPIRED"]) \
-                    .order("created_at", desc=True) \
-                    .limit(50) \
-                    .execute()
+                result = run_db_sync(
+                    lambda: supabase_admin.table("agreements") \
+                        .select(
+                            "id, tenant_id, property_id, status, tenant_signed_at, landlord_signed_at, "
+                            "lease_start_date, lease_end_date, rent_amount, deposit_amount, "
+                            "payment_frequency, expected_payment_amount, total_received_amount, "
+                            "reconciliation_status, virtual_account_number, virtual_account_name, "
+                            "nomba_account_ref, created_at, updated_at"
+                        ) \
+                        .eq("landlord_id", landlord_id) \
+                        .in_("status", ["ACTIVE", "SIGNED", "PENDING_LANDLORD", "PENDING_TENANT", "EXPIRED"]) \
+                        .order("created_at", desc=True) \
+                        .limit(50) \
+                        .execute()
+                )
                 rows = result.data or []
 
                 tenant_ids = list({r["tenant_id"] for r in rows if r.get("tenant_id")})
@@ -866,14 +884,18 @@ async def get_landlord_dashboard(
                 tenants_map = {}
                 props_map = {}
                 if tenant_ids:
-                    t_res = supabase_admin.table("users") \
-                        .select("id, full_name") \
-                        .in_("id", tenant_ids).execute()
+                    t_res = run_db_sync(
+                        lambda: supabase_admin.table("users") \
+                            .select("id, full_name") \
+                            .in_("id", tenant_ids).execute()
+                    )
                     tenants_map = {t["id"]: t for t in (t_res.data or [])}
                 if property_ids:
-                    p_res = supabase_admin.table("properties") \
-                        .select("id, title, payment_frequency") \
-                        .in_("id", property_ids).execute()
+                    p_res = run_db_sync(
+                        lambda: supabase_admin.table("properties") \
+                            .select("id, title, payment_frequency") \
+                            .in_("id", property_ids).execute()
+                    )
                     props_map = {p["id"]: p for p in (p_res.data or [])}
 
                 for row in rows:
@@ -892,17 +914,19 @@ async def get_landlord_dashboard(
             # Fetch received payments for real-time stat updates
             # transactions table has landlord_id directly
             try:
-                result = supabase_admin.table("transactions") \
-                    .select(
-                        "id, tenant_id, property_id, agreement_id, application_id, "
-                        "amount, currency, status, transaction_type, payment_gateway, "
-                        "paystack_ref, held_at, released_at, refunded_at, "
-                        "notes, created_at, updated_at"
-                    ) \
-                    .eq("landlord_id", landlord_id) \
-                    .order("created_at", desc=True) \
-                    .limit(100) \
-                    .execute()
+                result = run_db_sync(
+                    lambda: supabase_admin.table("transactions") \
+                        .select(
+                            "id, tenant_id, property_id, agreement_id, application_id, "
+                            "amount, currency, status, transaction_type, payment_gateway, "
+                            "paystack_ref, held_at, released_at, refunded_at, "
+                            "notes, created_at, updated_at"
+                        ) \
+                        .eq("landlord_id", landlord_id) \
+                        .order("created_at", desc=True) \
+                        .limit(100) \
+                        .execute()
+                )
                 rows = result.data or []
 
                 # Batch-fetch tenant and property data
@@ -912,14 +936,18 @@ async def get_landlord_dashboard(
                 tenants_map = {}
                 props_map = {}
                 if tenant_ids:
-                    t_res = supabase_admin.table("users") \
-                        .select("id, full_name, email, phone_number, avatar_url") \
-                        .in_("id", tenant_ids).execute()
+                    t_res = run_db_sync(
+                        lambda: supabase_admin.table("users") \
+                            .select("id, full_name, email, phone_number, avatar_url") \
+                            .in_("id", tenant_ids).execute()
+                    )
                     tenants_map = {t["id"]: t for t in (t_res.data or [])}
                 if property_ids:
-                    p_res = supabase_admin.table("properties") \
-                        .select("id, title, address, city") \
-                        .in_("id", property_ids).execute()
+                    p_res = run_db_sync(
+                        lambda: supabase_admin.table("properties") \
+                            .select("id, title, address, city") \
+                            .in_("id", property_ids).execute()
+                    )
                     props_map = {p["id"]: p for p in (p_res.data or [])}
 
                 for row in rows:

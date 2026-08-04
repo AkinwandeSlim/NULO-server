@@ -2,17 +2,43 @@
 Viewing Requests routes
 """
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
-from app.database import supabase_admin
+from app.database import supabase_admin, run_db_async
 from app.middleware.auth import get_current_tenant, get_current_landlord
 from app.services.notification_service import notification_service
 from pydantic import BaseModel
 from typing import Optional, Literal
 from datetime import datetime
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/viewing-requests")
+
+
+def _run_with_retry(fn, *, attempts: int = 3, delay: float = 0.4, label: str = "query"):
+    """Run a Supabase query with retry on transient connection errors.
+
+    The shared supabase-py client occasionally raises ConnectionTerminated /
+    ConnectionReset on this host. Those failures are transient — retrying the
+    same read shortly after almost always succeeds. We never retry writes.
+    """
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            is_transient = any(k in msg for k in (
+                "ConnectionTerminated", "ConnectionReset", "Connection broken",
+                "connection reset", "RemoteProtocolError",
+            ))
+            if not is_transient or i == attempts - 1:
+                break
+            logger.warning(f"[viewing_requests] {label} transient failure (attempt {i+1}/{attempts}): {msg}")
+            time.sleep(delay * (i + 1))
+    raise last_err
 
 
 class ViewingRequestCreate(BaseModel):
@@ -92,10 +118,16 @@ async def get_landlord_viewing_requests(
     try:
         landlord_id = current_user["id"]
 
-        query = supabase_admin.table("viewing_requests").select("*").eq("landlord_id", landlord_id)
-        if status_filter:
-            query = query.eq("status", status_filter)
-        response = query.order("created_at", desc=True).execute()
+        def _base_query():
+            return supabase_admin.table("viewing_requests").select("*").eq("landlord_id", landlord_id)
+
+        def _run_query():
+            query = _base_query()
+            if status_filter:
+                query = query.eq("status", status_filter)
+            return query.order("created_at", desc=True).execute()
+
+        response = await run_db_async(_run_query)
 
         # Batch fetch all unique property IDs and tenant IDs to avoid N+1 queries
         property_ids = list({req["property_id"] for req in response.data if req.get("property_id")})
@@ -105,7 +137,9 @@ async def get_landlord_viewing_requests(
         properties_map = {}
         if property_ids:
             try:
-                props_response = supabase_admin.table("properties").select("*").in_("id", property_ids).execute()
+                props_response = await run_db_async(
+                    lambda: supabase_admin.table("properties").select("*").in_("id", property_ids).execute(),
+                )
                 properties_map = {p["id"]: p for p in (props_response.data or [])}
             except Exception as props_error:
                 logger.warning(f"Could not fetch properties: {props_error}")
@@ -114,9 +148,11 @@ async def get_landlord_viewing_requests(
         tenants_map = {}
         if tenant_ids:
             try:
-                tenants_response = supabase_admin.table("users").select(
-                    "id, full_name, email, phone_number, avatar_url"
-                ).in_("id", tenant_ids).execute()
+                tenants_response = await run_db_async(
+                    lambda: supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).in_("id", tenant_ids).execute(),
+                )
                 tenants_map = {t["id"]: t for t in (tenants_response.data or [])}
             except Exception as tenants_error:
                 logger.warning(f"Could not fetch tenants: {tenants_error}")

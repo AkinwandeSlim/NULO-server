@@ -28,7 +28,7 @@ import logging
 import asyncio
 import re
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
-from app.database import supabase_admin
+from app.database import supabase_admin, run_db_async
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
 from app.services.notification_service import notification_service
 from app.routes.tenant_dashboard import invalidate_tenant_cache
@@ -239,7 +239,7 @@ async def get_agreements(
         if status_filter:
             query = query.eq("status", status_filter)
 
-        response = query.order("created_at", desc=True).execute()
+        response = await run_db_async(lambda: query.order("created_at", desc=True).execute())
         agreements = response.data or []
 
         # ✅ OPTIMIZATION: Batch fetch all related data instead of N+1 queries
@@ -255,18 +255,22 @@ async def get_agreements(
 
         try:
             if tenant_ids:
-                tenants_resp = supabase_admin.table("users").select(
-                    "id, full_name, email, phone_number, avatar_url"
-                ).in_("id", tenant_ids).execute()
+                tenants_resp = await run_db_async(
+                    lambda: supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).in_("id", tenant_ids).execute()
+                )
                 tenants_map = {u["id"]: u for u in tenants_resp.data}
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch tenants failed: {e}")
 
         try:
             if landlord_ids:
-                landlords_resp = supabase_admin.table("users").select(
-                    "id, full_name, email, phone_number, avatar_url"
-                ).in_("id", landlord_ids).execute()
+                landlords_resp = await run_db_async(
+                    lambda: supabase_admin.table("users").select(
+                        "id, full_name, email, phone_number, avatar_url"
+                    ).in_("id", landlord_ids).execute()
+                )
                 landlords_map = {u["id"]: u for u in landlords_resp.data}
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch landlords failed: {e}")
@@ -276,9 +280,11 @@ async def get_agreements(
         # Without this, every confirm-release dialog shows "Your Bank / ••••••••".
         try:
             if landlord_ids:
-                profiles_resp = supabase_admin.table("landlord_profiles").select(
-                    "id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
-                ).in_("id", landlord_ids).execute()
+                profiles_resp = await run_db_async(
+                    lambda: supabase_admin.table("landlord_profiles").select(
+                        "id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
+                    ).in_("id", landlord_ids).execute()
+                )
                 for profile in profiles_resp.data:
                     lid = profile["id"]
                     if lid in landlords_map:
@@ -298,9 +304,11 @@ async def get_agreements(
 
         try:
             if property_ids:
-                properties_resp = supabase_admin.table("properties").select(
-                "id, title, location, city, state, address, full_address, price, images, payment_frequency"
-            ).in_("id", property_ids).execute()
+                properties_resp = await run_db_async(
+                    lambda: supabase_admin.table("properties").select(
+                        "id, title, location, city, state, address, full_address, price, images, payment_frequency"
+                    ).in_("id", property_ids).execute()
+                )
                 properties_map = {p["id"]: p for p in properties_resp.data}
         except Exception as e:
             logger.warning(f"[AGREEMENTS] Batch fetch properties failed: {e}")
@@ -310,12 +318,14 @@ async def get_agreements(
         try:
             if agreements:
                 # Get the latest disbursement for each agreement
-                disbursements_resp = supabase_admin.table("transactions").select(
-                    "agreement_id, status, amount, nomba_transfer_ref"
-                ).in_("agreement_id", [a["id"] for a in agreements if a.get("id")]) \
-                .in_("transaction_type", ["nomba_disbursement"]) \
-                .order("created_at", desc=True) \
-                .execute()
+                disbursements_resp = await run_db_async(
+                    lambda: supabase_admin.table("transactions").select(
+                        "agreement_id, status, amount, nomba_transfer_ref"
+                    ).in_("agreement_id", [a["id"] for a in agreements if a.get("id")]) \
+                    .in_("transaction_type", ["nomba_disbursement"]) \
+                    .order("created_at", desc=True) \
+                    .execute()
+                )
                 logger.info(f"[AGREEMENTS] Fetched {len(disbursements_resp.data)} disbursements")
                 # Keep only the latest disbursement per agreement.
                 # But prefer a 'released' row over a 'failed' row — if we already
@@ -553,9 +563,10 @@ async def get_agreement(
 
         logger.info(f"[AGREEMENTS] Fetching agreement {agreement_id} for {user_type} {user_id}")
 
-        response = supabase_admin.table("agreements").select("*").eq(
-            "id", agreement_id
-        ).execute()
+        # Wrap Supabase calls with transient-socket retry (WinError 10035, timeouts, etc.)
+        response = await run_db_async(
+            lambda: supabase_admin.table("agreements").select("*").eq("id", agreement_id).execute()
+        )
 
         if not response.data:
             raise HTTPException(
@@ -580,12 +591,14 @@ async def get_agreement(
         # mask a successful release that happened afterwards.
         disbursement = None
         try:
-            disbursement_resp = supabase_admin.table("transactions").select(
-                "agreement_id, status, amount, nomba_transfer_ref"
-            ).eq("agreement_id", agreement_id) \
-            .eq("transaction_type", "nomba_disbursement") \
-            .order("created_at", desc=True) \
-            .execute()
+            disbursement_resp = await run_db_async(
+                lambda: supabase_admin.table("transactions").select(
+                    "agreement_id, status, amount, nomba_transfer_ref"
+                ).eq("agreement_id", agreement_id)
+                .eq("transaction_type", "nomba_disbursement")
+                .order("created_at", desc=True)
+                .execute()
+            )
             rows = disbursement_resp.data or []
             # Pick the best row: prefer 'released', then 'pending', then latest
             released_row = next((r for r in rows if r.get("status") == "released"), None)
@@ -603,30 +616,31 @@ async def get_agreement(
             enriched["disbursement_amount"] = disbursement.get("amount")
 
         # Fetch transfer history for this agreement
+        # Always try — the query uses account_ref = "{agreement_id}-SUB" built
+        # from the agreement UUID itself, so it works even when the agreement
+        # row has a null nomba_account_ref (e.g. older provisions).
         transfer_history = []
-        if agreement.get("nomba_account_ref"):
-            # Extract UUID and build suffixed account ref for querying virtual_account_transfers
-            uuid_match = re.search(
-                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-                agreement_id, re.IGNORECASE,
-            )
-            clean_agreement_id = uuid_match.group(0) if uuid_match else agreement_id
-            suffixed_account_ref = f"{clean_agreement_id}-SUB"
+        uuid_match = re.search(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            agreement_id, re.IGNORECASE,
+        )
+        clean_agreement_id = uuid_match.group(0) if uuid_match else agreement_id
+        suffixed_account_ref = f"{clean_agreement_id}-SUB"
 
-            transfers = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: supabase_admin
-                    .table("virtual_account_transfers")
-                    .select(
-                        "id, account_ref, account_number, amount_received, currency, "
-                        "sender_name, sender_bank, reconciliation_result, transaction_type, "
-                        "event_type, nomba_request_id, nomba_transaction_id, created_at"
-                    )
-                    .eq("account_ref", suffixed_account_ref)
-                    .order("created_at", desc=True)
-                    .execute(),
-            )
-            transfer_history = transfers.data or []
+        transfers = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: supabase_admin
+                .table("virtual_account_transfers")
+                .select(
+                    "id, account_ref, account_number, amount_received, currency, "
+                    "sender_name, sender_bank, reconciliation_result, transaction_type, "
+                    "event_type, nomba_request_id, nomba_transaction_id, created_at"
+                )
+                .eq("account_ref", suffixed_account_ref)
+                .order("created_at", desc=True)
+                .execute(),
+        )
+        transfer_history = transfers.data or []
 
         logger.info(f"✅ [AGREEMENTS] Returning agreement {agreement_id} to {user_type} {user_id}")
         return {
@@ -685,6 +699,18 @@ async def sign_agreement(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Failed to sign agreement"
             )
+
+        # ── PropFlow graph sync: once BOTH parties have signed, advance the
+        #     workflow past the signing gate so provision_nomba_dva runs (real/
+        #     mock VA). Best-effort — a graph hiccup must never fail the sign.
+        if str(agreement.get("status", "")).upper() == "SIGNED":
+            try:
+                from app.services.propflow_graph_sync import advance_after_sign
+                await advance_after_sign(agreement_id, supabase_admin)
+            except Exception as graph_err:
+                logger.warning(
+                    f"[AGREEMENTS] PropFlow graph advance failed (non-fatal): {graph_err}"
+                )
 
         enriched = _enrich(agreement)
 

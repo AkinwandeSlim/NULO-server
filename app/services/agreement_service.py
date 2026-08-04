@@ -19,7 +19,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-from app.database import supabase_admin
+from app.database import supabase_admin, run_db_async
 
 logger = logging.getLogger(__name__)
 
@@ -461,10 +461,12 @@ Signatures below constitute acceptance of all terms and conditions.
             agreement_dict["generation_metadata"] = metadata
             
             logger.info(f"🔥 [AGREEMENT SERVICE] Inserting enhanced agreement (source: {terms_result['source']})")
-            
+
             # Insert agreement into database
-            agreement_response = supabase_admin.table("agreements").insert(agreement_dict).execute()
-            
+            agreement_response = await run_db_async(
+                lambda: supabase_admin.table("agreements").insert(agreement_dict).execute()
+            )
+
             if agreement_response.data:
                 agreement_id = agreement_response.data[0]['id']
                 logger.info(f"✅ [AGREEMENT SERVICE] Enhanced agreement {agreement_id} created ({terms_result['source']})")

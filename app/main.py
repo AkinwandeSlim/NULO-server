@@ -56,7 +56,10 @@ def setup_logging():
     logger.addHandler(console_handler)
 
     # File handler with auto-rotation (5MB per file, keep 3 backups)
-    log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "serverlog.txt")
+    # Write outside the uvicorn reload-watched directory to avoid "watchfiles -1 change detected" spam
+    import tempfile
+    log_dir = tempfile.gettempdir()  # e.g. C:\Users\USER\AppData\Local\Temp
+    log_path = os.path.join(log_dir, "nulo-serverlog.txt")
     file_handler = RotatingFileHandler(
         log_path,
         maxBytes=5 * 1024 * 1024,  # 5 MB
@@ -303,5 +306,7 @@ if __name__ == "__main__":
         "app.main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=settings.DEBUG
+        reload=settings.DEBUG,
+        reload_includes=["*.py", "*.yaml", "*.yml"],
+        reload_excludes=["*.txt", "*.log", "*.tmp"],
     )

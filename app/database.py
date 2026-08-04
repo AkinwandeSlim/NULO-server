@@ -52,6 +52,73 @@ def retry_on_timeout(max_retries=3, delay=1.0):
             return sync_wrapper
     return decorator
 
+
+# ── Transient socket-error retry helpers ───────────────────────────────────────
+#
+# Windows raises WSAEWOULDBLOCK ([WinError 10035]) when multiple threads hammer
+# a single shared sync httpx client (the global `supabase_admin`) at once — the
+# landlord dashboard fans out 9 parallel run_in_executor fetches, while the
+# disburse flow, graph-sync and agreement detail all use the same client. These
+# are *transient*: a short backoff and one retry succeeds once the contention
+# clears. HTTP-level errors (auth, 4xx/5xx) are NOT retried — they propagate.
+
+def _is_transient_db_error(e: Exception) -> bool:
+    """True when the error is a transient socket/connection failure safe to retry."""
+    msg = str(e).lower()
+    markers = (
+        "10035",                       # winerror 10035 (wsae wouldblock)
+        "would block",                 # non-blocking socket busy
+        "could not be completed immediately",
+        "timed out",                   # existing retry_on_timeout case
+        "connection reset",
+        "connection aborted",
+        "connection error",
+        "broken pipe",
+        "remote end closed",
+        "econnreset",
+        "epipe",
+    )
+    return any(m in msg for m in markers)
+
+
+def run_db_sync(db_op, *args, max_retries=3, base_delay=0.4, **kwargs):
+    """Run a synchronous Supabase/PostgREST op, retrying transient socket errors.
+
+    Pass a zero-arg callable that performs the network I/O::
+
+        resp = run_db_sync(lambda: supabase_admin.table("x").select("*").execute())
+
+    Only connection-level failures (WSAEWOULDBLOCK, timeouts, resets) retry.
+    """
+    for attempt in range(max_retries):
+        try:
+            return db_op(*args, **kwargs)
+        except Exception as e:
+            if _is_transient_db_error(e) and attempt < max_retries - 1:
+                sleep_s = base_delay * (attempt + 1)
+                print(f"[DB] Transient error (attempt {attempt + 1}/{max_retries}): {e} — retrying in {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+
+async def run_db_async(db_op, *args, max_retries=3, base_delay=0.4, **kwargs):
+    """Async variant of :func:`run_db_sync` for use directly in async routes.
+
+    Same semantics, but sleeps with ``asyncio.sleep`` so the event loop is
+    not blocked while waiting for the retry backoff.
+    """
+    for attempt in range(max_retries):
+        try:
+            return db_op(*args, **kwargs)
+        except Exception as e:
+            if _is_transient_db_error(e) and attempt < max_retries - 1:
+                sleep_s = base_delay * (attempt + 1)
+                print(f"[DB] Transient error (attempt {attempt + 1}/{max_retries}): {e} — retrying in {sleep_s:.1f}s")
+                await asyncio.sleep(sleep_s)
+                continue
+            raise
+
 # OPTIMIZATION: Create Supabase client with SSL and timeout configuration
 def create_optimized_client(url: str, key: str) -> Client:
     """Create Supabase client with SSL and timeout configuration

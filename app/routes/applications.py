@@ -5,7 +5,7 @@ import asyncio
 import logging
 from pydantic import ValidationError
 from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
-from app.database import supabase_admin
+from app.database import supabase_admin, run_db_async
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
 from pydantic import BaseModel
 from typing import Optional, List
@@ -701,29 +701,31 @@ async def approve_application(
     """
     try:
         landlord_id = current_user["id"]
-        
+
         # Fetch application with property and tenant
-        app_response = supabase_admin.table("applications").select(
-            "*, property:properties(id, title, landlord_id, price, payment_frequency), user:users!user_id(id, full_name, email, phone_number)"
-        ).eq("id", application_id).single().execute()
-        
+        app_response = await run_db_async(
+            lambda: supabase_admin.table("applications").select(
+                "*, property:properties(id, title, landlord_id, price, payment_frequency), user:users!user_id(id, full_name, email, phone_number)"
+            ).eq("id", application_id).single().execute()
+        )
+
         if not app_response.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Application not found"
             )
-        
+
         application = app_response.data
         property_data = application.get("property")
         tenant_data = application.get("user")
-        
+
         # Verify landlord owns the property
         if not property_data or property_data.get("landlord_id") != landlord_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You don't have permission to approve this application"
             )
-        
+
         # Check if already approved/rejected
         # NOTE: include both 'submitted' and 'pending' here so we handle legacy
         # rows that may have been inserted before the status vocabulary was
@@ -735,18 +737,22 @@ async def approve_application(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Application is already {application['status']}"
             )
-        
+
         # Update application status
-        update_response = supabase_admin.table("applications").update({
-            "status": "approved",
-            "viewed_by_landlord": True,
-            "viewed_at": datetime.now().isoformat()
-        }).eq("id", application_id).execute()
-        
+        update_response = await run_db_async(
+            lambda: supabase_admin.table("applications").update({
+                "status": "approved",
+                "viewed_by_landlord": True,
+                "viewed_at": datetime.now().isoformat()
+            }).eq("id", application_id).execute()
+        )
+
         # Fetch the updated application with full details
-        updated_app_response = supabase_admin.table("applications").select(
-            "*, property:properties!inner(id, title, location, price, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score)"
-        ).eq("id", application_id).single().execute()
+        updated_app_response = await run_db_async(
+            lambda: supabase_admin.table("applications").select(
+                "*, property:properties!inner(id, title, location, price, landlord_id, payment_frequency), user:users!user_id(id, full_name, email, phone_number, trust_score)"
+            ).eq("id", application_id).single().execute()
+        )
         
         if not updated_app_response.data:
             raise HTTPException(
