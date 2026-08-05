@@ -545,7 +545,9 @@ async def get_current_user_profile(current_user: dict = Depends(get_current_user
         user_id = current_user["id"]
         
         # Fetch complete user profile
-        user_data = supabase_admin.table("users").select("*").eq("id", user_id).single().execute()
+        user_data = await run_db_async(
+            lambda: supabase_admin.table("users").select("*").eq("id", user_id).single().execute()
+        )
         
         if not user_data.data:
             raise HTTPException(
