@@ -20,7 +20,6 @@ Architecture note (Rule 6):
   asyncio.get_event_loop().run_in_executor() to avoid blocking the event loop.
 """
 
-import asyncio
 import logging
 import uuid
 from typing import Optional
@@ -163,64 +162,140 @@ async def _query_properties(
 ) -> list:
     """
     Run a Supabase query and return ranked property dicts.
-    Uses progressive filter relaxation: if the full query returns nothing,
-    drop bedrooms; if still nothing, drop price ceiling.
+
+    Strategy — broader query with composite scoring rather than hard filter
+    relaxation.  We fetch approved + vacant properties in the requested area
+    and rank them by how well they match the tenant's stated intent:
+      - exact bedroom match gets a large bonus
+      - being within budget gets a bonus (closer to budget = better)
+      - being over budget incurs a penalty proportional to the overrun
+    This means the tenant always sees the *most relevant* properties even
+    when no perfect match exists, rather than showing wildly mismatched
+    listings that happen to be in the right neighbourhood.
+
+    Falls back from neighbourhood → city if the location-specific query
+    returns nothing, so "Lekki Phase 1" → "Lekki" → "Lagos".
     """
-    from app.database import supabase_admin
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import settings
+        url = settings.SUPABASE_URL
+        key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    except Exception as exc:
+        logger.error(f"[match_properties] Config load failed: {exc}")
+        return []
 
-    loop = asyncio.get_event_loop()
+    select_cols = (
+        "id,title,location,city,state,price,beds,baths,"
+        "property_type,images,landlord_id,payment_frequency,"
+        "verification_status,status"
+    )
 
-    def _run(loc, beds, budget):
-        q = (
-            supabase_admin
-            .table("properties")
-            .select(
-                "id, title, location, city, state, price, beds, baths, "
-                "property_type, images, landlord_id, payment_frequency, "
-                "verification_status, status"
-            )
-            # verification_status='approved' — admin has verified this property
-            .eq("verification_status", "approved")
-            # status='vacant' — property is listed and not yet rented
-            # (matches the marketplace route filter in app/routes/properties.py)
-            .eq("status", "vacant")
-            .is_("deleted_at", "null")
+    def _raw_query(loc_filter: str | None) -> list:
+        """Fetch approved + vacant properties matching an optional location ILIKE."""
+        params = (
+            f"select={select_cols}"
+            f"&verification_status=eq.approved"
+            f"&status=eq.vacant"
+            f"&deleted_at=is.null"
         )
+        if loc_filter:
+            params += f"&location=ilike.*{loc_filter}*"
+        params += "&order=created_at.desc&limit=20"
+        try:
+            r = requests.get(
+                f"{url}/rest/v1/properties?{params}",
+                headers=headers, verify=False, timeout=10,
+            )
+            return r.json() if r.ok and r.json() else []
+        except Exception as exc:
+            logger.warning(f"[match_properties] REST query failed: {exc}")
+            return []
 
-        if loc:
-            # ILIKE matches partial location names: "Lekki" matches "Lekki Phase 1"
-            q = q.ilike("location", f"%{loc}%")
+    # ── Attempt 1: neighbourhood-level search ────────────────────────────────
+    data = _raw_query(location)
 
-        if beds is not None:
-            q = q.eq("beds", beds)
+    # ── Attempt 2: if location has a comma (e.g. "Lekki Phase 1, Lagos"),
+    # try just the first token (e.g. "Lekki") ─────────────────────────────────
+    if not data and location and "," in location:
+        broader = location.split(",")[0].strip()
+        logger.info(f"[match_properties] Narrowing location '{location}' -> '{broader}'")
+        data = _raw_query(broader)
 
-        if budget is not None:
-            # price column stores monthly rent as integer NGN
-            q = q.lte("price", int(budget * 1.20))  # 20% buffer above stated max
-
-        return q.order("price", desc=False).limit(_MAX_MATCHES).execute()
-
-    # Attempt 1: all filters
-    result = await loop.run_in_executor(None, lambda: _run(location, bedrooms, budget_monthly))
-    data = result.data or []
-
-    # Attempt 2: relax bedrooms if empty
-    if not data and bedrooms is not None:
-        logger.info("[match_properties] Relaxing bedrooms filter")
-        result = await loop.run_in_executor(None, lambda: _run(location, None, budget_monthly))
-        data = result.data or []
-
-    # Attempt 3: relax price if still empty
-    if not data and budget_monthly is not None:
-        logger.info("[match_properties] Relaxing price filter")
-        result = await loop.run_in_executor(None, lambda: _run(location, None, None))
-        data = result.data or []
+    # ── Attempt 3: try city-level if neighbourhood returned nothing ───────────
+    # Extract the CITY token (the part after the comma), e.g. "Garki, Abuja"
+    # -> "Abuja". The previous code searched the full "Garki, Abuja" string
+    # against city/location, which matched NOTHING because the DB stores
+    # city="Abuja" (never "Garki, Abuja"). This is why "2-bed in Garki, Abuja"
+    # returned zero even though Gwarinpa/Maitama/Wuse II 2-beds exist.
+    if not data and location:
+        city_token = location
+        if "," in location:
+            city_token = location.split(",")[-1].strip()
+        logger.info(f"[match_properties] City-level fallback for '{location}' -> city '{city_token}'")
+        select_alt = select_cols.replace("location,city,state", "city,location,state")
+        params = (
+            f"select={select_alt}"
+            f"&verification_status=eq.approved"
+            f"&status=eq.vacant"
+            f"&deleted_at=is.null"
+            f"&or=(city.ilike.*{city_token}*,state.ilike.*{city_token}*,location.ilike.*{city_token}*)"
+            f"&order=created_at.desc&limit=20"
+        )
+        try:
+            r = requests.get(
+                f"{url}/rest/v1/properties?{params}",
+                headers=headers, verify=False, timeout=10,
+            )
+            data = r.json() if r.ok and r.json() else []
+        except Exception as exc:
+            logger.warning(f"[match_properties] City fallback failed: {exc}")
 
     if not data:
         return []
 
-    # Rank by price proximity to stated budget (closer = better)
-    if budget_monthly:
-        data.sort(key=lambda p: abs(p.get("price", 0) - budget_monthly))
+    # ── Composite scoring ──────────────────────────────────────────────────
+    def _score(p: dict) -> float:
+        s = 0.0
 
-    return data[:_MAX_MATCHES]
+        # Bedroom match (biggest signal — most tenants have a hard requirement)
+        p_beds = p.get("beds") or 0
+        if bedrooms is not None:
+            b_diff = abs(p_beds - bedrooms)
+            if b_diff == 0:
+                s += 100               # exact match
+            elif b_diff == 1:
+                s += 40                # close enough
+            else:
+                s -= 20 * (b_diff - 1)   # penalty per extra bedroom beyond 1-off
+
+        # Price proximity
+        p_price = p.get("price") or 0
+        if budget_monthly is not None and p_price > 0:
+            ratio = p_price / budget_monthly
+            if ratio <= 1.0:
+                # Within budget — closer to max budget = better value for landlord
+                s += 50
+                s += 20 * ratio          # prefer properties closer to stated budget
+            else:
+                # Over budget — penalty scales with overrun
+                over_pct = ratio - 1.0
+                if over_pct <= 0.2:
+                    s += 10               # slight over budget, still acceptable
+                else:
+                    s -= 40 * over_pct    # steep penalty for way over budget
+
+        return s
+
+    scored = [(p, _score(p)) for p in data]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    logger.info(
+        f"[match_properties] {len(data)} candidates scored; best: "
+        f"{scored[0][0].get('title','?')} ({scored[0][1]:.0f} pts)"
+    )
+
+    return [p for p, _ in scored[:_MAX_MATCHES]]

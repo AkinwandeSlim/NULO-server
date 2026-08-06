@@ -155,11 +155,15 @@ def get_landlord_profile(landlord_id: str) -> dict:
     """Get landlord profile with user data - OPTIMIZED with parallel query setup"""
     try:
         # 🚀 OPTIMIZATION: Get both user and profile data with minimal fields needed
-        user_result = supabase_admin.table("users").select("id, full_name, email, phone_number, avatar_url, trust_score, verification_status, created_at, updated_at").eq("id", landlord_id).single().execute()
+        user_result = run_db_sync(
+            lambda: supabase_admin.table("users").select("id, full_name, email, phone_number, avatar_url, trust_score, verification_status, created_at, updated_at").eq("id", landlord_id).single().execute()
+        )
         user = user_result.data if user_result.data else {}
-        
+
         # Get landlord profile - use id as primary key
-        profile_result = supabase_admin.table("landlord_profiles").select("*").eq("id", landlord_id).single().execute()
+        profile_result = run_db_sync(
+            lambda: supabase_admin.table("landlord_profiles").select("*").eq("id", landlord_id).single().execute()
+        )
         profile = profile_result.data if profile_result.data else {}
         
         # Combine data efficiently
@@ -292,11 +296,13 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     # We also fetch ACTIVE/SIGNED agreement property_ids as a reliable fallback
     # and use whichever count is higher.
     try:
-        properties_result = supabase_admin.table("properties") \
-            .select("id, status, verification_status, view_count, price, deleted_at") \
-            .eq("landlord_id", landlord_id) \
-            .is_("deleted_at", "null") \
-            .execute()
+        properties_result = run_db_sync(
+            lambda: supabase_admin.table("properties") \
+                .select("id, status, verification_status, view_count, price, deleted_at") \
+                .eq("landlord_id", landlord_id) \
+                .is_("deleted_at", "null") \
+                .execute()
+        )
         properties = properties_result.data or []
 
         stats["total_properties"] = len(properties)
@@ -311,10 +317,12 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
         try:
             # Fetch all agreements (any status) to detect SIGNED-but-not-ACTIVE
             # so we can correctly demote stale "occupied" properties.
-            all_agr_result = supabase_admin.table("agreements") \
-                .select("id, property_id, status, tenant_signed_at, landlord_signed_at") \
-                .eq("landlord_id", landlord_id) \
-                .execute()
+            all_agr_result = run_db_sync(
+                lambda: supabase_admin.table("agreements") \
+                    .select("id, property_id, status, tenant_signed_at, landlord_signed_at") \
+                    .eq("landlord_id", landlord_id) \
+                    .execute()
+            )
             for agr in (all_agr_result.data or []):
                 pid = agr.get("property_id")
                 if not pid:
@@ -339,10 +347,12 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
                     and not prop.get("deleted_at")
                 ):
                     try:
-                        supabase_admin.table("properties") \
-                            .update({"status": "occupied"}) \
-                            .eq("id", prop_id) \
-                            .execute()
+                        run_db_sync(
+                            lambda: supabase_admin.table("properties") \
+                                .update({"status": "occupied"}) \
+                                .eq("id", prop_id) \
+                                .execute()
+                        )
                         prop["status"] = "occupied"  # update in-memory for counting below
                         logger.info(
                             "Backfilled property status to occupied | property=%s", prop_id
@@ -363,10 +373,12 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
                     and not prop.get("deleted_at")
                 ):
                     try:
-                        supabase_admin.table("properties") \
-                            .update({"status": "vacant"}) \
-                            .eq("id", prop_id) \
-                            .execute()
+                        run_db_sync(
+                            lambda: supabase_admin.table("properties") \
+                                .update({"status": "vacant"}) \
+                                .eq("id", prop_id) \
+                                .execute()
+                        )
                         prop["status"] = "vacant"  # update in-memory for counting below
                         logger.info(
                             "Demoted stale occupied→vacant (no ACTIVE agreement) | property=%s", prop_id
@@ -412,11 +424,13 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
 
         # ── Separate count: soft-deleted properties ──────────────────────
         try:
-            deleted_result = supabase_admin.table("properties") \
-                .select("id", count="exact") \
-                .eq("landlord_id", landlord_id) \
-                .not_.is_("deleted_at", "null") \
-                .execute()
+            deleted_result = run_db_sync(
+                lambda: supabase_admin.table("properties") \
+                    .select("id", count="exact") \
+                    .eq("landlord_id", landlord_id) \
+                    .not_.is_("deleted_at", "null") \
+                    .execute()
+            )
             stats["deleted_properties"] = deleted_result.count or 0
         except Exception:
             stats["deleted_properties"] = 0
@@ -427,10 +441,12 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
 
     # ── Query 2: Pending viewings ────────────────────────────────────────────
     try:
-        vr = supabase_admin.table("viewing_requests") \
-            .select("id") \
-            .eq("landlord_id", landlord_id) \
-            .eq("status", "pending").execute()
+        vr = run_db_sync(
+            lambda: supabase_admin.table("viewing_requests") \
+                .select("id") \
+                .eq("landlord_id", landlord_id) \
+                .eq("status", "pending").execute()
+        )
         stats["pending_viewings"] = len(vr.data or [])
     except Exception as e:
         logger.error(f"Stats query failed (viewings): {e}")
@@ -438,11 +454,13 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
 
     # ── Query 3: Messages (unread + read + total) ─────────────────────────────
     try:
-        # Fetch only the read flag and id (lightweight) for all messages to this landlord
-        all_msgs = supabase_admin.table("messages") \
-            .select("id, read") \
-            .eq("recipient_id", landlord_id) \
-            .execute()
+        # Fetch only the unread flag and id (lightweight) for all messages to this landlord
+        all_msgs = run_db_sync(
+            lambda: supabase_admin.table("messages") \
+                .select("id, read") \
+                .eq("recipient_id", landlord_id) \
+                .execute()
+        )
         msgs_list = all_msgs.data or []
         stats["total_messages"] = len(msgs_list)
         stats["unread_messages"] = sum(1 for m in msgs_list if not m.get("read", False))
@@ -457,19 +475,23 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     # REG-08: Exclude soft-deleted properties from this list.
     try:
         # Step 1: Get landlord's ACTIVE (non-deleted) property IDs
-        props = supabase_admin.table("properties") \
-            .select("id") \
-            .eq("landlord_id", landlord_id) \
-            .is_("deleted_at", "null") \
-            .execute()
+        props = run_db_sync(
+            lambda: supabase_admin.table("properties") \
+                .select("id") \
+                .eq("landlord_id", landlord_id) \
+                .is_("deleted_at", "null") \
+                .execute()
+        )
 
         property_ids = [p["id"] for p in (props.data or [])]
-        
+
         if property_ids:
             # Step 2: Get applications for those properties
-            apps = supabase_admin.table("applications") \
-                .select("id, status") \
-                .in_("property_id", property_ids).execute()
+            apps = run_db_sync(
+                lambda: supabase_admin.table("applications") \
+                    .select("id, status") \
+                    .in_("property_id", property_ids).execute()
+            )
             
             for app in (apps.data or []):
                 if app.get("status") in ("submitted", "pending"):
@@ -488,9 +510,11 @@ def calculate_landlord_stats(landlord_id: str) -> dict:
     # -- Query 5: Total conversations ----------------------------------------
     # conversations table has landlord_id directly
     try:
-        convos = supabase_admin.table("conversations") \
-            .select("id") \
-            .eq("landlord_id", landlord_id).execute()
+        convos = run_db_sync(
+            lambda: supabase_admin.table("conversations") \
+                .select("id") \
+                .eq("landlord_id", landlord_id).execute()
+        )
         stats["total_conversations"] = len(convos.data or [])
     except Exception as e:
         logger.error("Stats query failed (conversations): %s", str(e))
@@ -521,7 +545,7 @@ def get_landlord_properties(landlord_id: str, include_deleted: bool = False) -> 
         if not include_deleted:
             query = query.is_("deleted_at", "null")
 
-        result = query.execute()
+        result = run_db_sync(lambda: query.execute())
         properties = result.data or []
 
         if not properties:
@@ -529,7 +553,9 @@ def get_landlord_properties(landlord_id: str, include_deleted: bool = False) -> 
 
         # 🚀 OPTIMIZATION: Get ALL favorite counts in one batch query instead of one per property
         property_ids = [p["id"] for p in properties]
-        favorites_result = supabase_admin.table("favorites").select("property_id", count="exact").in_("property_id", property_ids).execute()
+        favorites_result = run_db_sync(
+            lambda: supabase_admin.table("favorites").select("property_id", count="exact").in_("property_id", property_ids).execute()
+        )
 
         # Build favorite count map
         favorite_counts = {}
@@ -585,29 +611,35 @@ def get_recent_activity(landlord_id: str, limit: int = 10) -> List[dict]:
     """Get recent activity for landlord"""
     try:
         activities = []
-        
+
         # Get recent viewing requests with minimal data
-        viewings_result = supabase_admin.table("viewing_requests").select("id, tenant_id, property_id, created_at").eq("landlord_id", landlord_id).order("created_at", desc=True).limit(limit).execute()
-        
+        viewings_result = run_db_sync(
+            lambda: supabase_admin.table("viewing_requests").select("id, tenant_id, property_id, created_at").eq("landlord_id", landlord_id).order("created_at", desc=True).limit(limit).execute()
+        )
+
         # Batch fetch tenant and property data to reduce queries
         tenant_ids = list(set([v["tenant_id"] for v in viewings_result.data or []]))
         property_ids = list(set([v["property_id"] for v in viewings_result.data or []]))
-        
+
         tenants = {}
         properties = {}
-        
+
         if tenant_ids:
-            tenants_result = supabase_admin.table("users").select("id, full_name").in_("id", tenant_ids).execute()
+            tenants_result = run_db_sync(
+                lambda: supabase_admin.table("users").select("id, full_name").in_("id", tenant_ids).execute()
+            )
             tenants = {t["id"]: t["full_name"] for t in tenants_result.data or []}
-        
+
         if property_ids:
-            props_result = supabase_admin.table("properties").select("id, title").in_("id", property_ids).execute()
+            props_result = run_db_sync(
+                lambda: supabase_admin.table("properties").select("id, title").in_("id", property_ids).execute()
+            )
             properties = {p["id"]: p["title"] for p in props_result.data or []}
-        
+
         for viewing in viewings_result.data or []:
             tenant_name = tenants.get(viewing["tenant_id"], "Unknown")
             prop_title = properties.get(viewing["property_id"], "Unknown Property")
-            
+
             activities.append({
                 "id": f"viewing_{viewing['id']}",
                 "type": "viewing_request",
@@ -620,14 +652,16 @@ def get_recent_activity(landlord_id: str, limit: int = 10) -> List[dict]:
                 "created_at": viewing["created_at"],
                 "read": False
             })
-        
+
         # Get recent applications with optimized queries
-        applications_result = supabase_admin.table("applications").select("id, user_id, property_id, propflow_thread_id, created_at").in_("property_id", property_ids).order("created_at", desc=True).limit(limit).execute()
-        
+        applications_result = run_db_sync(
+            lambda: supabase_admin.table("applications").select("id, user_id, property_id, propflow_thread_id, created_at").in_("property_id", property_ids).order("created_at", desc=True).limit(limit).execute()
+        )
+
         for app in applications_result.data or []:
             tenant_name = tenants.get(app["user_id"], "Unknown")
             prop_title = properties.get(app["property_id"], "Unknown Property")
-            
+
             activities.append({
                 "id": f"application_{app['id']}",
                 "type": "application",
@@ -640,7 +674,7 @@ def get_recent_activity(landlord_id: str, limit: int = 10) -> List[dict]:
                 "created_at": app["created_at"],
                 "read": False
             })
-        
+
         # Sort by date and limit
         activities.sort(key=lambda x: x["created_at"], reverse=True)
         return activities[:limit]
@@ -651,7 +685,9 @@ def get_recent_activity(landlord_id: str, limit: int = 10) -> List[dict]:
 def get_notifications(landlord_id: str) -> List[dict]:
     """Get notifications for landlord"""
     try:
-        result = supabase_admin.table("notifications").select("*").eq("user_id", landlord_id).order("created_at", desc=True).limit(20).execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("notifications").select("*").eq("user_id", landlord_id).order("created_at", desc=True).limit(20).execute()
+        )
         return result.data or []
     except Exception as e:
         logger.error(f"Error getting notifications: {str(e)}")
