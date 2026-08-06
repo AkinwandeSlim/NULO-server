@@ -52,7 +52,7 @@ Nigerian Pidgin translation guide:
   "face-me-I-face-you" = shared compound rooms
   "BQ" = boys quarters (servant quarters)
   "VI" = Victoria Island, Lagos
-  "GRA" = Government Reserved Area
+  "GRA" = Government Reserved Area (a neighbourhood, NOT a city)
   "k" or "K" after number = thousands (e.g. "500k" = 500,000)
   "m" or "M" after number = millions (e.g. "1.5m" = 1,500,000)
   "per month", "monthly" -> budget_monthly
@@ -60,6 +60,22 @@ Nigerian Pidgin translation guide:
   If only monthly given, annual = monthly * 12. If only annual, monthly = annual / 12.
   "ASAP", "immediately" -> move_in_date = today's date
   "next month" -> move_in_date = first day of next month
+
+LOCATION EXTRACTION (IMPORTANT -- preserve specificity):
+  Keep the tenant's neighbourhood exactly as written; do NOT collapse it to
+  the city or state. Nigerian tenants write many forms; preserve them all:
+    - "Ajah Lagos"        -> location = "Ajah, Lagos"
+    - "Ajah, Lagos"       -> location = "Ajah, Lagos"
+    - "Badagry Lagos"     -> location = "Badagry, Lagos"
+    - "First Junction PH" -> location = "First Junction, Port Harcourt"
+    - "GRA PH"            -> location = "GRA, Port Harcourt"
+    - "GRA, Portharcourt" -> location = "GRA, Port Harcourt"
+    - "Lekki Phase 1"     -> location = "Lekki Phase 1"
+    - "VI, Lagos"         -> location = "Victoria Island, Lagos"
+  Preserve the specific neighbourhood BEFORE the city so the matcher can
+  show the tenant exactly what they asked for, not every listing in the
+  whole city. Do NOT drop "GRA", "Badagry", "First Junction", etc.
+  If the user names ONLY a city (e.g. "Lagos" or "Abuja"), return just that.
 """
 
 _BRIEFING_SYSTEM_PROMPT = """You are a professional Nigerian property manager writing a briefing
