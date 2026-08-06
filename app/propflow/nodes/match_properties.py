@@ -132,7 +132,7 @@ def _extract_city_token(location: str) -> str:
 
     lowered = location.strip().lower()
 
-    # 1. Multi-word city phrase check ("port harcourt" wins over 'harcourt')
+    # 1. Multi-word city phrase check first ("port harcourt" wins over 'harcourt')
     for phrase in _MULTI_WORD_CITIES:
         if phrase in lowered:
             return _CITY_WORDS[phrase]
@@ -151,6 +151,52 @@ def _extract_city_token(location: str) -> str:
     else:
         candidate = location
     return candidate
+
+
+def _extract_neighbourhood(location: str) -> str | None:
+    """Extract the SPECIFIC neighbourhood from a location string, dropping the
+    city suffix -- the inverse of :func:`_extract_city_token`.
+
+    We search the neighbourhood FIRST so a tenant who typed "Ajah Lagos" or
+    "GRA Portharcourt" sees the specific Ajah / GRA listings, NOT every Lagos
+    / Port Harcourt property. City-level matching is a LAST resort.
+
+    Examples:
+      'Ajah, Lagos'          -> 'Ajah'
+      'Ajah Lagos'           -> 'Ajah'
+      'Badagry Lagos'        -> 'Badagry'
+      'First Junction PH'    -> 'First Junction'   (city alias for 'ph')
+      'GRA Portharcourt'     -> 'GRA'
+      'GRA, Portharcourt'    -> 'GRA'
+      'Lekki Phase 1, Lagos' -> 'Lekki Phase 1'
+      'Victoria Island, Lagos' -> 'Victoria Island'
+      'Garki, Abuja'         -> 'Garki'
+      'Lagos'                -> None   (neighbourhood IS the city: nothing to drop)
+    """
+    if not location:
+        return None
+
+    lowered = location.strip().lower()
+
+    # 1. Multi-word city phrase -> neighbourhood is everything before it
+    for phrase in _MULTI_WORD_CITIES:
+        idx = lowered.find(phrase)
+        if idx >= 0:
+            prefix = location[:idx].strip().rstrip(",").strip()
+            return prefix or None
+
+    # 2. Tokenise and cut at the first token that names a city
+    tokens = re.split(r"[\s,]+", location.strip())
+    for i, tok in enumerate(tokens):
+        if tok.strip().lower() in _CITY_WORDS:
+            if i == 0:
+                # The 'city' token is the whole string (e.g. "Lagos"/"PH").
+                # There is no finer neighbourhood to search.
+                return None
+            return " ".join(tokens[:i]).strip() or None
+
+    # 3. No city token embedded -> the entire string is the neighbourhood
+    return location.strip()
 
 
 async def match_properties_node(state: PropFlowState) -> PropFlowState:
@@ -296,28 +342,33 @@ async def _query_properties(
             logger.warning(f"[match_properties] REST query failed: {exc}")
             return []
 
-    # ── Attempt 1: neighbourhood-level search ────────────────────────────────
+    # ── Attempt 1: specific neighbourhood-first search ───────────────────────
+    # If the tenant said "Ajah Lagos" / "GRA Portharcourt", the RAW string
+    # "Ajah Lagos" won't match the DB's "Ajah, Lagos" (space vs comma), and
+    # searching the whole city would over-broaden. So:
+    #   1. try the raw location string as-is,
+    #   2. then the extracted SPECIFIC neighbourhood (drops the city suffix),
+    #   3. city-level search is the LAST resort, not the first.
     data = _raw_query(location)
 
-    # ── Attempt 2: if location has a comma (e.g. "Lekki Phase 1, Lagos"),
-    # try just the first token (e.g. "Lekki") ─────────────────────────────────
-    if not data and location and "," in location:
-        broader = location.split(",")[0].strip()
-        logger.info(f"[match_properties] Narrowing location '{location}' -> '{broader}'")
-        data = _raw_query(broader)
+    if not data and location:
+        neighbourhood = _extract_neighbourhood(location)
+        if neighbourhood and neighbourhood != location:
+            logger.info(
+                f"[match_properties] Neighbourhood search '{location}' -> '{neighbourhood}'"
+            )
+            data = _raw_query(neighbourhood)
 
-    # ── Attempt 3: try city-level if neighbourhood returned nothing ───────────
-    # Extract the CITY token from a messy location string. The previous code
-    # searched the full string (e.g. "Garki, Abuja" or "Ajah Lagos") against
-    # city/location, which matched NOTHING because the DB stores city="Abuja"
-    # / "Lagos" (never "Garki, Abuja" / "Ajah Lagos"). This is why "2-bed in
-    # Garki, Abuja" returned zero even though Gwarinpa/Maitama/Wuse II 2-beds
-    # exist — and why "Ajah Lagos", "First Junction PH", "GRA, Portharcourt"
-    # all returned zero too.
+    # ── Attempt 2: city-level search (only if every neighbourhood check found
+    #    nothing). Extract the CITY token from a messy location string. E.g.
+    #    "Garki, Abuja" -> "Abuja", "First Junction PH" -> "Port Harcourt".
+    #    Search city/state/location for that token.
     if not data and location:
         city_token = _extract_city_token(location)
         logger.info(f"[match_properties] City-level fallback for '{location}' -> city '{city_token}'")
-        select_alt = select_cols.replace("location,city,state", "city,location,state")
+        select_alt = select_cols.replace(
+            "location,city,state", "city,location,state"
+        )
         params = (
             f"select={select_alt}"
             f"&verification_status=eq.approved"
