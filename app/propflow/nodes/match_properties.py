@@ -71,6 +71,87 @@ _LOCATION_ALIASES: dict[str, str] = {
 # Properties per query — show tenant a shortlist, not a wall of listings
 _MAX_MATCHES = 3
 
+# Known Nigerian cities → the token we search city/state/location with.
+# The alias map above handles neighbourhoods ("garki", "lekki", "ph"); this
+# map is for CITY-level extraction used by the fallback search. Nigerian
+# tenants rarely write clean "Neighbourhood, City" strings — they write
+# "Ajah Lagos", "Badagry Lagos", "First Junction PH", "GRA, Portharcourt",
+# "Portharcourt", "GRA Portharcourt", etc. We tokenise the raw location and
+# look for the first token that names a city, then search by that.
+_CITY_WORDS: dict[str, str] = {
+    "lagos": "Lagos",
+    "lagos island": "Lagos",
+    "victoria island": "Victoria Island",
+    "abuja": "Abuja",
+    "fct": "Abuja",
+    "port harcourt": "Port Harcourt",
+    "portharcourt": "Port Harcourt",
+    "ph": "Port Harcourt",
+    "phc": "Port Harcourt",
+    "p/h": "Port Harcourt",
+    "rivers": "Port Harcourt",     # state containing Port Harcourt
+    "enugu": "Enugu",
+    "kano": "Kano",
+    "ibadan": "Ibadan",
+    "owerri": "Owerri",
+    "benin": "Benin City",
+    "abia": "Umuahia",
+}
+
+# Multi-word city names we must match as a phrase before falling back to
+# single-word token matching (e.g. "Port Harcourt" would otherwise split).
+_MULTI_WORD_CITIES = [
+    "port harcourt",
+    "lagos island",
+    "victoria island",
+    "benin city",
+]
+
+
+def _extract_city_token(location: str) -> str:
+    """Pull the CITY out of a messy Nigerian location string.
+
+    Examples:
+      'Garki, Abuja'           -> 'Abuja'
+      'Ajah, Lagos'            -> 'Lagos'
+      'Ajah Lagos'             -> 'Lagos'
+      'Badagry Lagos'          -> 'Lagos'
+      'First Junction PH'      -> 'Port Harcourt'
+      'GRA, Portharcourt'      -> 'Port Harcourt'
+      'GRA Portharcourt'       -> 'Port Harcourt'
+      'Portharcourt'           -> 'Port Harcourt'
+      'Central Business District, Abuja' -> 'Abuja'
+      'Wuse II, Abuja'         -> 'Abuja'
+      'Lekki Phase 1'          -> 'Lekki'   (no city token -> keep neighbourhood)
+
+    Falls back to the last comma-separated segment, else the last word, else
+    the whole string — so we never return an empty token.
+    """
+    if not location:
+        return location
+
+    lowered = location.strip().lower()
+
+    # 1. Multi-word city phrase check ("port harcourt" wins over 'harcourt')
+    for phrase in _MULTI_WORD_CITIES:
+        if phrase in lowered:
+            return _CITY_WORDS[phrase]
+
+    # 2. Tokenise on comma / slash / space and look for a single-word city
+    tokens = re.split(r"[,\s/]+", lowered)
+    for tok in tokens:
+        if tok in _CITY_WORDS:
+            return _CITY_WORDS[tok]
+
+    # 3. No city token found — use the last comma-separated segment, else the
+    #    last word (neighbourhood-level fallback, e.g. "Lekki Phase 1" -> "1"
+    #    is useless, so prefer the first token of the last comma segment).
+    if "," in location:
+        candidate = location.split(",")[-1].strip()
+    else:
+        candidate = location
+    return candidate
+
 
 async def match_properties_node(state: PropFlowState) -> PropFlowState:
     """
@@ -226,15 +307,15 @@ async def _query_properties(
         data = _raw_query(broader)
 
     # ── Attempt 3: try city-level if neighbourhood returned nothing ───────────
-    # Extract the CITY token (the part after the comma), e.g. "Garki, Abuja"
-    # -> "Abuja". The previous code searched the full "Garki, Abuja" string
-    # against city/location, which matched NOTHING because the DB stores
-    # city="Abuja" (never "Garki, Abuja"). This is why "2-bed in Garki, Abuja"
-    # returned zero even though Gwarinpa/Maitama/Wuse II 2-beds exist.
+    # Extract the CITY token from a messy location string. The previous code
+    # searched the full string (e.g. "Garki, Abuja" or "Ajah Lagos") against
+    # city/location, which matched NOTHING because the DB stores city="Abuja"
+    # / "Lagos" (never "Garki, Abuja" / "Ajah Lagos"). This is why "2-bed in
+    # Garki, Abuja" returned zero even though Gwarinpa/Maitama/Wuse II 2-beds
+    # exist — and why "Ajah Lagos", "First Junction PH", "GRA, Portharcourt"
+    # all returned zero too.
     if not data and location:
-        city_token = location
-        if "," in location:
-            city_token = location.split(",")[-1].strip()
+        city_token = _extract_city_token(location)
         logger.info(f"[match_properties] City-level fallback for '{location}' -> city '{city_token}'")
         select_alt = select_cols.replace("location,city,state", "city,location,state")
         params = (
