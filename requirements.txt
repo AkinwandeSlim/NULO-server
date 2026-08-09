@@ -57,6 +57,7 @@ openai>=1.0.0
 # PropFlow Memory (Mem0 - persistent cross-session agent memory)
 mem0ai>=0.1.0
 
+
 # PropFlow Evaluation Framework
 deepeval>=1.0.0
 

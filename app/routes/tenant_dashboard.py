@@ -200,6 +200,7 @@ class TenantApplication(BaseModel):
     move_in_date: Optional[str] = Field(None, description="Proposed move-in date")
     created_at: str = Field(..., description="Application submission timestamp")
     viewed_by_landlord: bool = Field(..., description="Whether landlord viewed application")
+    propflow_thread_id: Optional[str] = Field(None, description="PropFlow workflow thread ID")
 
     model_config = {
         "json_schema_extra": {
@@ -212,7 +213,8 @@ class TenantApplication(BaseModel):
                 "status": "pending",
                 "move_in_date": "2024-03-01",
                 "created_at": "2024-02-12T10:30:00Z",
-                "viewed_by_landlord": False
+                "viewed_by_landlord": False,
+                "propflow_thread_id": "propflow-abc123"
             }]
         }
     }
@@ -637,7 +639,7 @@ def fetch_applications(tenant_id: str) -> List[dict]:
     try:
         result = supabase_admin.table("applications") \
             .select(
-                "id, property_id, status, move_in_date, created_at, viewed_by_landlord"
+                "id, property_id, status, move_in_date, created_at, viewed_by_landlord, propflow_thread_id"
             ) \
             .eq("user_id", tenant_id) \
             .order("created_at", desc=True).execute()
@@ -668,7 +670,8 @@ def fetch_applications(tenant_id: str) -> List[dict]:
                 "status": app.get("status"),
                 "move_in_date": app.get("move_in_date"),
                 "created_at": app.get("created_at"),
-                "viewed_by_landlord": app.get("viewed_by_landlord", False)
+                "viewed_by_landlord": app.get("viewed_by_landlord", False),
+                "propflow_thread_id": app.get("propflow_thread_id"),
             })
         
         logger.info(f"Fetched {len(applications)} applications for user {tenant_id}")

@@ -14,6 +14,7 @@ Endpoints:
 
 import asyncio
 import logging
+import re
 import traceback
 import uuid
 from typing import Dict, Any, Optional, List
@@ -27,10 +28,17 @@ from app.database import get_supabase_admin
 from app.propflow.graph import propflow_graph
 from app.propflow.state import PropFlowState
 from app.propflow.config import propflow_settings
+from app.services.nomba_helpers import calculate_expected_amount
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/propflow", tags=["PropFlow AI Agent"])
+
+# Sentinel tenant used for guest (unauthenticated) search-only runs. Search
+# nodes (extract_intent / match_properties) never read tenant_id, and the
+# graph pauses at INTERRUPT #1 before create_application, so a guest workflow
+# never reaches any node that needs a real tenant. Guests are never resumed.
+GUEST_TENANT_UUID = uuid.UUID(int=0)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REQUEST/RESPONSE MODELS
@@ -196,7 +204,7 @@ async def start_propflow_chat(
         print(f"[PROPFLOW] Workflow completed: {result['current_stage']}")
         
         # Generate response message based on current stage
-        response_message = _generate_response_message(result)
+        response_message = await _generate_response_message(result)
         
         return ChatResponse(
             success=True,
@@ -217,6 +225,81 @@ async def start_propflow_chat(
             current_stage="error",
             response_message="I'm sorry, I encountered an error processing your request. Please try again.",
             error_message=str(e)
+        )
+
+
+@router.post("/chat/guest", response_model=ChatResponse)
+async def guest_search(request: ChatRequest):
+    """
+    Guest (unauthenticated) search-only PropFlow conversation.
+
+    Runs ONLY the search portion of the graph (extract_intent -> match_properties);
+    the compiled graph pauses on its own at INTERRUPT #1
+    (interrupt_before create_application), so no application / money path
+    is reachable. Property selection requires /select, which stays auth-gated.
+
+    NOTE: This endpoint spends ~3 Qwen calls + 1 Supabase read per request,
+    unauthenticated. Rate-limiting by IP is a known follow-up before wide
+    production exposure.
+    """
+    try:
+        workflow_id = f"propflow-guest-{uuid.uuid4().hex[:12]}"
+
+        initial_state = PropFlowState(
+            workflow_id=workflow_id,
+            tenant_id=GUEST_TENANT_UUID,
+            raw_inquiry_text=request.message,
+            current_stage="intent_extraction",
+            error_log=[],
+            extracted_intent=None,
+            extraction_confidence=None,
+            property_matches=None,
+            selected_property_id=None,
+            application_id=None,
+            application_status=None,
+            agreement_id=None,
+            agreement_status=None,
+            agreement_pdf_oss_key=None,
+            nomba_account_ref=None,
+            nomba_virtual_account_number=None,
+            expected_payment_amount=None,
+            reconciliation_status=None,
+            disbursement_merchant_tx_ref=None,
+            prior_tenant_memories=None,
+            prior_landlord_memories=None,
+            landlord_briefing=None,
+            is_returning_tenant=None,
+            disbursement_amount=None,
+            platform_fee=None,
+            rejection_reason=None,
+            landlord_id=None,
+        )
+
+        config = {"configurable": {"thread_id": workflow_id}}
+        result = await propflow_graph().ainvoke(initial_state, config=config)
+
+        response_message = await _generate_response_message(result)
+
+        return ChatResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage=result["current_stage"],
+            response_message=response_message,
+            extracted_intent=result.get("extracted_intent"),
+            matched_properties=result.get("property_matches"),
+        )
+    except Exception as e:
+        print(f"[PROPFLOW] Guest search failed: {e}")
+        traceback.print_exc()
+        return ChatResponse(
+            success=False,
+            workflow_id="unknown",
+            current_stage="error",
+            response_message=(
+                "I'm sorry, I encountered an error processing your request. "
+                "Please try again."
+            ),
+            error_message=str(e),
         )
 
 
@@ -286,7 +369,7 @@ async def select_property(
         # Step 4: Resume the graph -> proceeds to create_application
         result = await graph.ainvoke(None, config=thread_config)
 
-        response_message = _generate_response_message(result)
+        response_message = await _generate_response_message(result)
 
         return SelectResponse(
             success=True,
@@ -569,7 +652,7 @@ async def resume_propflow_workflow(
 
         # Step 4: Resume the graph
         result = await graph.ainvoke(None, config=thread_config)
-        response_message = _generate_response_message(result)
+        response_message = await _generate_response_message(result)
 
         return ResumeResponse(
             success=True,
@@ -676,29 +759,191 @@ async def simulate_propflow_payment(
         loop = asyncio.get_event_loop()
         supabase_admin = get_supabase_admin()
 
+        # The workflow state may not carry expected_payment_amount /
+        # virtual_account_number back through the checkpointer (channel not
+        # persisted or serialized to null), and the agreement may not have had
+        # a VA provisioned (provision_nomba_dva only runs via graph resume, but
+        # the frontend signs through the agreements route). So resolve the
+        # amount defensively: state → agreement.expected_payment_amount →
+        # calculate_expected_amount(rent, frequency). This is the same calc
+        # provision_virtual_account uses, so the simulated payment matches.
+        agreement_row = None
+        try:
+            agreement_result = await loop.run_in_executor(
+                None,
+                lambda: supabase_admin.table("agreements")
+                .select(
+                    "expected_payment_amount, virtual_account_number, "
+                    "nomba_account_ref, rent_amount, payment_frequency"
+                )
+                .eq("id", str(agreement_id))
+                .maybe_single()
+                .execute(),
+            )
+            agreement_row = agreement_result.data
+        except Exception as exc:
+            logger.warning(
+                "[PROPFLOW] Could not read agreement fallback for %s: %s",
+                agreement_id, exc,
+            )
+
+        agreement = agreement_row or {}
+        if expected_amount is None:
+            expected_amount = agreement.get("expected_payment_amount")
+        if expected_amount is None:
+            try:
+                rent = float(agreement.get("rent_amount") or 0)
+                freq = agreement.get("payment_frequency") or "MONTHLY"
+                expected_amount = calculate_expected_amount(rent, freq)
+            except (TypeError, ValueError):
+                expected_amount = 0.0
+        if not virtual_account:
+            virtual_account = agreement.get("virtual_account_number")
+        if not virtual_account:
+            # No real VA was provisioned (provision_nomba_dva only runs via graph
+            # resume, which the frontend sign flow skips). Derive a stable
+            # 10-digit synthetic VA from the agreement id so the tenant payment
+            # page and the transfer row always have a consistent account number.
+            digits = "".join(c for c in str(agreement_id) if c.isdigit())
+            virtual_account = ("9" + digits)[:10].ljust(10, "0")
+
+        # Single safe float for all inserts and message formatting. Never crashes
+        # on a None/str state value from the checkpointer.
+        try:
+            amount_float = float(expected_amount or 0)
+        except (TypeError, ValueError):
+            amount_float = 0.0
+
+        # ── Write agreement as FULL_PAYMENT ───────────────────────────────────
+        # Backfill expected_payment_amount / virtual_account_number too so the
+        # landlord payments page and release flow see a self-consistent row.
+        agreement_update = {
+            "total_received_amount": amount_float,
+            "reconciliation_status": "FULL_PAYMENT",
+            "status": "ACTIVE",
+        }
+        if not agreement.get("expected_payment_amount"):
+            agreement_update["expected_payment_amount"] = amount_float
+        if not agreement.get("virtual_account_number") and virtual_account:
+            agreement_update["virtual_account_number"] = virtual_account
+
         await loop.run_in_executor(
             None,
             lambda: supabase_admin.table("agreements")
-            .update({
-                "total_received_amount": float(expected_amount or 0),
-                "reconciliation_status": "FULL_PAYMENT",
-                "status": "ACTIVE",
-            })
+            .update(agreement_update)
             .eq("id", str(agreement_id))
             .execute(),
         )
 
+        # ── Transfer record for the landlord release flow ────────────────────
+        uuid_match = re.search(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            str(agreement_id), re.IGNORECASE,
+        )
+        clean_id = uuid_match.group(0) if uuid_match else str(agreement_id)
+        suffixed_ref = f"{clean_id}-SUB"
+        request_id = str(uuid.uuid4())
+        # Mirrors the Nomba webhook payload shape (the raw_payload column is
+        # NOT NULL), so the transfer row looks like a real webhook insert.
+        raw_payload = {
+            "requestId": request_id,
+            "event_type": "payment_success",
+            "data": {
+                "transaction": {
+                    "type": "vact_transfer",
+                    "transactionId": f"propflow-sim-{agreement_id[:8]}",
+                    "aliasAccountReference": suffixed_ref,
+                    "aliasAccountNumber": virtual_account,
+                    "transactionAmount": amount_float,
+                },
+                "customer": {
+                    "senderName": "Simulated Payment",
+                    "bankName": "PropFlow",
+                },
+            },
+        }
+
+        transfer_payload = {
+            "nomba_request_id": request_id,
+            "nomba_transaction_id": f"propflow-sim-{agreement_id[:8]}",
+            "account_ref": suffixed_ref,
+            "account_number": virtual_account,
+            # The disburse endpoint looks up the source transfer by this
+            # agreement_id column (same as _reconcile_payment sets it in the
+            # real webhook path) — without it the release flow 404s.
+            "agreement_id": clean_id,
+            "amount_received": amount_float,
+            "sender_name": "Simulated Payment",
+            "sender_bank": "PropFlow",
+            "currency": "NGN",
+            "event_type": "payment_success",
+            "transaction_type": "vact_transfer",
+            "raw_payload": raw_payload,
+            "signature_valid": True,
+            "reconciliation_result": "FULL_PAYMENT",
+        }
+
+        # Idempotent upsert: if a transfer already exists for this account ref
+        # (e.g. a previous run wrote ₦0), UPDATE its amount rather than stacking
+        # a duplicate row. Otherwise insert a new one.
+        try:
+            existing_result = await loop.run_in_executor(
+                None,
+                lambda: supabase_admin.table("virtual_account_transfers")
+                .select("id")
+                .eq("account_ref", suffixed_ref)
+                .limit(1)
+                .execute(),
+            )
+            existing = existing_result.data[0] if existing_result.data else None
+            if existing:
+                await loop.run_in_executor(
+                    None,
+                    lambda: supabase_admin.table("virtual_account_transfers")
+                    .update({
+                        "agreement_id": clean_id,
+                        "amount_received": amount_float,
+                        "account_number": virtual_account,
+                        "raw_payload": raw_payload,
+                        "reconciliation_result": "FULL_PAYMENT",
+                    })
+                    .eq("id", existing["id"])
+                    .execute(),
+                )
+            else:
+                await loop.run_in_executor(
+                    None,
+                    lambda: supabase_admin.table("virtual_account_transfers")
+                    .insert(transfer_payload)
+                    .execute(),
+                )
+        except Exception as exc:
+            logger.warning(
+                "[PROPFLOW] Transfer upsert failed (non-fatal) for %s: %s",
+                agreement_id, exc,
+            )
+
         logger.info(
             f"[PROPFLOW] Simulated payment for agreement={agreement_id} "
-            f"amount=NGN {expected_amount:,.0f}"
+            f"amount=NGN {amount_float:,.0f}"
         )
+
+        # ── Keep the graph thread in sync with the payment so a later
+        #     resume/confirm works against a correct stage. Best-effort.
+        try:
+            from app.services.propflow_graph_sync import sync_after_payment
+            await sync_after_payment(str(agreement_id), amount_float, supabase_admin)
+        except Exception as sync_err:
+            logger.warning(
+                f"[PROPFLOW] Graph payment sync failed (non-fatal): {sync_err}"
+            )
 
         return {
             "success": True,
-            "message": f"Payment of NGN {expected_amount:,.0f} received! The landlord can now confirm and complete the tenancy.",
+            "message": f"Payment of NGN {amount_float:,.0f} received! The landlord can now confirm and complete the tenancy.",
             "agreement_id": str(agreement_id) if agreement_id else None,
             "virtual_account": virtual_account,
-            "amount": expected_amount,
+            "amount": amount_float,
         }
 
     except Exception as e:
@@ -956,7 +1201,7 @@ def _safe_amount(val: Any) -> float | None:
         return None
 
 
-def _generate_response_message(result: Dict[str, Any], user_type: str = "tenant") -> str:
+async def _generate_response_message(result: Dict[str, Any], user_type: str = "tenant") -> str:
     """Generate user-friendly response message based on workflow stage and caller role."""
     stage = result.get("current_stage", "unknown")
     
@@ -976,7 +1221,36 @@ def _generate_response_message(result: Dict[str, Any], user_type: str = "tenant"
         if not matches:
             return "I couldn't find any properties matching your criteria. Would you like to adjust your requirements or budget?"
 
-        lines = [f"I found {len(matches)} properties that match your request. Which one do you prefer?"]
+        match_quality = result.get("match_quality") or "neighbourhood"
+
+        # LLM-grounded reply: honest about whether these are exact matches
+        # ('neighbourhood') or expanded recommendations from a wider area
+        # ('city'). Best-effort -- falls back to the deterministic template
+        # (below) if Qwen is unavailable or errors.
+        from app.propflow.services.qwen_client import qwen_client
+        try:
+            reply = await qwen_client.generate_tenant_reply(
+                result.get("extracted_intent") or {},
+                matches,
+                match_quality,
+            )
+            if reply and reply.strip():
+                return reply.strip()
+        except Exception as exc:
+            logger.warning(f"LLM tenant reply failed, using template: {exc}")
+
+        # Deterministic fallback -- the client strips the numbered list down to
+        # this header when property cards are rendered separately.
+        if match_quality == "city":
+            header = (
+                f"I couldn't find an exact match in "
+                f"{result.get('extracted_intent', {}).get('location', 'your area')}, "
+                f"but here are the closest options we found. They may differ from "
+                f"your request."
+            )
+        else:
+            header = f"I found {len(matches)} properties that match your request. Which one do you prefer?"
+        lines = [header]
         for i, p in enumerate(matches):
             title = p.get("title", "Property")
             price = _safe_amount(p.get("price"))

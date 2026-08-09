@@ -26,6 +26,8 @@ class ApplicationCreate(BaseModel):
     # Employment Info
     employment_status: Optional[str] = None
     employer_name: Optional[str] = None
+    job_title: Optional[str] = None
+    employment_duration: Optional[str] = None
     monthly_income: Optional[int] = None
     
     # Additional Info
@@ -127,6 +129,8 @@ async def create_application(
             message=application_data.message,
             employment_status=application_data.employment_status,
             employer_name=application_data.employer_name,
+            job_title=application_data.job_title,
+            employment_duration=application_data.employment_duration,
             monthly_income=application_data.monthly_income,
             move_in_date=application_data.move_in_date,
             lease_duration=application_data.lease_duration,

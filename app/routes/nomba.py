@@ -478,6 +478,15 @@ async def simulate_payment(
         agreement_id, expected_amount,
     )
 
+    # ── Keep the graph thread in sync with the payment. Best-effort.
+    try:
+        from app.services.propflow_graph_sync import sync_after_payment
+        await sync_after_payment(str(agreement_id), expected_amount, supabase_admin)
+    except Exception as sync_err:
+        logger.warning(
+            "[NOMBA] Graph payment sync failed (non-fatal): %s", sync_err,
+        )
+
     return {
         "status": "simulated",
         "amount": expected_amount,

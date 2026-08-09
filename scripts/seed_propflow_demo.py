@@ -34,6 +34,7 @@ Usage:
 import os
 import json
 import sys
+from datetime import datetime, timezone
 import requests
 import urllib3
 
@@ -196,6 +197,54 @@ def main():
         ok("tenants (already existed — patched)", status, data)
     else:
         ok("tenants (inserted)", status, data)
+
+    # ── Step 4: Seed a matching Lekki property for PropFlow demo ──────────────
+    print("\n[4/4] Seeding matching Lekki property for PropFlow demo ...")
+    import uuid as _uuid
+    LEKKI_PROP_ID = "00000000-0000-0000-0000-000000000001"
+    prop_body = {
+        "id":           LEKKI_PROP_ID,
+        "user_id":      "660e8400-e29b-41d4-a716-446655440001",
+        "title":        "Modern 2-Bedroom Apartment in Lekki Phase 1",
+        "description":  "A beautiful 2-bedroom apartment in the heart of Lekki Phase 1 with modern finishes, 24/7 security, and dedicated parking.",
+        "location":     "Lekki Phase 1, Lagos",
+        "city":         "Lagos",
+        "state":        "Lagos",
+        "price":        650000,
+        "beds":         2,
+        "baths":        2,
+        "property_type":"apartment",
+        "status":       "vacant",
+        "verification_status": "approved",
+    }
+    status, data = req("post", "properties", prop_body)
+    if status == 409:
+        # Already exists — patch it
+        status, data = req("patch", f"properties?id=eq.{LEKKI_PROP_ID}",
+            {k: v for k, v in prop_body.items() if k != "id"})
+        ok("properties — 2-bed Lekki (already existed — patched)", status, data)
+    else:
+        ok("properties — 2-bed Lekki (inserted)", status, data)
+
+    # Also seed a landlord profile for the property owner if missing
+    print("\n[4b/4] Ensuring landlord profile for property owner ...")
+    lprof_body = {
+        "id":                     "660e8400-e29b-41d4-a716-446655440001",
+        "bank_account_number":    "0123456789",
+        "bank_name":              "GTBank",
+        "account_name":           "Demo Landlord",
+        "bank_code":              "058",
+        "bank_verified_at":       datetime.now(timezone.utc).isoformat(),
+        "created_at":             datetime.now(timezone.utc).isoformat(),
+        "updated_at":             datetime.now(timezone.utc).isoformat(),
+    }
+    status, data = req("post", "landlord_profiles", lprof_body)
+    if status == 409:
+        status, data = req("patch", f"landlord_profiles?id=eq.660e8400-e29b-41d4-a716-446655440001",
+            {k: v for k, v in lprof_body.items() if k != "id"})
+        ok("landlord_profiles (already existed — patched)", status, data)
+    else:
+        ok("landlord_profiles (inserted)", status, data)
 
     # ── Verification pass ─────────────────────────────────────────────────────
     print("\n─── Verification ─────────────────────────────────────────────")

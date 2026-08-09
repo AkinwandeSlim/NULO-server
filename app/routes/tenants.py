@@ -1,6 +1,7 @@
 """
 Tenant api routes
 """
+import logging
 from fastapi import APIRouter, HTTPException, Depends, status, File, UploadFile
 from app.database import supabase_admin
 from app.middleware.auth import get_current_tenant
@@ -9,6 +10,8 @@ from typing import Optional
 from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tenants")
 executor = ThreadPoolExecutor(max_workers=4)
@@ -94,6 +97,7 @@ class EnrichProfileRequest(BaseModel):
     date_of_birth: Optional[str] = None
     nationality: Optional[str] = None
     marital_status: Optional[str] = None
+    phone: Optional[str] = None
 
 
 @router.get("/profile")
@@ -444,27 +448,50 @@ async def enrich_profile(
             update_data['income_proof_url'] = req.income_proof_url
             update_data['income_proof_verified'] = False  # Marked for landlord verification
 
-        # Personal info fields (new)
+        # Personal info fields (new) — all persisted in tenant_profiles so the
+        # next application pre-fills from a single source of truth.
         if req.date_of_birth:
             update_data['date_of_birth'] = req.date_of_birth
         if req.nationality:
             update_data['nationality'] = req.nationality
         if req.marital_status:
             update_data['marital_status'] = req.marital_status
+        if req.phone:
+            update_data['phone'] = req.phone
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: supabase_admin.table('tenant_profiles')
-                .upsert({'id': tenant_id, **update_data}, on_conflict='id')
+
+        def _upsert(payload: dict):
+            return supabase_admin.table('tenant_profiles') \
+                .upsert({'id': tenant_id, **payload}, on_conflict='id') \
                 .execute()
-        )
+
+        try:
+            result = await loop.run_in_executor(None, lambda: _upsert(update_data))
+        except Exception as exc:
+            # Self-heal: if the upsert fails because a column doesn't exist yet
+            # (e.g. `employment_duration`/`phone` migration not run), drop the
+            # offending fields and retry so the rest of the profile still persists.
+            msg = str(exc)
+            dropped = set()
+            for col in ('employment_duration', 'phone'):
+                if col in update_data and col in msg:
+                    dropped.add(col)
+                    del update_data[col]
+            if dropped:
+                logger.warning(f"[ENRICH] Column(s) missing in tenant_profiles, dropped {dropped}: {msg}")
+                result = await loop.run_in_executor(None, lambda: _upsert(update_data))
+            else:
+                logger.error(f"[ENRICH] Upsert failed: {msg}")
+                raise
 
         return {
             'success': True,
             'profile': result.data[0] if result.data else {}
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

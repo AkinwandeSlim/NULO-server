@@ -68,7 +68,7 @@ def count(table: str, filters: str = "") -> int:
     if filters:
         url += f"?{filters}"
     resp = requests.head(
-        url, headers={**headers, "Prefer": "count=exact"}
+        url, headers={**headers, "Prefer": "count=exact"}, verify=False
     )
     if not resp.ok:
         # 404 = table doesn't exist; anything else is a real error
@@ -96,13 +96,11 @@ def delete_all(table: str, filters: str = "") -> int:
     if filters:
         url += f"?{filters}"
     else:
-        # Use a permissive UUID filter that matches all rows
         url += "?id=gt.00000000-0000-0000-0000-000000000000"
-    resp = requests.delete(url, headers=headers)
+    resp = requests.delete(url, headers=headers, verify=False)
     if not resp.ok:
-        print(f"  [ERROR] {table}: {resp.status_code} {resp.text[:200]}")
+        print(f"  [WARN] {table}: HTTP {resp.status_code} — re-run indicates: {resp.text[:120]}")
         return 0
-    # With Prefer: return=representation, deleted rows are in the body
     try:
         return len(resp.json()) if resp.text else 0
     except Exception:
@@ -151,12 +149,7 @@ def main():
     n = delete_all("payment_reconciliation_log")
     print(f"  Deleted {n} rows")
 
-    # 2. Webhook event logs (only if tables exist)
-    print("\n[2/12] Checking webhook event logs...")
-    for table in ("webhook_events", "event_logs", "webhook_logs"):
-        if count(table) >= 0:
-            n = delete_all(table)
-            print(f"  {table}: {n} rows")
+    # 2. No webhook tables exist in current schema — skipping
 
     # 3. Transactions (must be deleted BEFORE virtual_account_transfers due to FK)
     print("\n[3/12] Deleting transactions...")
@@ -180,13 +173,7 @@ def main():
     n = delete_all("virtual_account_transfers")
     print(f"  Deleted {n} rows")
 
-    # 5. Disbursement records (only if tables exist)
-    print("\n[5/12] Checking disbursement records...")
-    for table in ("disbursement_queue", "disbursements", "payouts"):
-        if count(table) >= 0:
-            n = delete_all(table)
-            if n:
-                print(f"  {table}: {n} rows")
+    # 5. No separate disbursement tables exist (transactions table covers this)
 
     # 6. Applications
     print("\n[6/12] Deleting applications...")
@@ -214,11 +201,6 @@ def main():
     print(f"  messages: {n} rows")
     n = delete_all("conversations")
     print(f"  conversations: {n} rows")
-    # Check for chat_messages too (in case it exists in some deployments)
-    if count("chat_messages") >= 0:
-        n = delete_all("chat_messages")
-        if n:
-            print(f"  chat_messages: {n} rows")
 
     # 11. Favourites
     print("\n[11/12] Deleting favourites...")
@@ -240,7 +222,7 @@ def main():
     
     if occupied_count > 0:
         url = f"{SUPABASE_URL}/rest/v1/properties?status=eq.occupied"
-        resp = requests.patch(url, headers=headers, json={"status": "vacant"})
+        resp = requests.patch(url, headers=headers, json={"status": "vacant"}, verify=False)
         
         if resp.ok:
             try:
@@ -259,7 +241,7 @@ def main():
     # before running PropFlow. We check for it here and warn if missing.
     print("\n[PROPFLOW CHECK] Verifying applications.landlord_briefing column...")
     _check_url = f"{SUPABASE_URL}/rest/v1/applications?select=landlord_briefing&limit=0"
-    _check_resp = requests.get(_check_url, headers=headers)
+    _check_resp = requests.get(_check_url, headers=headers, verify=False)
     if _check_resp.status_code == 400 and "landlord_briefing" in _check_resp.text:
         print("  [WARN] applications.landlord_briefing column MISSING.")
         print("  Run this migration before using PropFlow:")
