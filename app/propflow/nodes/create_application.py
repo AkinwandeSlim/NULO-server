@@ -94,26 +94,23 @@ async def create_application_node(state: PropFlowState) -> PropFlowState:
 async def _fetch_tenant_profile(tenant_id: str) -> dict:
     """
     Fetch tenant_profiles row for employment and income data.
+    Uses REST (requests+verify=False) to avoid Windows socket issues.
     Returns safe empty dict on failure — node continues without it.
     """
-    import asyncio
     try:
-        from app.database import supabase_admin
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("tenant_profiles")
-                .select(
-                    "employment_status, company_name, job_title, "
-                    "monthly_income_range, income_proof_verified, "
-                    "emergency_contact_name, emergency_contact_phone"
-                )
-                .eq("id", tenant_id)
-                .single()
-                .execute(),
+        import os, requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import settings
+        url = settings.SUPABASE_URL
+        key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+        r = requests.get(
+            f"{url}/rest/v1/tenant_profiles?id=eq.{tenant_id}"
+            f"&select=employment_status,company_name,job_title,monthly_income_range,income_proof_verified",
+            headers=headers, verify=False, timeout=10,
         )
-        return result.data or {}
+        return r.json()[0] if r.ok and r.json() else {}
     except Exception as exc:
         logger.warning(f"[create_application] tenant_profiles fetch failed: {exc}")
         return {}

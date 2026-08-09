@@ -97,6 +97,33 @@ Use plain language (no jargon). Format amounts as NGN with commas (e.g. NGN 50,0
 Return ONLY the SMS text -- nothing else.
 """
 
+_TENANT_REPLY_PROMPT = """You are PropFlow, a friendly Nigerian AI rental assistant chatting with a
+tenant in the NuloAfrica app. You have just searched for properties and need to present the results.
+
+Context you receive:
+- REQUESTED: what the tenant asked for (neighbourhood, bedrooms, monthly budget)
+- FOUND: the properties actually found (title, area, monthly price, bedrooms)
+- MATCH_QUALITY: one of
+    "neighbourhood" -- every result is in the EXACT area the tenant asked for
+    "city"         -- nothing was found in the exact area; the results are the
+                      closest options from the wider city/area (recommendations,
+                      NOT exact matches)
+
+Rules:
+1. If MATCH_QUALITY is "neighbourhood": present the results as real matches.
+   Say where they are and how they fit the request. Invite the tenant to pick one.
+2. If MATCH_QUALITY is "city": be HONEST. Say clearly that you could not find
+   exactly what they asked for in <requested neighbourhood>, and that the options
+   shown are the closest ones from <wider city>. Name concrete gaps -- e.g. "the
+   closest 2-bed is NGN 680,000/month, above your NGN 500,000 budget" or "these
+   are in Maitama/Wuse, not in Garki". Then ask whether they'd like to adjust
+   (budget, area, bedrooms) or pick one of the options shown.
+3. Do NOT enumerate a numbered list -- the property cards are shown separately
+   in the app. Refer to "these options" / "the listings above".
+4. Keep it to 2-4 short sentences. Warm, plain English with a light Nigerian
+   tone (Pidgin only where natural). No JSON, no markdown, no bullet points.
+"""
+
 
 class QwenClient:
     """
@@ -114,12 +141,22 @@ class QwenClient:
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
+                import httpx
+                # QWEN_VERIFY_SSL defaults True (secure). Set false in local .env
+                # only if the dev machine's CA store rejects DashScope's cert
+                # chain (Python 3.14 / OpenSSL strict X.509). Production stays
+                # verified — mirrors the verify=False Supabase pattern.
+                http_client = httpx.AsyncClient(
+                    verify=self._settings.QWEN_VERIFY_SSL,
+                    timeout=60.0,
+                )
                 self._client = AsyncOpenAI(
                     api_key=self._settings.QWEN_API_KEY or "placeholder",
                     base_url=self._settings.QWEN_API_URL,
+                    http_client=http_client,
                 )
             except ImportError:
-                logger.error("openai package not installed. Run: pip install openai>=1.0.0")
+                logger.error("openai/httpx not installed. Run: pip install openai>=1.0.0 httpx")
                 return None
         return self._client
 
@@ -448,6 +485,91 @@ class QwenClient:
             f"Overpayment: NGN {actual - expected:,.0f} excess received. "
             f"Refund in 24hrs."
         )[:160]
+
+    # ── 4. Tenant Reply (property search presentation) ───────────────────────
+
+    async def generate_tenant_reply(
+        self,
+        intent: dict[str, Any],
+        matches: list,
+        match_quality: str,
+    ) -> str:
+        """
+        Generate a natural, HONEST reply presenting search results to a tenant.
+
+        `match_quality` tells us whether the matches are exact ('neighbourhood')
+        or expanded recommendations from a broader area ('city'). When 'city',
+        the reply must be clear these are the closest options, NOT the exact
+        request -- the tenant asked for e.g. Garki, we only found things in Abuja.
+        Falls back to a deterministic template if Qwen is unavailable.
+        """
+        intent = intent or {}
+        matches = matches or []
+
+        beds = intent.get("bedrooms")
+        budget = intent.get("budget_monthly")
+        req = (
+            f"Requested: {beds or '?'}-bed, "
+            f"location={intent.get('location') or 'any'}, "
+            f"budget={budget or 'any'} NGN/month"
+        )
+        found_lines = []
+        for p in matches[:3]:
+            found_lines.append(
+                f"- {p.get('title', 'Property')} | area={p.get('location', '?')} "
+                f"| price={p.get('price', '?')} NGN/month | beds={p.get('beds', '?')}"
+            )
+
+        user_message = (
+            f"MATCH_QUALITY: {match_quality}\n"
+            f"{req}\n"
+            f"FOUND ({len(found_lines)}):\n" + "\n".join(found_lines)
+        )
+
+        raw = await self._chat(_TENANT_REPLY_PROMPT, user_message, max_tokens=220)
+
+        if raw is None:
+            logger.info("Qwen unavailable -- using mock tenant reply")
+            return self._mock_tenant_reply(intent, matches, match_quality)
+
+        reply = raw.strip()
+        logger.info(f"Tenant reply generated ({len(reply)} chars, quality={match_quality})")
+        return reply
+
+    def _mock_tenant_reply(
+        self,
+        intent: dict[str, Any],
+        matches: list,
+        match_quality: str,
+    ) -> str:
+        """Deterministic fallback when Qwen is down. Still honest about quality."""
+        loc = (intent or {}).get("location") or ""
+        beds = (intent or {}).get("bedrooms")
+        budget = None
+        try:
+            budget = float((intent or {}).get("budget_monthly")) if (intent or {}).get("budget_monthly") else None
+        except (TypeError, ValueError):
+            budget = None
+        n = len(matches or [])
+        bed_txt = f"{beds}-bedroom " if beds else ""
+        budget_txt = f"NGN {budget:,.0f}/month" if budget else "your budget"
+
+        if match_quality == "city" and loc and "," in loc:
+            parts = [p.strip() for p in loc.split(",")]
+            neighbourhood = parts[0]
+            city = parts[-1]
+            if city and city.lower() != neighbourhood.lower():
+                return (
+                    f"I couldn't find exactly a {bed_txt}apartment in {neighbourhood} "
+                    f"within {budget_txt}, so here are {n} of the closest options in "
+                    f"{city} I'd recommend. They may be in a different area or above "
+                    f"budget -- would you like to adjust your search or pick one?"
+                )
+
+        return (
+            f"I found {n} properties that match what you asked for. "
+            f"Which one would you like to go with?"
+        )
 
 
 # Singleton

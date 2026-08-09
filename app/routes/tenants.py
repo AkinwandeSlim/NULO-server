@@ -72,15 +72,28 @@ class CompleteProfileData(BaseModel):
     preferred_location: str
     bedrooms: int
     move_in_date: Optional[str] = None
-    
+
     # Step 2: Documents
     id_document_url: str
     proof_of_income_url: str
     reference1_email: Optional[str] = None
     reference2_email: Optional[str] = None
-    
+
     # Step 3: Rent Credit
     join_rent_credit: bool = False
+
+
+class EnrichProfileRequest(BaseModel):
+    """Request to enrich tenant profile after application submit"""
+    employment_status: Optional[str] = None
+    company_name: Optional[str] = None
+    job_title: Optional[str] = None
+    employment_duration: Optional[str] = None
+    monthly_income: Optional[int] = None
+    income_proof_url: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    nationality: Optional[str] = None
+    marital_status: Optional[str] = None
 
 
 @router.get("/profile")
@@ -376,11 +389,84 @@ async def upload_document(
             "success": True,
             "url": document_url
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload document: {str(e)}"
+        )
+
+
+def _income_to_range(monthly: int) -> str:
+    """Convert monthly income (in Naira) to a range string"""
+    if monthly < 100_000:
+        return '< 100k'
+    elif monthly < 250_000:
+        return '100k - 250k'
+    elif monthly < 500_000:
+        return '250k - 500k'
+    elif monthly < 1_000_000:
+        return '500k - 1M'
+    else:
+        return '> 1M'
+
+
+@router.post("/enrich-profile")
+async def enrich_profile(
+    req: EnrichProfileRequest,
+    current_user: dict = Depends(get_current_tenant)
+):
+    """
+    Enrich tenant profile with employment/income data after application submit.
+    Called from: apply page (after successful app submit) OR PropFlow chat.
+    Writes to tenant_profiles so next application pre-fills.
+    """
+    try:
+        tenant_id = current_user["id"]
+
+        update_data = {
+            'updated_at': datetime.utcnow().isoformat(),
+        }
+
+        if req.employment_status:
+            update_data['employment_status'] = req.employment_status
+        if req.company_name:
+            update_data['company_name'] = req.company_name
+        if req.job_title:
+            update_data['job_title'] = req.job_title
+        if req.employment_duration:
+            update_data['employment_duration'] = req.employment_duration
+        if req.monthly_income:
+            update_data['monthly_income_range'] = _income_to_range(req.monthly_income)
+        if req.income_proof_url:
+            update_data['income_proof_url'] = req.income_proof_url
+            update_data['income_proof_verified'] = False  # Marked for landlord verification
+
+        # Personal info fields (new)
+        if req.date_of_birth:
+            update_data['date_of_birth'] = req.date_of_birth
+        if req.nationality:
+            update_data['nationality'] = req.nationality
+        if req.marital_status:
+            update_data['marital_status'] = req.marital_status
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: supabase_admin.table('tenant_profiles')
+                .upsert({'id': tenant_id, **update_data}, on_conflict='id')
+                .execute()
+        )
+
+        return {
+            'success': True,
+            'profile': result.data[0] if result.data else {}
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to enrich profile: {str(e)}"
         )

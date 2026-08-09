@@ -54,3 +54,10 @@ node_modules/
 # ── Dangerous database cleanup scripts ───────────────
 scripts/clean_database_for_demo.py
 scripts/reset_test_data.py
+
+# ── SQL & Database Files (kept private in /database) ─
+*.sql
+docs/
+app/db_migrations/
+dev_tests/
+migrations/

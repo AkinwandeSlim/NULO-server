@@ -97,12 +97,34 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             )
         except JWTError:
             # If strict validation fails, try lenient decode (extract claims without signature verification)
-            # This handles Supabase tokens during fallback
+            # This handles Supabase tokens during fallback. We disable ALL claim
+            # verification (aud/iss/exp/...) — the token was already validated by
+            # Supabase (or is our own), and here we only need the `sub` to look up
+            # the DB profile. Leaving verify_aud on raises "Invalid audience" for
+            # Supabase tokens (aud="authenticated"), causing false 401s.
             print("⚠️ [get_current_user] Strict validation failed, trying lenient decode...")
             payload = jwt.decode(
                 token,
                 key="",  # Required parameter, even with verify_signature=False
-                options={"verify_signature": False}  # Don't verify signature — Supabase uses their key
+                options={
+                    "verify_signature": False,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                    "verify_sub": False,
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                    "verify_iat": False,
+                    "verify_jti": False,
+                    "verify_at_hash": False,
+                    "require_aud": False,
+                    "require_exp": False,
+                    "require_iat": False,
+                    "require_nbf": False,
+                    "require_iss": False,
+                    "require_sub": False,
+                    "require_jti": False,
+                    "require_at_hash": False,
+                }
             )
         
         # Extract user_id from payload
@@ -267,7 +289,25 @@ async def get_optional_current_user(
             payload = jwt.decode(
                 token,
                 key="",
-                options={"verify_signature": False}
+                options={
+                    "verify_signature": False,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                    "verify_sub": False,
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                    "verify_iat": False,
+                    "verify_jti": False,
+                    "verify_at_hash": False,
+                    "require_aud": False,
+                    "require_exp": False,
+                    "require_iat": False,
+                    "require_nbf": False,
+                    "require_iss": False,
+                    "require_sub": False,
+                    "require_jti": False,
+                    "require_at_hash": False,
+                }
             )
         
         user_id = payload.get("sub") or payload.get("user_id")

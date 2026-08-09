@@ -116,7 +116,7 @@ def _patch_services():
         patch("app.propflow.nodes.extract_intent.mem0_service.search_tenant_memories",
               return_value=[]),
         patch("app.propflow.nodes.match_properties._query_properties",
-              new_callable=AsyncMock, return_value=MOCK_PROPERTIES),
+              new_callable=AsyncMock, return_value=(MOCK_PROPERTIES, "neighbourhood")),
         patch("app.services.application_service.application_service.submit_application",
               new_callable=AsyncMock,
               return_value={"id": str(uuid.uuid4()), "status": "submitted",

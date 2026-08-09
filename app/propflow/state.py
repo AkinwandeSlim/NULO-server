@@ -18,6 +18,11 @@ class PropFlowState(TypedDict):
     # Each item: { id, title, location, price, bedrooms, property_type }
     property_matches: Optional[list]
     selected_property_id: Optional[uuid.UUID]
+    # How closely the matches fit the tenant's request:
+    #   'neighbourhood' — found in the exact area asked for (true matches)
+    #   'city'          — only found via city/area fallback (recommendations)
+    #   'none'          — nothing found
+    match_quality: Optional[str]
 
     # ── Application State Machine ────────────────────────────────────────────
     application_id: Optional[uuid.UUID]

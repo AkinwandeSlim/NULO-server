@@ -43,6 +43,12 @@ from typing import Any, AsyncIterator, Iterator, Optional, List, Tuple, Dict
 import httpx
 import requests
 
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     Checkpoint,
@@ -115,6 +121,7 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
             self._async_client = httpx.AsyncClient(
                 headers=self._headers,
                 timeout=httpx.Timeout(30.0, connect=10.0),
+                verify=False,  # same SSL handling as the rest of the app on Windows
             )
         return self._async_client
 
@@ -122,6 +129,7 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
         """Lazy-create the shared requests Session."""
         if self._sync_session is None:
             self._sync_session = requests.Session()
+            self._sync_session.verify = False  # same SSL handling as the rest of the app
             self._sync_session.headers.update(self._headers)
         return self._sync_session
 

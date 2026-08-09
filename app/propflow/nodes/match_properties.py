@@ -21,6 +21,7 @@ Architecture note (Rule 6):
 """
 
 import logging
+import re
 import uuid
 from typing import Optional
 
@@ -238,13 +239,14 @@ async def match_properties_node(state: PropFlowState) -> PropFlowState:
     )
 
     try:
-        matches = await _query_properties(location, bedrooms, budget_monthly)
+        matches, match_quality = await _query_properties(location, bedrooms, budget_monthly)
     except Exception as exc:
         logger.error(f"[match_properties] Supabase query failed: {exc}")
         error_log = state.get("error_log", [])
         return {
             **state,
             "property_matches": [],
+            "match_quality": "none",
             "error_log": error_log + [f"match_properties: {exc}"],
             "current_stage": "no_properties_found",
         }
@@ -257,6 +259,7 @@ async def match_properties_node(state: PropFlowState) -> PropFlowState:
         return {
             **state,
             "property_matches": [],
+            "match_quality": "none",
             "current_stage": "no_properties_found",
             "error_log": state.get("error_log", []) + [
                 f"No approved properties found matching: "
@@ -276,6 +279,7 @@ async def match_properties_node(state: PropFlowState) -> PropFlowState:
     return {
         **state,
         "property_matches": matches,
+        "match_quality": match_quality,
         "selected_property_id": None,   # Set via /select endpoint
         "landlord_id": None,            # Set via /select endpoint
         "current_stage": "awaiting_tenant_selection",
@@ -313,7 +317,7 @@ async def _query_properties(
         headers = {"apikey": key, "Authorization": f"Bearer {key}"}
     except Exception as exc:
         logger.error(f"[match_properties] Config load failed: {exc}")
-        return []
+        return [], "none"
 
     select_cols = (
         "id,title,location,city,state,price,beds,baths,"
@@ -349,20 +353,30 @@ async def _query_properties(
     #   1. try the raw location string as-is,
     #   2. then the extracted SPECIFIC neighbourhood (drops the city suffix),
     #   3. city-level search is the LAST resort, not the first.
+    match_quality = "none"  # set to 'neighbourhood'/'city' by whichever query produced data
     data = _raw_query(location)
 
-    if not data and location:
+    if data:
+        # Found in the exact requested area (raw string matched directly).
+        match_quality = "neighbourhood"
+    elif location:
         neighbourhood = _extract_neighbourhood(location)
         if neighbourhood and neighbourhood != location:
             logger.info(
                 f"[match_properties] Neighbourhood search '{location}' -> '{neighbourhood}'"
             )
             data = _raw_query(neighbourhood)
+            if data:
+                # Found in the exact neighbourhood the tenant named.
+                match_quality = "neighbourhood"
 
     # ── Attempt 2: city-level search (only if every neighbourhood check found
     #    nothing). Extract the CITY token from a messy location string. E.g.
     #    "Garki, Abuja" -> "Abuja", "First Junction PH" -> "Port Harcourt".
     #    Search city/state/location for that token.
+    #    Track WHERE the data ultimately came from so the reply can be honest:
+    #    'neighbourhood' (exact area) vs 'city' (expanded area — these are
+    #    recommendations, not exact matches).
     if not data and location:
         city_token = _extract_city_token(location)
         logger.info(f"[match_properties] City-level fallback for '{location}' -> city '{city_token}'")
@@ -385,9 +399,11 @@ async def _query_properties(
             data = r.json() if r.ok and r.json() else []
         except Exception as exc:
             logger.warning(f"[match_properties] City fallback failed: {exc}")
+        if data:
+            match_quality = "city"
 
     if not data:
-        return []
+        return [], "none"
 
     # ── Composite scoring ──────────────────────────────────────────────────
     def _score(p: dict) -> float:
@@ -427,7 +443,8 @@ async def _query_properties(
 
     logger.info(
         f"[match_properties] {len(data)} candidates scored; best: "
-        f"{scored[0][0].get('title','?')} ({scored[0][1]:.0f} pts)"
+        f"{scored[0][0].get('title','?')} ({scored[0][1]:.0f} pts) "
+        f"[match_quality={match_quality}]"
     )
 
-    return [p for p, _ in scored[:_MAX_MATCHES]]
+    return [p for p, _ in scored[:_MAX_MATCHES]], match_quality

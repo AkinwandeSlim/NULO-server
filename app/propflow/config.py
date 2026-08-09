@@ -19,6 +19,11 @@ class PropFlowSettings(BaseSettings):
     QWEN_FALLBACK_MODEL: str = "qwen-turbo"
     QWEN_TEMPERATURE: float = 0.1   # Low = deterministic, good for JSON extraction
     QWEN_MAX_TOKENS: int = 1000
+    # TLS verification for the DashScope connection. Default True (secure).
+    # Set QWEN_VERIFY_SSL=false in local .env ONLY if your dev machine's CA
+    # store rejects DashScope's cert chain (Python 3.14 / OpenSSL strict X.509).
+    # Production should keep this True.
+    QWEN_VERIFY_SSL: bool = True
 
     # ── Confidence Thresholds ─────────────────────────────────────────────────
     INTENT_CONFIDENCE_THRESHOLD: float = 0.7   # Below this, ask tenant to clarify

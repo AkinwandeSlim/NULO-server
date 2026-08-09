@@ -189,42 +189,34 @@ async def enrich_and_qualify_node(state: PropFlowState) -> PropFlowState:
 # The Supabase Python client is synchronous -- calling it directly blocks the loop.
 
 async def _fetch_tenant_profile(tenant_id: str) -> dict:
-    """Fetch tenant profile from Supabase. Returns safe defaults on failure."""
+    """Fetch tenant profile via REST (requests+verify=False — avoids Windows socket issues with supabase-py).
+
+    Returns safe defaults on failure so the workflow continues even if Supabase is flaky.
+    """
     try:
-        from app.database import supabase_admin
-        loop = asyncio.get_event_loop()
+        import os, requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import settings
+        url = settings.SUPABASE_URL
+        key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
 
-        # users table has full_name, email
-        user_result = await loop.run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("users")
-                .select("id, full_name, email, phone_number")
-                .eq("id", tenant_id)
-                .single()
-                .execute()
-        )
-        user_data = user_result.data or {}
+        # users table
+        ru = requests.get(f"{url}/rest/v1/users?id=eq.{tenant_id}&select=id,full_name,email,phone_number",
+                          headers=headers, verify=False, timeout=10)
+        user_data = ru.json()[0] if ru.ok and ru.json() else {}
 
-        # tenant_profiles has employment_status, company_name, job_title, monthly_income_range
-        profile_result = await loop.run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("tenant_profiles")
-                .select("employment_status, company_name, job_title, monthly_income_range")
-                .eq("id", tenant_id)
-                .single()
-                .execute()
-        )
-        profile_data = profile_result.data or {}
+        # tenant_profiles (columns confirmed to exist)
+        rp = requests.get(f"{url}/rest/v1/tenant_profiles?id=eq.{tenant_id}&select=employment_status,company_name,job_title,monthly_income_range",
+                          headers=headers, verify=False, timeout=10)
+        profile_data = rp.json()[0] if rp.ok and rp.json() else {}
 
-        # Merge into a single dict with normalised keys expected by Qwen briefing
         return {
             "id": tenant_id,
             "full_name": user_data.get("full_name", "Applicant"),
             "email": user_data.get("email", ""),
             "phone_number": user_data.get("phone_number", ""),
-            # Map to the keys that qwen_client.generate_landlord_briefing expects
             "occupation": profile_data.get("job_title") or profile_data.get("employment_status", ""),
             "employer": profile_data.get("company_name", ""),
             "monthly_income": profile_data.get("monthly_income_range", ""),
@@ -232,31 +224,26 @@ async def _fetch_tenant_profile(tenant_id: str) -> dict:
     except Exception as exc:
         logger.warning(f"[enrich_qualify] tenant profile fetch failed: {exc}")
 
-    # Safe fallback — workflow continues even if profile fetch fails
     return {"id": tenant_id, "full_name": "Applicant", "email": ""}
 
 
 async def _fetch_property_details(property_id: str | None) -> dict:
-    """Fetch property details from Supabase. Returns safe defaults on failure."""
+    """Fetch property details via REST. Safe fallback on failure."""
     if not property_id:
         return {"title": "Listed property", "location": "", "price": 0}
-
     try:
-        from app.database import supabase_admin
-        loop = asyncio.get_event_loop()
+        import os, requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import settings
+        url = settings.SUPABASE_URL
+        key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
 
-        result = await loop.run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("properties")
-                .select("id, title, location, price, beds, property_type, landlord_id")
-                .eq("id", property_id)
-                .single()
-                .execute()
-        )
-        if result.data:
-            data = result.data
-            # Normalise beds → bedrooms for Qwen briefing context
+        r = requests.get(f"{url}/rest/v1/properties?id=eq.{property_id}&select=id,title,location,price,beds,property_type,landlord_id",
+                         headers=headers, verify=False, timeout=10)
+        if r.ok and r.json():
+            data = r.json()[0]
             data["bedrooms"] = data.pop("beds", None)
             return data
     except Exception as exc:
@@ -266,22 +253,20 @@ async def _fetch_property_details(property_id: str | None) -> dict:
 
 
 async def _update_application_briefing(application_id: str, briefing: str) -> None:
-    """Write the Qwen-generated briefing to the applications table."""
+    """Write briefing to applications table via REST."""
     try:
-        from app.database import supabase_admin
-        loop = asyncio.get_event_loop()
+        import os, requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import settings
+        url = settings.SUPABASE_URL
+        key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
 
-        await loop.run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("applications")
-                .update({"landlord_briefing": briefing})
-                .eq("id", application_id)
-                .execute()
-        )
-        logger.info(
-            f"[enrich_qualify] Briefing written to applications table: {application_id[:8]}..."
-        )
+        r = requests.patch(f"{url}/rest/v1/applications?id=eq.{application_id}",
+                           json={"landlord_briefing": briefing},
+                           headers=headers, verify=False, timeout=10)
+        if r.ok:
+            logger.info(f"[enrich_qualify] Briefing written to applications table: {application_id[:8]}...")
     except Exception as exc:
-        # Non-fatal -- briefing is in state even if DB write fails
         logger.warning(f"[enrich_qualify] Failed to write briefing to DB: {exc}")
