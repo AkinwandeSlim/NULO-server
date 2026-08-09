@@ -3,12 +3,12 @@ Application routes
 """
 import asyncio
 import logging
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File
 from app.database import supabase_admin, run_db_async
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, ClassVar
 from datetime import datetime, timedelta
 import re
 import uuid
@@ -22,30 +22,59 @@ class ApplicationCreate(BaseModel):
     viewing_id: Optional[str] = None
     # Personal Info (will be extracted from user profile)
     message: Optional[str] = None
-    
+
     # Employment Info
-    employment_status: Optional[str] = None
+    employment_status: str
     employer_name: Optional[str] = None
     job_title: Optional[str] = None
     employment_duration: Optional[str] = None
     monthly_income: Optional[int] = None
-    
+
     # Additional Info
-    move_in_date: Optional[str] = None
-    lease_duration: Optional[str] = None
-    number_of_occupants: Optional[int] = None
+    move_in_date: str
+    lease_duration: str
+    number_of_occupants: int
     has_pets: Optional[bool] = False
     pet_details: Optional[str] = None
-    
+
     # References (JSONB)
-    references: Optional[dict] = None
-    
+    references: dict
+
     # Documents (text array)
-    documents: Optional[list] = None
-    
+    documents: list
+
     # Emergency contact
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
+
+    # ── Phase 2 validation ─────────────────────────────────────────────
+    # Trust-critical fields are enforced server-side so incomplete
+    # applications are rejected at the API, not just in the UI.
+    EMPLOYMENT_STATUSES: ClassVar[set[str]] = {'employed', 'self-employed', 'student', 'retired', 'unemployed'}
+
+    @field_validator('employment_status')
+    @classmethod
+    def _validate_employment_status(cls, v: str) -> str:
+        if v not in cls.EMPLOYMENT_STATUSES:
+            raise ValueError(f'employment_status must be one of {sorted(cls.EMPLOYMENT_STATUSES)}')
+        return v
+
+    @field_validator('references')
+    @classmethod
+    def _validate_references(cls, v: dict) -> dict:
+        if not v or 'reference1' not in v:
+            raise ValueError('At least one reference (reference1) is required')
+        ref1 = v.get('reference1') or {}
+        if not ref1.get('name') or not ref1.get('phone'):
+            raise ValueError('reference1 must have name and phone')
+        return v
+
+    @field_validator('documents')
+    @classmethod
+    def _validate_documents(cls, v: list) -> list:
+        if not v or len(v) < 2:
+            raise ValueError('Government ID and proof of income documents are required')
+        return v
 
 
 class ApplicationApprove(BaseModel):

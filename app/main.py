@@ -145,20 +145,33 @@ async def log_requests(request: Request, call_next):
 # Validation error handler
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
+    # pydantic v2 embeds the raised exception object in each error's `ctx`
+    # (e.g. `ctx.error = ValueError(...)`), which is NOT JSON-serializable and
+    # would turn a clean 422 into a 500. Strip `ctx` and keep only the
+    # serializable fields the client needs.
+    def _clean(err):
+        return {
+            "type": err.get("type"),
+            "loc": list(err.get("loc", [])),
+            "msg": err.get("msg"),
+            "input": err.get("input"),
+        }
+
+    clean_errors = [_clean(e) for e in exc.errors()]
     logger.error(format_log(
         "validation_error",
         f"❌ Validation error on {request.method} {request.url}",
         method=request.method,
         url=str(request.url),
-        detail=str(exc.errors())
+        detail=str(clean_errors)
     ))
     return JSONResponse(
         status_code=422,
         content={
             "success": False,
             "error": "Validation error",
-            "detail": exc.errors(),
-            "errors": exc.errors()
+            "detail": clean_errors,
+            "errors": clean_errors
         }
     )
 
