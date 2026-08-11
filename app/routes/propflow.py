@@ -1625,8 +1625,10 @@ async def _generate_response_message(result: Dict[str, Any], user_type: str = "t
             price = _safe_amount(p.get("price"))
             price_str = f"₦{price:,.0f}/month" if price else "Price N/A"
             location = p.get("location", "")
-            beds = p.get("beds", "?")
-            lines.append(f"  {i+1}. {title} — {price_str} ({beds} bed, {location})")
+            beds = p.get("beds")
+            # Format beds: studios are 0 beds, show as "Studio"; otherwise show "N bed(s)"
+            bed_str = "Studio" if beds == 0 else (f"{beds} bed{'s' if beds and beds != 1 else ''}" if beds else "?")
+            lines.append(f"  {i+1}. {title} — {price_str} ({bed_str}, {location})")
         lines.append("Reply with the number you'd like, or tap one of the options above.")
         return "\n".join(lines)
     
@@ -1651,7 +1653,7 @@ async def _generate_response_message(result: Dict[str, Any], user_type: str = "t
         return "The landlord has approved your application! A lease agreement has been drafted and is ready for your review. Please sign to proceed with payment setup."
 
     elif stage == "enrich_and_qualify" or stage == "awaiting_landlord_approval":
-        return "Your application has been enriched with your profile details and sent to the landlord for review. You'll receive a notification once they make a decision."
+        return "Your application has been sent to the landlord for review. You'll receive a notification once they make a decision."
     
     elif stage == "nomba_provisioned":
         account_number = result.get("nomba_virtual_account_number")
