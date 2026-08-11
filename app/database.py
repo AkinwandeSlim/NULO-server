@@ -77,6 +77,15 @@ def _is_transient_db_error(e: Exception) -> bool:
         "remote end closed",
         "econnreset",
         "epipe",
+        # Stale pooled HTTP/2 keep-alive to Supabase/Cloudflare: the peer closes
+        # an idle connection, the next request on it dies with
+        # httpx.RemoteProtocolError <ConnectionTerminated ...>. Transient —
+        # retrying opens a fresh connection. Observed on disburse first-click.
+        "remote protocol error",
+        "connectionterminated",
+        "connection terminated",
+        "goaway",
+        "received goaway",
     )
     return any(m in msg for m in markers)
 
@@ -164,3 +173,22 @@ def get_supabase_admin() -> Client:
 # Global instances with connection pooling (via @lru_cache)
 supabase: Client = get_supabase_client()
 supabase_admin: Client = get_supabase_admin()
+
+
+def get_supabase_disburse() -> Client:
+    """Dedicated Supabase admin client for the disbursement path.
+
+    The global ``supabase_admin`` is shared by the landlord dashboard's ~15
+    parallel fetches. On Windows, hammering one shared httpx connection pool
+    from many threads raises WSAEWOULDBLOCK (WinError 10035 -> httpx.ReadError),
+    which surfaced as the disburse first-click 500 ("Request failed"). A
+    separate client has its OWN connection pool, so disbursement never collides
+    with that bursty traffic. No lru_cache: it's a module singleton.
+    """
+    service_key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_SERVICE_KEY
+    return create_optimized_client(settings.SUPABASE_URL, service_key)
+
+
+# Dedicated client for money-moving operations (disbursements) — isolated pool
+# so it never races the dashboard's shared-pool traffic on Windows.
+supabase_disburse: Client = get_supabase_disburse()

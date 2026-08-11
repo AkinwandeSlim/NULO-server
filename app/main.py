@@ -301,6 +301,18 @@ async def startup_event():
     except Exception as exc:
         logger.warning("[STARTUP] PropFlow checkpointer init skipped: %s", exc)
 
+    # Pre-compile the PropFlow graph so the first disburse / resume request
+    # doesn't pay a 20-30s cold-start (Mem0 + OSS + Qwen imports + graph
+    # compile). Without this, sync_after_release inside the disbursement
+    # endpoint lazily builds the whole graph on its first call, blocking the
+    # request and the event loop.
+    try:
+        from app.propflow.graph import get_propflow_graph
+        get_propflow_graph()
+        logger.info("[STARTUP] PropFlow graph pre-warmed")
+    except Exception as exc:
+        logger.warning("[STARTUP] PropFlow graph pre-warm skipped: %s", exc)
+
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -321,5 +333,8 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=settings.DEBUG,
         reload_includes=["*.py", "*.yaml", "*.yml"],
-        reload_excludes=["*.txt", "*.log", "*.tmp"],
+        # .mem0_store / sqlite are written constantly by Mem0 at runtime and
+        # must NEVER trigger a reload (which would cold-restart the graph and
+        # stall in-flight requests like disbursement).
+        reload_excludes=["*.txt", "*.log", "*.tmp", "*.sqlite3", "*.wal", "*.shm", ".mem0_store"],
     )

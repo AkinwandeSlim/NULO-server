@@ -61,3 +61,7 @@ docs/
 app/db_migrations/
 dev_tests/
 migrations/
+
+# Mem0 local vector store — runtime data, never commit. Relocated to
+# %LOCALAPPDATA%\Nulo\mem0 so uvicorn --reload doesn't watch it.
+.mem0_store/

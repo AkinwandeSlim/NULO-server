@@ -18,7 +18,7 @@ from functools import wraps
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from app.database import supabase_admin, run_db_sync, run_db_async
+from app.database import supabase_admin, supabase_disburse, run_db_sync, run_db_async
 from app.middleware.auth import get_current_user
 from app.services.nomba_client import NombaAPIError, nomba_client
 from app.services.nomba_helpers import (
@@ -278,6 +278,14 @@ async def disburse_to_landlord(
     """
     logger.info(f"[DISBURSE] Starting disbursement for agreement={agreement_id} caller={current_user.get('id')}")
 
+    # ── DEDICATED CLIENT (2026-08-11) ───────────────────────────────────────
+    # Use an ISOLATED Supabase client for the whole disbursement so it never
+    # contends with the landlord dashboard's ~15 parallel fetches on the shared
+    # pool. On Windows that contention surfaced as WSAEWOULDBLOCK
+    # (WinError 10035 -> httpx.ReadError) on the first click. Every
+    # `supabase_admin` reference below now resolves to this dedicated client.
+    supabase_admin = supabase_disburse
+
     source_transfer_id = (body.get("source_transfer_id") or "").strip()
     # Test-only override: allow disbursement of UNDERPAYMENT (or any) transfers.
     # Production must always pass FULL_PAYMENT; this flag is for hackathon tests
@@ -307,6 +315,7 @@ async def disburse_to_landlord(
             .eq("id", agreement_id)
             .maybe_single()
             .execute(),
+        max_retries=5, base_delay=0.5,  # WinError10035 contention resilience
     )
     transfer_task = run_db_async(
         lambda: supabase_admin
@@ -318,6 +327,7 @@ async def disburse_to_landlord(
             .limit(1)
             .maybe_single()
             .execute(),
+        max_retries=5, base_delay=0.5,  # WinError10035 contention resilience
     )
     agreement_result, transfer_result = await asyncio.gather(agreement_task, transfer_task)
 
@@ -373,6 +383,7 @@ async def disburse_to_landlord(
             .eq("source_transfer_id", actual_transfer_id)
             .in_("transaction_type", ["nomba_disbursement"])
             .execute(),
+        max_retries=5, base_delay=0.5,  # WinError10035 contention resilience
     )
     landlord_task = run_db_async(
         lambda: supabase_admin
@@ -381,6 +392,7 @@ async def disburse_to_landlord(
             .eq("id", agreement["landlord_id"])
             .maybe_single()
             .execute(),
+        max_retries=5, base_delay=0.5,  # WinError10035 contention resilience
     )
     existing_result, landlord_result = await asyncio.gather(existing_task, landlord_task)
 
@@ -877,13 +889,13 @@ async def disburse_to_landlord(
     )
 
     # 8b. PropFlow graph sync: mark the thread disbursement_complete so the
-    #     workflow reflects the finished release. Best-effort.
+    #     workflow reflects the finished release. Best-effort AND backgrounded:
+    #     the transactions row updated above is the source of truth, and the
+    #     checkpoint round-trips must not delay the release response (pre-warm
+    #     at startup keeps even the background sync fast). Runs after the
+    #     response is sent — same pattern as the landlord notification below.
     if tx_status == "released":
-        try:
-            from app.services.propflow_graph_sync import sync_after_release
-            await sync_after_release(agreement_id, supabase_admin)
-        except Exception as sync_err:
-            logger.warning(f"[DISBURSE] Graph release sync failed (non-fatal): {sync_err}")
+        background_tasks.add_task(_sync_propflow_graph_release, agreement_id)
 
     # 9. Background: notify landlord
     background_tasks.add_task(
@@ -964,6 +976,24 @@ async def get_disbursement_status(
 # ============================================================
 # Background notification helper
 # ============================================================
+
+async def _sync_propflow_graph_release(agreement_id: str):
+    """Background: sync the PropFlow thread to disbursement_complete.
+
+    Runs after the disburse response is sent. The transactions row is the
+    source of truth; this only keeps the chat thread stage consistent. The
+    graph is pre-warmed at startup, so this is a few fast checkpoint calls.
+    """
+    try:
+        from app.services.propflow_graph_sync import sync_after_release
+        from app.database import supabase_disburse as _admin
+        await sync_after_release(agreement_id, _admin)
+        logger.info(
+            "[DISBURSE] Graph release sync done (background) for %s", agreement_id
+        )
+    except Exception as sync_err:
+        logger.warning(f"[DISBURSE] Graph release sync failed (non-fatal): {sync_err}")
+
 
 async def _notify_landlord_payout(
     agreement_id: str,

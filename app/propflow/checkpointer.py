@@ -191,7 +191,7 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
                     f"{response.text[:200]}"
                 )
 
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
                 last_error = f"Network error on {method} {table}: {exc}"
 
             # Exponential backoff before retry
