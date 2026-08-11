@@ -17,11 +17,11 @@ import logging
 import re
 import traceback
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, ClassVar
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.middleware.auth import get_current_user
 from app.database import get_supabase_admin
@@ -49,6 +49,13 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="User's rental inquiry message")
     use_memory: bool = Field(default=True, description="Whether to use persistent memory")
     mock_mode: bool = Field(default=False, description="Use mock responses (testing)")
+    # Optional — pass the current thread's workflow_id on FOLLOW-UP messages so
+    # the server loads the prior conversation transcript and resolves the new
+    # message in context (e.g. "within 500k-600k" adjusts the earlier budget).
+    workflow_id: Optional[str] = Field(
+        default=None,
+        description="Prior search thread to continue conversationally",
+    )
 
 class ChatResponse(BaseModel):
     """PropFlow chat response."""
@@ -109,6 +116,89 @@ class SelectResponse(BaseModel):
     error_message: Optional[str] = None
 
 
+class CompleteApplicationRequest(BaseModel):
+    """
+    Trust Passport payload — the tenant's documents, references and consent,
+    collected on the in-chat card BEFORE the application is created.
+
+    Mirrors the Phase-2 ApplicationCreate validation so a submitted application
+    means the same thing everywhere: ID + income proof + one reference + consent.
+    """
+    documents: list[str] = Field(..., description="Storage paths (≥2: identity + income evidence)")
+    references: dict = Field(..., description="{reference1: {name, phone, relationship}, ...}")
+    consent: bool = Field(..., description="Tenant authorises sharing details with this property's landlord")
+    # Employment / emergency fields (optional — profile + intent fill gaps)
+    employment_status: Optional[str] = None
+    employer_name: Optional[str] = None
+    job_title: Optional[str] = None
+    employment_duration: Optional[str] = None
+    monthly_income: Optional[int] = None
+    emergency_contact_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
+    # Tenant contact number — collected on the card because Google OAuth users
+    # sign up with only name + email (no phone). We persist it to users.phone_number
+    # so the landlord always has a reachable number. Basic sanity check only;
+    # full validation (e.g. SMS OTP) is a later version.
+    phone_number: Optional[str] = None
+    move_in_date: Optional[str] = None
+    lease_duration: Optional[str] = None
+    number_of_occupants: Optional[int] = None
+    has_pets: Optional[bool] = None
+    pet_details: Optional[str] = None
+    message: Optional[str] = None
+
+    EMPLOYMENT_STATUSES: ClassVar[set[str]] = {'employed', 'self-employed', 'student', 'retired', 'unemployed'}
+
+    @field_validator('documents')
+    @classmethod
+    def _validate_documents(cls, v: list) -> list:
+        if not v or len(v) < 2:
+            raise ValueError('Identity and proof-of-income documents are required (at least 2)')
+        return v
+
+    @field_validator('references')
+    @classmethod
+    def _validate_references(cls, v: dict) -> dict:
+        if not v or 'reference1' not in v:
+            raise ValueError('At least one reference (reference1) is required')
+        ref1 = v.get('reference1') or {}
+        if not ref1.get('name') or not ref1.get('phone'):
+            raise ValueError('reference1 must have name and phone')
+        return v
+
+    @field_validator('consent')
+    @classmethod
+    def _validate_consent(cls, v: bool) -> bool:
+        if not v:
+            raise ValueError('Tenant consent is required to share details with the landlord')
+        return v
+
+    @field_validator('employment_status')
+    @classmethod
+    def _validate_employment_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in cls.EMPLOYMENT_STATUSES:
+            raise ValueError(f'employment_status must be one of {sorted(cls.EMPLOYMENT_STATUSES)}')
+        return v
+
+    @field_validator('number_of_occupants')
+    @classmethod
+    def _validate_occupants(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError('number_of_occupants must be at least 1')
+        return v
+
+    @field_validator('phone_number')
+    @classmethod
+    def _validate_phone_number(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        digits = re.sub(r'\D', '', v)
+        if len(digits) < 7 or len(digits) > 15:
+            raise ValueError('phone_number must be a valid phone number (7–15 digits)')
+        return v
+
+
 class ThreadInfoResponse(BaseModel):
     """Summary info for a PropFlow thread in multi-tenant listing."""
     thread_id: str
@@ -134,6 +224,48 @@ class ThreadListResponse(BaseModel):
 # ROUTE HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _load_conversation_history(
+    graph, workflow_id: str, expected_tenant_id: str
+) -> list:
+    """
+    Load a prior search thread's conversation transcript for a follow-up.
+
+    Returns the stored conversation_history (or [] when the thread is unknown,
+    so a stale client thread simply starts fresh). Verifies the thread belongs
+    to the caller and NEVER returns another account's conversation.
+
+    Args:
+        graph: the compiled PropFlow graph (for its checkpointer).
+        workflow_id: the thread to continue, or "" for a brand-new chat.
+        expected_tenant_id: the caller's tenant id; "" disables the check
+                            (guest threads share a sentinel tenant).
+    """
+    if not workflow_id:
+        return []
+    try:
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+        saved = await graph.checkpointer.aget_tuple(thread_config)
+        if not saved:
+            logger.info(
+                f"[PROPFLOW] Follow-up referenced unknown thread "
+                f"{workflow_id[:16]}... — starting fresh"
+            )
+            return []
+        prev = saved.checkpoint.get("channel_values", {})
+        owner = str(prev.get("tenant_id", "") or "")
+        if owner and expected_tenant_id and owner != expected_tenant_id:
+            logger.warning(
+                f"[PROPFLOW] Cross-tenant follow-up blocked: "
+                f"caller={expected_tenant_id[:8]}... "
+                f"thread_owner={owner[:8]}..."
+            )
+            return []  # never leak another account's transcript
+        return list(prev.get("conversation_history") or [])
+    except Exception as exc:
+        logger.warning(f"[PROPFLOW] Failed to load conversation history: {exc}")
+        return []
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def start_propflow_chat(
     request: ChatRequest,
@@ -157,6 +289,19 @@ async def start_propflow_chat(
                 detail="PropFlow is only available to tenants"
             )
 
+        graph = propflow_graph()
+
+        # ── Conversational follow-up ──────────────────────────────────────────
+        # On follow-ups the client passes the current workflow_id. Load that
+        # thread's transcript so Qwen can resolve the new message in context
+        # (e.g. "within 500k-600k" adjusts the earlier 4-bed/Ajah budget).
+        conversation_history = await _load_conversation_history(
+            graph, request.workflow_id or "", current_user["id"]
+        )
+        conversation_history = (
+            conversation_history + [{"role": "user", "text": request.message}]
+        )[-20:]  # keep the last ~10 exchanges; transcript must never grow unbounded
+
         # Create initial PropFlow state
         workflow_id = f"propflow-{uuid.uuid4().hex[:12]}"
 
@@ -166,6 +311,7 @@ async def start_propflow_chat(
             raw_inquiry_text=request.message,  # ✅ Correct field name
             current_stage="intent_extraction",
             error_log=[],
+            conversation_history=conversation_history,
             # Initialize all optional fields as None
             extracted_intent=None,
             extraction_confidence=None,
@@ -188,7 +334,27 @@ async def start_propflow_chat(
             disbursement_amount=None,
             platform_fee=None,
             rejection_reason=None,
-            landlord_id=None
+            landlord_id=None,
+            trust_documents=None,
+            trust_references=None,
+            trust_consent=None,
+            trust_profile_completion=None,
+            trust_employment_status=None,
+            trust_employer_name=None,
+            trust_job_title=None,
+            trust_employment_duration=None,
+            trust_monthly_income=None,
+            trust_emergency_contact_name=None,
+            trust_emergency_contact_phone=None,
+            trust_phone_number=None,
+            trust_move_in_date=None,
+            trust_lease_duration=None,
+            trust_number_of_occupants=None,
+            trust_has_pets=None,
+            trust_pet_details=None,
+            trust_message=None,
+            document_verification_status=None,
+            reference_verification_status=None,
         )
         
         print(f"[PROPFLOW] Starting workflow {workflow_id} for user {current_user['id']}")
@@ -199,13 +365,26 @@ async def start_propflow_chat(
             print("[PROPFLOW] Running in MOCK MODE")
             
         config = {"configurable": {"thread_id": workflow_id}}
-        result = await propflow_graph().ainvoke(initial_state, config=config)
-        
+        result = await graph.ainvoke(initial_state, config=config)
+
         print(f"[PROPFLOW] Workflow completed: {result['current_stage']}")
-        
+
         # Generate response message based on current stage
         response_message = await _generate_response_message(result)
-        
+
+        # Persist the assistant's reply so the NEXT follow-up has full context.
+        # Best-effort — if this fails, the user turn is still in the transcript.
+        try:
+            graph.update_state(
+                {"configurable": {"thread_id": workflow_id}},
+                {
+                    "conversation_history": conversation_history
+                    + [{"role": "agent", "text": response_message}],
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"[PROPFLOW] Failed to persist conversation history: {exc}")
+
         return ChatResponse(
             success=True,
             workflow_id=workflow_id,
@@ -243,6 +422,18 @@ async def guest_search(request: ChatRequest):
     production exposure.
     """
     try:
+        graph = propflow_graph()
+
+        # Guests get the same conversational follow-up support: load the prior
+        # guest thread's transcript so a refinement resolves in context.
+        # No ownership check needed — guest threads share the sentinel tenant.
+        conversation_history = await _load_conversation_history(
+            graph, request.workflow_id or "", ""
+        )
+        conversation_history = (
+            conversation_history + [{"role": "user", "text": request.message}]
+        )[-20:]
+
         workflow_id = f"propflow-guest-{uuid.uuid4().hex[:12]}"
 
         initial_state = PropFlowState(
@@ -251,6 +442,7 @@ async def guest_search(request: ChatRequest):
             raw_inquiry_text=request.message,
             current_stage="intent_extraction",
             error_log=[],
+            conversation_history=conversation_history,
             extracted_intent=None,
             extraction_confidence=None,
             property_matches=None,
@@ -273,12 +465,44 @@ async def guest_search(request: ChatRequest):
             platform_fee=None,
             rejection_reason=None,
             landlord_id=None,
+            trust_documents=None,
+            trust_references=None,
+            trust_consent=None,
+            trust_profile_completion=None,
+            trust_employment_status=None,
+            trust_employer_name=None,
+            trust_job_title=None,
+            trust_employment_duration=None,
+            trust_monthly_income=None,
+            trust_emergency_contact_name=None,
+            trust_emergency_contact_phone=None,
+            trust_phone_number=None,
+            trust_move_in_date=None,
+            trust_lease_duration=None,
+            trust_number_of_occupants=None,
+            trust_has_pets=None,
+            trust_pet_details=None,
+            trust_message=None,
+            document_verification_status=None,
+            reference_verification_status=None,
         )
 
         config = {"configurable": {"thread_id": workflow_id}}
-        result = await propflow_graph().ainvoke(initial_state, config=config)
+        result = await graph.ainvoke(initial_state, config=config)
 
         response_message = await _generate_response_message(result)
+
+        # Persist the assistant's reply so the next guest follow-up has context.
+        try:
+            graph.update_state(
+                {"configurable": {"thread_id": workflow_id}},
+                {
+                    "conversation_history": conversation_history
+                    + [{"role": "agent", "text": response_message}],
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"[PROPFLOW] Failed to persist guest conversation history: {exc}")
 
         return ChatResponse(
             success=True,
@@ -311,13 +535,17 @@ async def select_property(
 ):
     """
     Tenant selects a property from the matched results list.
-    Resumes the workflow after INTERRUPT #1.
+
+    Records the selection on the paused state but does NOT resume the graph:
+    the workflow now waits at the Trust Passport gate (awaiting_trust_profile).
+    The application is only created once the tenant completes the trust checks
+    via POST /complete-application/{workflow_id}.
 
     Steps:
       1. Retrieve the paused graph state from the checkpointer
       2. Get the property_matches list from the state
       3. Update state with the selected property's ID + landlord_id
-      4. Resume the graph -> continues to create_application
+         and advance to awaiting_trust_profile (do not resume yet)
     """
     try:
         graph = propflow_graph()
@@ -356,17 +584,153 @@ async def select_property(
         selected_id = uuid.UUID(selected["id"])
         landlord_id = uuid.UUID(selected["landlord_id"]) if selected.get("landlord_id") else None
 
-        # Step 3: Inject selection into the paused state
+        # Step 3: Inject selection into the paused state — pause at the Trust
+        # Passport gate instead of resuming to create_application.
         graph.update_state(
             thread_config,
             {
                 "selected_property_id": selected_id,
                 "landlord_id": landlord_id,
+                "current_stage": "awaiting_trust_profile",
+            },
+        )
+
+        beds = selected.get("beds", "?")
+        ptype = selected.get("property_type") or "property"
+        # Honest message — we only claim what this user actually has. Google OAuth
+        # tenants arrive with name + email only (no phone, no employment details),
+        # so never claim them. Employment is never known at select time either.
+        has_phone = bool(current_user.get("phone_number"))
+        greeting = f"Great choice! You're almost ready to apply for this {beds}-bed {ptype}."
+        if has_phone:
+            response_message = (
+                f"{greeting} We already have your name and phone. "
+                f"Complete the trust checks below to submit."
+            )
+        else:
+            response_message = (
+                f"{greeting} We have your name — you'll add your phone number "
+                f"and complete the trust checks below to submit."
+            )
+
+        return SelectResponse(
+            success=True,
+            workflow_id=workflow_id,
+            current_stage="awaiting_trust_profile",
+            response_message=response_message,
+            application_id=None,
+        )
+
+    except Exception as e:
+        print(f"[ERROR] [PROPFLOW] Select failed: {e}")
+        return SelectResponse(
+            success=False,
+            workflow_id=workflow_id,
+            current_stage="error",
+            response_message="Failed to process your property selection. Please try again.",
+            error_message=str(e),
+        )
+
+
+@router.post("/complete-application/{workflow_id}", response_model=SelectResponse)
+async def complete_application(
+    workflow_id: str,
+    request: CompleteApplicationRequest,
+    current_user = Depends(get_current_user),
+):
+    """
+    Trust Passport gate — tenant submits documents, references and consent
+    collected on the in-chat card, then the workflow resumes and the
+    application is created WITH the trust data attached.
+
+    Steps:
+      1. Verify the workflow is paused at awaiting_trust_profile
+      2. Inject the trust fields into the paused state
+      3. Resume the graph -> create_application (reads trust fields from state)
+         -> enrich_and_qualify -> pauses at INTERRUPT #2 (landlord approval)
+    """
+    try:
+        graph = propflow_graph()
+        thread_config = {"configurable": {"thread_id": workflow_id}}
+
+        # Step 1: Load the paused state from the checkpointer
+        saved = await graph.checkpointer.aget_tuple(thread_config)
+        if not saved:
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="expired",
+                response_message="Workflow not found. Please start a new search.",
+                error_message="No checkpoint found for this thread_id",
+            )
+
+        channel_values = saved.checkpoint.get("channel_values", {})
+        if channel_values.get("current_stage") != "awaiting_trust_profile":
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="error",
+                response_message="This workflow is not waiting for trust details.",
+                error_message=(
+                    f"Expected current_stage 'awaiting_trust_profile', got "
+                    f"'{channel_values.get('current_stage')}'"
+                ),
+            )
+
+        # Role check: only the workflow's tenant may complete their own trust
+        # passport (mirrors the resume endpoint's gate verification).
+        workflow_tenant_id = str(channel_values.get("tenant_id", ""))
+        if current_user.get("user_type") != "tenant" or current_user["id"] != workflow_tenant_id:
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="error",
+                response_message="Only the tenant who started this application can submit their trust details.",
+                error_message=(
+                    f"Role verification failed at trust gate: "
+                    f"caller={current_user['id']} ({current_user.get('user_type')}) "
+                    f"≠ workflow_tenant={workflow_tenant_id}"
+                ),
+            )
+
+        # Step 2: Inject the trust fields into the paused state
+        doc_status = {p: "provided" for p in request.documents}
+        ref_status = {k: "provided" for k in request.references.keys()}
+
+        graph.update_state(
+            thread_config,
+            {
+                "trust_documents": request.documents,
+                "trust_references": request.references,
+                "trust_consent": request.consent,
+                "trust_profile_completion": True,
+                "trust_employment_status": request.employment_status,
+                "trust_employer_name": request.employer_name,
+                "trust_job_title": request.job_title,
+                "trust_employment_duration": request.employment_duration,
+                "trust_monthly_income": request.monthly_income,
+                "trust_emergency_contact_name": request.emergency_contact_name,
+                "trust_emergency_contact_phone": request.emergency_contact_phone,
+                "trust_phone_number": request.phone_number,
+                "trust_move_in_date": request.move_in_date,
+                "trust_lease_duration": request.lease_duration,
+                "trust_number_of_occupants": request.number_of_occupants,
+                "trust_has_pets": request.has_pets,
+                "trust_pet_details": request.pet_details,
+                "trust_message": request.message,
+                "document_verification_status": doc_status,
+                "reference_verification_status": ref_status,
                 "current_stage": "property_selected",
             },
         )
 
-        # Step 4: Resume the graph -> proceeds to create_application
+        logger.info(
+            f"[PROPFLOW][TRUST] workflow={workflow_id} docs={len(request.documents)} "
+            f"refs={len(request.references)} consent={request.consent}"
+        )
+
+        # Step 3: Resume the graph -> create_application + enrich_and_qualify,
+        # pauses at INTERRUPT #2 (landlord approval).
         result = await graph.ainvoke(None, config=thread_config)
 
         response_message = await _generate_response_message(result)
@@ -380,12 +744,12 @@ async def select_property(
         )
 
     except Exception as e:
-        print(f"[ERROR] [PROPFLOW] Select failed: {e}")
+        print(f"[ERROR] [PROPFLOW] Complete-application failed: {e}")
         return SelectResponse(
             success=False,
             workflow_id=workflow_id,
             current_stage="error",
-            response_message="Failed to process your property selection. Please try again.",
+            response_message="Failed to submit your application. Please try again.",
             error_message=str(e),
         )
 
@@ -630,6 +994,7 @@ async def resume_propflow_workflow(
             stage_hints = {
                 "intent_extraction": "still processing the tenant's search request",
                 "awaiting_tenant_selection": "waiting for the tenant to select a property",
+                "awaiting_trust_profile": "waiting for the tenant to complete the trust checks before the application is submitted",
                 "property_selected": "processing property selection",
                 "application_created": "preparing the landlord briefing",
                 "enrich_and_qualify": "generating the AI briefing for the landlord",
@@ -1268,6 +1633,13 @@ async def _generate_response_message(result: Dict[str, Any], user_type: str = "t
         else:
             return "I couldn't find any properties matching your criteria. Would you like to adjust your requirements or budget?"
     
+    elif stage == "awaiting_trust_profile":
+        return (
+            "You're almost ready to apply! Complete the checks below (contact, "
+            "identity, income evidence, reference, employment and move-in "
+            "details), then review and submit your application."
+        )
+
     elif stage == "application_created":
         return "Perfect! I've submitted your application to the landlord. They'll review your profile and get back to you soon."
 

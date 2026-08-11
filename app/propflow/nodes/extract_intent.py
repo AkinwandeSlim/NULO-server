@@ -23,6 +23,8 @@ Confidence gate:
 
 import logging
 from datetime import datetime
+import asyncio
+import time
 
 from app.propflow.state import PropFlowState
 from app.propflow.config import propflow_settings
@@ -30,6 +32,57 @@ from app.propflow.services.qwen_client import qwen_client
 from app.propflow.services.mem0_client import mem0_service
 
 logger = logging.getLogger(__name__)
+
+
+def _fallback_extract_intent(text: str) -> dict:
+    """
+    Fast fallback intent extraction when Qwen is too slow (network issues).
+    Uses regex to extract: location, bedrooms, budget.
+    Confidence is 0.5 (low) to signal this is a fallback, not full extraction.
+    """
+    import re
+    intent = {
+        "property_type": None,
+        "location": None,
+        "bedrooms": None,
+        "budget_monthly": None,
+        "budget_annual": None,
+        "move_in_date": None,
+        "payment_frequency": None,
+        "special_requests": [],
+        "confidence": 0.5,  # Low confidence — fallback only
+    }
+
+    text_lower = text.lower()
+
+    # Extract location: "in Lekki", "at Ajah", "VI", "Lagos"
+    loc_match = re.search(r'(?:in|at|around)\s+([A-Za-z\s]+?)(?:\s+(?:for|with|budget|with|have)|\s*$)', text, re.I)
+    if loc_match:
+        intent["location"] = loc_match.group(1).strip()
+
+    # Extract bedrooms: "2-bed", "2 bedroom", "3bed"
+    bed_match = re.search(r'(\d+)\s*(?:bed|bedroom|br)', text, re.I)
+    if bed_match:
+        intent["bedrooms"] = int(bed_match.group(1))
+
+    # Extract budget: "500k", "500,000", "1m"
+    budget_match = re.search(r'(\d+(?:[,.]?\d+)?)\s*([km]?)', text, re.I)
+    if budget_match:
+        amount_str = budget_match.group(1).replace(',', '')
+        multiplier = budget_match.group(2).lower()
+        try:
+            amount = float(amount_str)
+            if multiplier == 'k':
+                amount *= 1000
+            elif multiplier == 'm':
+                amount *= 1_000_000
+            intent["budget_monthly"] = amount
+        except (ValueError, TypeError):
+            pass
+
+    logger.info(f"[extract_intent] Fallback extraction: {intent}")
+    return intent
+
 
 
 async def extract_intent_node(state: PropFlowState) -> PropFlowState:
@@ -75,10 +128,33 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
         logger.info("[extract_intent] First-time tenant -- no prior memories")
 
     # ── Step 2: Qwen intent extraction ───────────────────────────────────────
-    extracted_intent = await qwen_client.extract_intent(
-        text=raw_text,
-        prior_memories=prior_memories,
-    )
+    # Pass this thread's transcript so a follow-up message resolves against what
+    # the tenant asked earlier (conversational refinement, e.g. budget/area).
+    # The last history entry is the CURRENT message (raw_inquiry_text) — strip it
+    # so Qwen only sees prior turns and the live message as the "latest".
+    history = list(state.get("conversation_history") or [])
+    if history and history[-1].get("role") == "user":
+        history = history[:-1]
+
+    logger.info(f"[extract_intent] Starting Qwen intent extraction...")
+    start_qwen = time.time()
+    try:
+        extracted_intent = await asyncio.wait_for(
+            qwen_client.extract_intent(
+                text=raw_text,
+                prior_memories=prior_memories,
+                conversation_history=history or None,
+            ),
+            timeout=45.0  # Timeout after 45s to leave room for rest of graph
+        )
+        elapsed_qwen = time.time() - start_qwen
+        logger.info(f"[extract_intent] Qwen extraction completed in {elapsed_qwen:.1f}s")
+    except asyncio.TimeoutError:
+        elapsed_qwen = time.time() - start_qwen
+        logger.error(f"[extract_intent] Qwen extraction timed out after {elapsed_qwen:.1f}s — using fallback")
+        # Fallback: use regex-based intent extraction if Qwen is too slow
+        extracted_intent = _fallback_extract_intent(raw_text)
+
     confidence = float(extracted_intent.get("confidence", 0.0))
 
     # ── Step 3: Confidence gate ───────────────────────────────────────────────

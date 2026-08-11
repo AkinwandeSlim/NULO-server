@@ -164,6 +164,16 @@ class NotificationService:
     # VIEWING NOTIFICATIONS
     # =========================================================================
 
+    async def notify_viewing_status_update(self, *, viewing_id: str, tenant_id: str, tenant_email: Optional[str], tenant_phone: Optional[str], property_title: str, title: str, message: str) -> None:
+        """Lifecycle update for a viewing. Keeps the app as the source of truth."""
+        link = f"/tenant/viewings?request={viewing_id}"
+        create_notification(user_id=tenant_id, notif_type="visit", title=title, message=message, link=link, data={"viewing_id": viewing_id})
+        if tenant_phone:
+            await _run(sms_service.send_sms, tenant_phone, f"Nulo: {message}")
+        if tenant_email:
+            html = f"<p>{message}</p><p><a href='{self.base_url}{link}'>View appointment</a></p>"
+            await _run(email_service._send_email, tenant_email, f"Nulo: {title}", html)
+
     async def notify_viewing_created(
         self,
         *,
@@ -261,7 +271,7 @@ class NotificationService:
                 f"{tenant_name} wants to view {property_title} on {date} at {time_slot}. "
                 f"Tap to accept or decline."
             ),
-            link=f"/landlord/viewings/{viewing_id}",
+            link=f"/landlord/viewings?request={viewing_id}",
             data={"viewing_id": viewing_id, "tenant_name": tenant_name,
                   "date": date, "time": time_slot},
         )
@@ -355,7 +365,7 @@ class NotificationService:
                 f"{tenant_name} has a confirmed viewing for {property_title} "
                 f"on {date} at {time_slot}."
             ),
-            link=f"/landlord/viewings/{viewing_id}",
+            link=f"/landlord/viewings?request={viewing_id}",
             data={"viewing_id": viewing_id, "tenant_name": tenant_name,
                   "date": date, "time": time_slot},
         )
@@ -448,7 +458,7 @@ class NotificationService:
                 f"{tenant_name} is interested in {property_title}. "
                 f"Review their profile and respond."
             ),
-            link=f"/landlord/viewings/{viewing_id}",
+            link=f"/landlord/viewings?request={viewing_id}",
             data={"viewing_id": viewing_id, "tenant_name": tenant_name},
         )
 

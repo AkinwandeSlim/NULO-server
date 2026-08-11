@@ -121,6 +121,11 @@ def _patch_services():
               new_callable=AsyncMock,
               return_value={"id": str(uuid.uuid4()), "status": "submitted",
                             "propflow_thread_id": "test-thread"}),
+        # Landlord notification runs as a fire-and-forget background task after
+        # the submit response — mock it so tests are deterministic and no real
+        # email/SMS/Supabase calls leak past the test event loop.
+        patch("app.propflow.nodes.enrich_qualify.NotificationService.notify_application_submitted",
+              new_callable=AsyncMock, return_value=None),
         # Agreement creation node: mock internal Supabase helper fetches
         patch("app.propflow.nodes.create_agreement._fetch_property",
               new_callable=AsyncMock,
@@ -172,6 +177,17 @@ async def test_graph_has_four_interrupts():
     assert graph is not None
     assert hasattr(graph, "ainvoke")
     assert len(graph.nodes) >= 7  # extract_intent through disburse_landlord
+
+
+def test_match_properties_selects_viewing_support_fields():
+    """
+    Matched properties must carry virtual_tour_url / video_tour_url so the
+    PropFlow chat can offer Virtual tour / Live video viewings ONLY when the
+    property actually supports them (never guessed by the model).
+    """
+    from app.propflow.nodes.match_properties import _SELECT_COLS
+    assert "virtual_tour_url" in _SELECT_COLS
+    assert "video_tour_url" in _SELECT_COLS
 
 
 # ---------------------------------------------------------------------------

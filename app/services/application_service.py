@@ -60,6 +60,13 @@ class ApplicationService:
         documents: Optional[list] = None,
         emergency_contact_name: Optional[str] = "",
         emergency_contact_phone: Optional[str] = "",
+        # Tenant contact number (PropFlow Trust Passport). Google OAuth tenants
+        # have no phone on their profile, so the card collects it and we save it
+        # to users.phone_number — the field the landlord page and notifications read.
+        phone_number: Optional[str] = None,
+        # Trust Passport — tenant consent to share details with this landlord.
+        # Persisted for the audit trail (column added by migration 020).
+        consent_captured: Optional[bool] = False,
         # Fields from PropFlow extracted_intent (used by PropFlow)
         intent: Optional[Dict[str, Any]] = None,
         tenant_profile: Optional[Dict[str, Any]] = None,
@@ -106,31 +113,31 @@ class ApplicationService:
             intent = intent or {}
             tenant_profile = tenant_profile or {}
 
-            # Lease preferences from extracted_intent
+            # ── Trust Passport v1.1: never fabricate ─────────────────────────
+            # Only carry over values that are REAL: explicitly chosen on the
+            # Trust Passport card, genuinely extracted from the conversation,
+            # or already saved in the tenant's profile. In particular:
+            #   • lease_duration is never defaulted (no invented "12 months")
+            #   • employment_status is never defaulted (no invented "employed")
+            #   • monthly_income NEVER falls back to the search budget — budget
+            #     is what the tenant wants to pay, not what they earn.
+            #   • no auto-authored "Message to Landlord" — only a real typed
+            #     message is stored.
             if not move_in_date and intent.get("move_in_date"):
                 move_in_date = intent["move_in_date"]
-            if not lease_duration:
-                lease_duration = str(int(intent.get("lease_duration_months") or 12))
+            if not lease_duration and intent.get("lease_duration_months"):
+                lease_duration = str(int(intent["lease_duration_months"]))
             if not employment_status:
-                employment_status = tenant_profile.get("employment_status") or "employed"
+                employment_status = tenant_profile.get("employment_status")
             if not employer_name:
                 employer_name = tenant_profile.get("company_name") or ""
             if not monthly_income:
-                monthly_income = (
-                    _parse_income_range(tenant_profile.get("monthly_income_range"))
-                    or intent.get("budget_monthly")
-                    or 0
+                # Income only from a real source: the tenant's saved profile
+                # range (previously self-reported). Never from the search budget.
+                monthly_income = _parse_income_range(
+                    tenant_profile.get("monthly_income_range")
                 )
-            if not number_of_occupants:
-                number_of_occupants = 1
-            if not message:
-                message = (
-                    f"Application submitted via PropFlow. "
-                    f"Tenant is looking for a "
-                    f"{intent.get('bedrooms', '?')}-bedroom "
-                    f"{intent.get('property_type', 'property')} "
-                    f"in {intent.get('location', 'the area')}."
-                ) if intent else "Application submitted via PropFlow."
+            # number_of_occupants: store only what the tenant chose.
 
         # ── Build insert dict ──────────────────────────────────────────────────
         app_dict = {
@@ -140,13 +147,16 @@ class ApplicationService:
             "status": "submitted",
             "message": message or "",
             "move_in_date": move_in_date,
-            "lease_duration": lease_duration or "12",
-            "employment_status": employment_status or "employed",
+            # NULL (not a fabricated default) when the tenant chose nothing —
+            # the landlord page hides these, and the DB CHECK constraint on
+            # employment_status rejects empty strings, so we store None.
+            "lease_duration": lease_duration or None,
+            "employment_status": employment_status or None,
             "employer_name": employer_name or "",
             "job_title": job_title or "",
             "employment_duration": employment_duration or "",
             "monthly_income": monthly_income or 0,
-            "number_of_occupants": number_of_occupants or 1,
+            "number_of_occupants": number_of_occupants,
             "dependents": dependents or 0,
             "has_pets": has_pets or False,
             "pet_details": pet_details or "",
@@ -156,6 +166,12 @@ class ApplicationService:
             "emergency_contact_phone": emergency_contact_phone or "",
             "viewed_by_landlord": False,
         }
+
+        # Consent is only persisted when explicitly captured (PropFlow Trust
+        # Passport). Manual submissions leave it NULL so inserts don't fail if
+        # migration 020 hasn't been applied yet.
+        if consent_captured:
+            app_dict["consent_captured"] = True
 
         # Store PropFlow workflow ID for context-aware resume capability
         if propflow_workflow_id:
@@ -188,6 +204,24 @@ class ApplicationService:
             )
         except Exception as exc:
             logger.debug(f"[APP SERVICE] increment_application_count skipped: {exc}")
+
+        # ── Persist tenant contact number (best-effort) ────────────────────────
+        # The applications table has no phone column — phone lives on users, which
+        # is what the landlord page joins for. Only write when the tenant actually
+        # provided one on the card; never overwrite a real number with empty.
+        if phone_number:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: supabase_admin
+                        .table("users")
+                        .update({"phone_number": phone_number})
+                        .eq("id", tenant_id)
+                        .execute(),
+                )
+                logger.info(f"[APP SERVICE] Updated users.phone_number for tenant {tenant_id[:8]}...")
+            except Exception as exc:
+                logger.warning(f"[APP SERVICE] users.phone_number update failed (non-fatal): {exc}")
 
         return application
 

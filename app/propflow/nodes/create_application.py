@@ -57,6 +57,17 @@ async def create_application_node(state: PropFlowState) -> PropFlowState:
     # ── Step 1: Fetch tenant profile for employment / income ─────────────────
     tenant_profile = await _fetch_tenant_profile(tenant_id)
 
+    # ── Step 1b: Trust Passport fields (explicit, win over profile/intent) ──
+    trust_documents = state.get("trust_documents")
+    trust_refs      = state.get("trust_references")
+    trust_consent   = state.get("trust_consent")
+
+    if trust_documents or trust_refs:
+        logger.info(
+            f"[TRUST] workflow={workflow_id} attaching docs={len(trust_documents or [])} "
+            f"refs={len(trust_refs or {})} consent={bool(trust_consent)}"
+        )
+
     # ── Step 2: Delegate to shared service ────────────────────────────────────
     application = await application_service.submit_application(
         tenant_id=tenant_id,
@@ -64,6 +75,25 @@ async def create_application_node(state: PropFlowState) -> PropFlowState:
         # PropFlow-specific fields from intent + profile
         intent=intent,
         tenant_profile=tenant_profile,
+        # Trust Passport — explicit tenant-provided data (the service only fills
+        # from intent/profile when these args are falsy, so explicit wins).
+        documents=trust_documents,
+        references=trust_refs,
+        consent_captured=bool(trust_consent),
+        employment_status=state.get("trust_employment_status"),
+        employer_name=state.get("trust_employer_name"),
+        job_title=state.get("trust_job_title"),
+        employment_duration=state.get("trust_employment_duration"),
+        monthly_income=state.get("trust_monthly_income"),
+        emergency_contact_name=state.get("trust_emergency_contact_name"),
+        emergency_contact_phone=state.get("trust_emergency_contact_phone"),
+        phone_number=state.get("trust_phone_number"),
+        move_in_date=state.get("trust_move_in_date") or state.get("extracted_intent", {}).get("move_in_date"),
+        lease_duration=state.get("trust_lease_duration"),
+        number_of_occupants=state.get("trust_number_of_occupants"),
+        has_pets=state.get("trust_has_pets"),
+        pet_details=state.get("trust_pet_details"),
+        message=state.get("trust_message"),
         # Context awareness — stored as propflow_thread_id in the application row
         propflow_workflow_id=workflow_id,
     )

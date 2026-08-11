@@ -211,13 +211,17 @@ class QwenClient:
         self,
         text: str,
         prior_memories: Optional[list] = None,
+        conversation_history: Optional[list] = None,
     ) -> dict[str, Any]:
         """
         Convert a raw tenant inquiry into structured property requirements.
 
         Args:
-            text:           Raw tenant message (Pidgin, broken English, formal)
-            prior_memories: Mem0 memories from previous sessions (may refine extraction)
+            text:                Raw tenant message (Pidgin, broken English, formal)
+            prior_memories:      Mem0 memories from previous sessions (may refine extraction)
+            conversation_history: Prior user/agent turns from THIS conversation, so a
+                                  follow-up like "within 500k-600k" or "okay 3-bed"
+                                  resolves against what the tenant said earlier.
 
         Returns:
             Structured dict with property_type, location, bedrooms, budget, etc.
@@ -235,6 +239,28 @@ class QwenClient:
             user_message = (
                 f"Context from this tenant's history:\n{memory_block}\n\n"
                 f"Tenant message: {text}"
+            )
+
+        # Conversational follow-up: prepend the real transcript so the latest
+        # message can refer back to earlier ones. We only ever feed REAL turns
+        # (no fabrication) and instruct carry-over + no-inventing explicitly.
+        if conversation_history:
+            transcript = "\n".join(
+                f"{'Tenant' if t.get('role') == 'user' else 'Assistant'}: "
+                f"{t.get('text', '')}"
+                for t in conversation_history
+            )
+            user_message = (
+                f"Previous conversation in this session:\n{transcript}\n\n"
+                f"Latest tenant message: {text}\n\n"
+                "The latest message may refer to the earlier conversation "
+                "(e.g. 'within 500k to 600k' adjusts the earlier budget; "
+                "'okay 3-bed' changes the bedrooms). Resolve it into ONE "
+                "complete requirement set: carry over any requirement from "
+                "earlier messages that the latest message does not override. "
+                "Never invent a requirement the tenant did not state. If the "
+                "tenant gives a budget RANGE, set budget_monthly to the "
+                "MAXIMUM amount in that range."
             )
 
         raw = await self._chat(_INTENT_SYSTEM_PROMPT, user_message)
@@ -332,6 +358,7 @@ class QwenClient:
         extracted_intent: dict[str, Any],
         prior_tenant_memories: Optional[list] = None,
         prior_landlord_memories: Optional[list] = None,
+        trust_status: Optional[dict] = None,
     ) -> str:
         """
         Generate a 3-sentence landlord briefing about the prospective tenant.
@@ -342,6 +369,8 @@ class QwenClient:
             extracted_intent:        Structured intent from extract_intent node
             prior_tenant_memories:   Mem0 history for this tenant
             prior_landlord_memories: Mem0 preferences for this landlord
+            trust_status:            Trust Passport status ({provided, verified, confirmed} per
+                                     document/reference). Never claims more than is evidenced.
 
         Returns:
             3-sentence briefing string ready for landlord notification.
@@ -385,6 +414,31 @@ class QwenClient:
             f"Property: {property_data.get('title', 'Listed property')} "
             f"in {property_data.get('location', '')}"
         )
+
+        # Trust Passport status — state only what is evidenced (provided/verified/
+        # confirmed). Never infer or invent a status.
+        if trust_status:
+            trust_parts = []
+            docs = trust_status.get("documents") or {}
+            refs = trust_status.get("references") or {}
+            # identity = ID/proof-of-income uploads; refs = reference contacts
+            if docs:
+                provided_count = sum(1 for s in docs.values() if s == "provided")
+                verified_count = sum(1 for s in docs.values() if s == "verified")
+                doc_line = f"Identity & income evidence: {provided_count} provided"
+                if verified_count:
+                    doc_line += f", {verified_count} verified"
+                trust_parts.append(doc_line)
+            if refs:
+                ref_line = f"References: {len(refs)} supplied"
+                confirmed_count = sum(1 for s in refs.values() if s == "confirmed")
+                if confirmed_count:
+                    ref_line += f", {confirmed_count} confirmed"
+                trust_parts.append(ref_line)
+            if trust_parts:
+                context_parts.append(
+                    "Trust status: " + " · ".join(trust_parts)
+                )
 
         # Inject memory context
         if prior_tenant_memories:

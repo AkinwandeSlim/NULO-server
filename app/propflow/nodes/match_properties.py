@@ -72,6 +72,15 @@ _LOCATION_ALIASES: dict[str, str] = {
 # Properties per query — show tenant a shortlist, not a wall of listings
 _MAX_MATCHES = 3
 
+# Columns fetched per matched property. `virtual_tour_url` / `video_tour_url`
+# let the PropFlow chat offer Virtual tour / Live video viewings ONLY when the
+# property actually supports them — we never guess a capability from the model.
+_SELECT_COLS = (
+    "id,title,location,city,state,price,beds,baths,"
+    "property_type,images,landlord_id,payment_frequency,"
+    "verification_status,status,virtual_tour_url,video_tour_url"
+)
+
 # Known Nigerian cities → the token we search city/state/location with.
 # The alias map above handles neighbourhoods ("garki", "lekki", "ph"); this
 # map is for CITY-level extraction used by the fallback search. Nigerian
@@ -319,11 +328,7 @@ async def _query_properties(
         logger.error(f"[match_properties] Config load failed: {exc}")
         return [], "none"
 
-    select_cols = (
-        "id,title,location,city,state,price,beds,baths,"
-        "property_type,images,landlord_id,payment_frequency,"
-        "verification_status,status"
-    )
+    select_cols = _SELECT_COLS
 
     def _raw_query(loc_filter: str | None) -> list:
         """Fetch approved + vacant properties matching an optional location ILIKE."""
