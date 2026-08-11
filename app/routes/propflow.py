@@ -985,9 +985,36 @@ async def resume_propflow_workflow(
                     response_message="Use 'confirm_payment' to confirm the tenant has paid.",
                     error_message=f"Got '{request.decision}' expected 'confirm_payment'",
                 )
-            # Payment confirmed — mock NUBAN (9391...) bypasses the FULL_PAYMENT
-            # check in disburse_landlord_node, so just resume directly.
+            # Payment confirmed — fetch the reconciliation_status from database and inject into state
+            # so disburse_landlord_node can see FULL_PAYMENT
             print(f"[PROPFLOW] Payment confirmed for {workflow_id} — resuming graph")
+
+            try:
+                agreement_id = channel_values.get("agreement_id")
+                if agreement_id:
+                    loop = asyncio.get_event_loop()
+                    supabase_admin = get_supabase_admin()
+                    agreement_result = await loop.run_in_executor(
+                        None,
+                        lambda: supabase_admin.table("agreements")
+                        .select("reconciliation_status, total_received_amount")
+                        .eq("id", str(agreement_id))
+                        .maybe_single()
+                        .execute(),
+                    )
+                    agreement_data = agreement_result.data
+                    if agreement_data:
+                        # Inject the database reconciliation_status into the workflow state
+                        print(f"[PROPFLOW] Injecting reconciliation_status={agreement_data.get('reconciliation_status')} from database")
+                        graph.update_state(
+                            thread_config,
+                            {
+                                "reconciliation_status": agreement_data.get("reconciliation_status"),
+                                "total_received_amount": agreement_data.get("total_received_amount"),
+                            },
+                        )
+            except Exception as exc:
+                logger.warning(f"[PROPFLOW] Could not inject reconciliation_status: {exc}")
 
         else:
             # ---- UNKNOWN STATE (fallback) ----
