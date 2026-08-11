@@ -93,8 +93,11 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
       1. Search Mem0 for prior memories about this tenant (read)
       2. Call Qwen to extract structured intent, injecting memory context
       3. Apply confidence gate
-      4. Write confirmed preferences back to Mem0 (write)
-      5. Return updated state
+      4. Detect relaxation requests: if tenant is asking to relax earlier criteria
+         (e.g. "show me ALL houses in Lekki" after no budget match), carry forward
+         the location but null out bedroom/budget so the matcher returns broader results
+      5. Write confirmed preferences back to Mem0 (write)
+      6. Return updated state
 
     Args:
         state: PropFlowState with raw_inquiry_text and tenant_id populated
@@ -156,8 +159,32 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
         extracted_intent = _fallback_extract_intent(raw_text)
 
     confidence = float(extracted_intent.get("confidence", 0.0))
+    is_relaxation = bool(extracted_intent.get("is_relaxation_request", False))
 
-    # ── Step 3: Confidence gate ───────────────────────────────────────────────
+    # ── Step 3: Relaxation detection — carry forward prior intent ────────────
+    # If tenant is asking to relax criteria (e.g. "show me ANY price in Lekki"
+    # after "no 4-bed under 500k"), merge the new extraction with the prior one,
+    # keeping location but relaxing bedroom/budget constraints.
+    prior_intent = state.get("prior_intent")
+    if is_relaxation and prior_intent:
+        logger.info(
+            f"[extract_intent] Relaxation request detected. "
+            f"Prior intent: {prior_intent}. New intent: {extracted_intent}"
+        )
+        # Merge: keep location from either extraction, but null out bedroom/budget
+        # so the matcher returns broader results
+        merged_intent = {
+            **extracted_intent,
+            "location": extracted_intent.get("location") or prior_intent.get("location"),
+            # Explicitly relax: set to None so matcher doesn't filter by these
+            "bedrooms": None if is_relaxation else extracted_intent.get("bedrooms"),
+            "budget_monthly": None if is_relaxation else extracted_intent.get("budget_monthly"),
+            "budget_annual": None if is_relaxation else extracted_intent.get("budget_annual"),
+        }
+        extracted_intent = merged_intent
+        logger.info(f"[extract_intent] Merged intent for relaxation: {extracted_intent}")
+
+    # ── Step 4: Confidence gate ───────────────────────────────────────────────
     threshold = propflow_settings.INTENT_CONFIDENCE_THRESHOLD
 
     if confidence < threshold:
@@ -172,6 +199,7 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
             "extraction_confidence": confidence,
             "prior_tenant_memories": prior_memories,
             "is_returning_tenant": is_returning,
+            "is_relaxation_request": is_relaxation,
             "current_stage": "needs_clarification",
             "error_log": state.get("error_log", []) + [
                 f"Low confidence intent extraction: {confidence:.2f}. "
@@ -179,7 +207,7 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
             ],
         }
 
-    # ── Step 4: Mem0 write -- store confirmed preferences ────────────────────
+    # ── Step 5: Mem0 write -- store confirmed preferences ────────────────────
     # Build a concise, factual memory string that's useful in future sessions
     memory_parts = []
 
@@ -221,14 +249,16 @@ async def extract_intent_node(state: PropFlowState) -> PropFlowState:
         f"[extract_intent] Success -- location={extracted_intent.get('location')} "
         f"bedrooms={extracted_intent.get('bedrooms')} "
         f"budget_monthly={extracted_intent.get('budget_monthly')} "
-        f"confidence={confidence:.2f}"
+        f"confidence={confidence:.2f} is_relaxation={is_relaxation}"
     )
 
     return {
         **state,
         "extracted_intent": extracted_intent,
         "extraction_confidence": confidence,
+        "prior_intent": extracted_intent,  # Save for next relaxation request
         "prior_tenant_memories": prior_memories,
         "is_returning_tenant": is_returning,
+        "is_relaxation_request": is_relaxation,
         "current_stage": "intent_extracted",
     }

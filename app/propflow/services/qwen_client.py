@@ -44,7 +44,8 @@ JSON schema (all keys required, use null for unknown fields):
   "move_in_date": "YYYY-MM-DD" | null,
   "payment_frequency": "MONTHLY" | "QUARTERLY" | "SEMI_ANNUAL" | "ANNUAL" | null,
   "special_requests": string | null,
-  "confidence": float  // 0.0-1.0, how confident you are in the extraction
+  "confidence": float,  // 0.0-1.0, how confident you are in the extraction
+  "is_relaxation_request": boolean  // true if tenant is asking to relax earlier criteria (e.g. "show me ANY budget" after no results)
 }
 
 Nigerian Pidgin translation guide:
@@ -76,6 +77,17 @@ LOCATION EXTRACTION (IMPORTANT -- preserve specificity):
   show the tenant exactly what they asked for, not every listing in the
   whole city. Do NOT drop "GRA", "Badagry", "First Junction", etc.
   If the user names ONLY a city (e.g. "Lagos" or "Abuja"), return just that.
+
+RELAXATION DETECTION:
+  If the tenant is asking to relax or broaden their earlier criteria (after no results),
+  set is_relaxation_request=true. Examples:
+    - "okay, show me ANY price in Lekki" (after "no 4-bed under 500k")
+    - "can you give me a list of all houses in Lekki" (implicitly: any size, any price)
+    - "which ones are available even if they're more expensive" (relaxing budget)
+    - "show me 3-bed or 4-bed options in that area" (relaxing bedroom, keeping location)
+
+  When is_relaxation_request=true, the backend will carry forward earlier constraints
+  that are NOT explicitly relaxed, so a follow-up keeps the location but drops budget/beds.
 """
 
 _BRIEFING_SYSTEM_PROMPT = """You are a professional Nigerian property manager writing a briefing

@@ -12,6 +12,9 @@ class PropFlowState(TypedDict):
     raw_inquiry_text: str
     extracted_intent: Optional[dict]       # Structured JSON from Qwen
     extraction_confidence: Optional[float] # Gate: < 0.7 routes to clarification
+    # Track the ORIGINAL intent so we can carry it forward when tenant relaxes criteria
+    prior_intent: Optional[dict]           # The earlier extraction (before relaxation)
+    is_relaxation_request: Optional[bool]  # True if tenant is asking to relax earlier criteria
 
     # ── Property Matching ────────────────────────────────────────────────────
     # Top candidates returned by match_properties node (up to 3)

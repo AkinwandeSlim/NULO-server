@@ -315,6 +315,8 @@ async def start_propflow_chat(
             # Initialize all optional fields as None
             extracted_intent=None,
             extraction_confidence=None,
+            prior_intent=None,  # For relaxation request tracking
+            is_relaxation_request=None,
             property_matches=None,
             selected_property_id=None,
             application_id=None,
@@ -445,6 +447,8 @@ async def guest_search(request: ChatRequest):
             conversation_history=conversation_history,
             extracted_intent=None,
             extraction_confidence=None,
+            prior_intent=None,  # For relaxation request tracking
+            is_relaxation_request=None,
             property_matches=None,
             selected_property_id=None,
             application_id=None,
