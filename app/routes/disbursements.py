@@ -254,7 +254,7 @@ async def lookup_bank(
 # Returns: { status, merchant_tx_ref, amount_ngn, message }
 # ============================================================
 
-@with_timeout(20)  # 20s timeout for disbursement (Nomba can take time)
+@with_timeout(75)  # 75s — live Nomba transfers can take up to 60s; must stay under client's 90s
 @router.post("/agreements/{agreement_id}/disburse")
 async def disburse_to_landlord(
     agreement_id: str,
@@ -287,9 +287,20 @@ async def disburse_to_landlord(
     if not source_transfer_id:
         raise HTTPException(400, "source_transfer_id is required")
 
-    # 1. Fetch agreement
-    logger.info(f"[DISBURSE] Fetching agreement {agreement_id}")
-    agreement_result = await run_db_async(
+    # ── OPTIMIZATION (2026-08-11): Parallel data fetch ──────────────────────
+    # Previously 3 sequential DB round-trips (agreement → transfer → idempotency
+    # + landlord). Now batched with asyncio.gather so independent reads happen
+    # concurrently. On slow networks this cuts pre-Nomba latency by ~2-3x.
+
+    # Strip -SUB suffix if present to get the agreement ID (Per PRD accountRef
+    # convention: agreement.id + "-SUB").
+    clean_agreement_id = source_transfer_id.replace("-SUB", "") if source_transfer_id.endswith("-SUB") else source_transfer_id
+    lookup_agreement_id = clean_agreement_id if clean_agreement_id == agreement_id else agreement_id
+
+    logger.info(f"[DISBURSE] Fetching agreement + transfer in parallel for agreement={agreement_id}")
+
+    # Batch 1: agreement + source transfer (independent reads).
+    agreement_task = run_db_async(
         lambda: supabase_admin
             .table("agreements")
             .select("id, landlord_id, tenant_id, platform_fee, expected_payment_amount")
@@ -297,33 +308,7 @@ async def disburse_to_landlord(
             .maybe_single()
             .execute(),
     )
-    # .maybe_single() returns None for 0 rows. Normalize to a dict.
-    agreement = (
-        agreement_result
-        if isinstance(agreement_result, dict)
-        else (agreement_result.data if agreement_result else None)
-    )
-    if not agreement:
-        raise HTTPException(404, "Agreement not found")
-    if current_user["id"] != agreement["landlord_id"]:
-        raise HTTPException(403, "Only the landlord on this agreement can disburse")
-
-    logger.info(f"[DISBURSE] Agreement validated: {agreement.get('id')}")
-
-    # 2. Fetch source transfer
-    # The frontend may send nomba_account_ref (agreement.id + "-SUB") as source_transfer_id.
-    # Strip the -SUB suffix to get the actual agreement ID, then lookup the transfer.
-    # Per PRD: accountRef = agreement.id + "-SUB" is the convention for sub-account-scoped VAs.
-    import re
-    # Strip -SUB suffix if present to get the agreement ID
-    clean_agreement_id = source_transfer_id.replace("-SUB", "") if source_transfer_id.endswith("-SUB") else source_transfer_id
-
-    # If the cleaned ID is a valid UUID and matches the agreement_id, use it to lookup the transfer
-    # Otherwise, use the agreement_id from the path parameter
-    lookup_agreement_id = clean_agreement_id if clean_agreement_id == agreement_id else agreement_id
-
-    logger.info(f"[DISBURSE] Fetching transfer for agreement={lookup_agreement_id}")
-    transfer_result = await run_db_async(
+    transfer_task = run_db_async(
         lambda: supabase_admin
             .table("virtual_account_transfers")
             .select("id, amount_received, reconciliation_result, agreement_id, currency, account_ref")
@@ -334,14 +319,28 @@ async def disburse_to_landlord(
             .maybe_single()
             .execute(),
     )
-    logger.info(f"[DISBURSE] Transfer fetch result: {transfer_result}")
-    # .maybe_single() returns None for 0 rows. Normalize to a dict.
+    agreement_result, transfer_result = await asyncio.gather(agreement_task, transfer_task)
+
+    # Normalize .maybe_single() results (dict or {data: ...})
+    agreement = (
+        agreement_result
+        if isinstance(agreement_result, dict)
+        else (agreement_result.data if agreement_result else None)
+    )
     transfer = (
         transfer_result
         if isinstance(transfer_result, dict)
         else (transfer_result.data if transfer_result else None)
     )
-    
+
+    # 1. Validate agreement
+    if not agreement:
+        raise HTTPException(404, "Agreement not found")
+    if current_user["id"] != agreement["landlord_id"]:
+        raise HTTPException(403, "Only the landlord on this agreement can disburse")
+    logger.info(f"[DISBURSE] Agreement validated: {agreement.get('id')}")
+
+    # 2. Validate source transfer
     if not transfer:
         raise HTTPException(404, "Source transfer not found - no FULL_PAYMENT transfers for this agreement")
     if transfer.get("agreement_id") != agreement_id:
@@ -362,30 +361,20 @@ async def disburse_to_landlord(
             float(agreement.get("expected_payment_amount") or 0),
         )
 
-    # Idempotency: check if a disbursement already exists for this source transfer
-    # Use the actual transfer ID from the lookup, not the source_transfer_id parameter
+    # 3. Idempotency check + landlord fetch in parallel (both depend only on the
+    #    agreement/transfer already fetched above).
     actual_transfer_id = transfer.get("id")
-    existing_result = await run_db_async(
+    logger.info(f"[DISBURSE] Checking idempotency + fetching landlord in parallel")
+
+    existing_task = run_db_async(
         lambda: supabase_admin
             .table("transactions")
-            .select("id, nomba_transfer_ref, status, amount")
+            .select("id, nomba_transfer_ref, status, amount, created_at")
             .eq("source_transfer_id", actual_transfer_id)
             .in_("transaction_type", ["nomba_disbursement"])
             .execute(),
     )
-    if existing_result.data:
-        existing = existing_result.data[0]
-        if existing.get("status") in ("released", "pending"):
-            return {
-                "status": existing.get("status", "already_processed"),
-                "merchant_tx_ref": existing.get("nomba_transfer_ref"),
-                "amount_ngn": float(existing.get("amount") or 0),
-                "message": "Disbursement already in progress or complete",
-            }
-
-    # 3. Fetch landlord bank details (PRD V3.2 OPEN #1: now from landlord_profiles,
-    #    the payout-data single source of truth, NOT the legacy landlords table).
-    landlord_result = await run_db_async(
+    landlord_task = run_db_async(
         lambda: supabase_admin
             .table("landlord_profiles")
             .select("id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at")
@@ -393,7 +382,64 @@ async def disburse_to_landlord(
             .maybe_single()
             .execute(),
     )
-    # .maybe_single() returns None for 0 rows. Normalize to a dict.
+    existing_result, landlord_result = await asyncio.gather(existing_task, landlord_task)
+
+    # Idempotency short-circuit — with stale-pending recovery.
+    # A "pending" row that is OLD (created > STALE_MIN) means the original call
+    # died mid-transfer (client timeout / server restart). Without recovery, it
+    # would block every future release forever — the stuck "Disbursement in
+    # Progress" state. We delete the stale row so this retry proceeds fresh.
+    STALE_PENDING_MIN = 10
+    blocked_by_pending = False
+    if existing_result.data:
+        existing = existing_result.data[0]
+        existing_status = existing.get("status")
+        if existing_status == "released":
+            return {
+                "status": "released",
+                "merchant_tx_ref": existing.get("nomba_transfer_ref"),
+                "amount_ngn": float(existing.get("amount") or 0),
+                "message": "Disbursement already completed",
+            }
+        if existing_status == "pending":
+            try:
+                created = datetime.fromisoformat(
+                    str(existing.get("created_at")).replace("Z", "+00:00")
+                )
+                age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60
+            except (TypeError, ValueError):
+                age_min = 0.0  # unparseable timestamp → assume recent, do not recover
+            if age_min >= STALE_PENDING_MIN:
+                logger.warning(
+                    "[DISBURSE] Stale pending disbursement detected (age=%.1fmin) — "
+                    "deleting so release can retry | tx_id=%s",
+                    age_min, existing.get("id"),
+                )
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: supabase_admin
+                            .table("transactions")
+                            .delete()
+                            .eq("id", existing.get("id"))
+                            .execute(),
+                    )
+                except Exception as del_exc:
+                    logger.warning(
+                        "[DISBURSE] Could not delete stale pending tx (non-fatal): %s", del_exc,
+                    )
+            else:
+                blocked_by_pending = True
+    if blocked_by_pending:
+        existing = existing_result.data[0]
+        return {
+            "status": "pending",
+            "merchant_tx_ref": existing.get("nomba_transfer_ref"),
+            "amount_ngn": float(existing.get("amount") or 0),
+            "message": "Disbursement already in progress",
+        }
+
+    # 4. Validate landlord bank details
     landlord = (
         landlord_result
         if isinstance(landlord_result, dict)
@@ -592,18 +638,20 @@ async def disburse_to_landlord(
                 agreement_id, str(e)
             )
     
-    # Refresh bank_verified_at even on success so the next call within
-    # 24h skips this lookup.
-    await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: supabase_admin
-            .table("landlord_profiles")
-            .update({
-                "bank_verified_at": datetime.now(timezone.utc).isoformat(),
-            })
-            .eq("id", agreement["landlord_id"])
-            .execute(),
-    )
+    # Refresh bank_verified_at ONLY when the cache was stale (i.e. we actually
+    # re-verified). Previously this wrote on EVERY disbursement — an avoidable
+    # DB round-trip on the hot path.
+    if cache_stale:
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: supabase_admin
+                .table("landlord_profiles")
+                .update({
+                    "bank_verified_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("id", agreement["landlord_id"])
+                .execute(),
+        )
 
     # 4. Calculate payout amount
     platform_fee = float(agreement.get("platform_fee") or 0)
