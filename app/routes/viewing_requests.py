@@ -92,6 +92,8 @@ def _validate_future_date(value: str, label: str) -> date:
 
 def _validate_exact_time(value: Optional[str]) -> str:
     normalized = (value or "").strip().upper()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="Please select an exact appointment time, for example 10:00 AM")
     if not _EXACT_TIME.fullmatch(normalized):
         raise HTTPException(status_code=422, detail="Choose an exact appointment time, for example 10:00 AM")
     return normalized

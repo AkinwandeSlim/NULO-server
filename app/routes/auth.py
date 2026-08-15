@@ -959,6 +959,49 @@ async def sync_user_profile(profile: SyncUserProfile):
                 logger.warning(f"Error checking for duplicates: {e}")
                 # Continue - this might be a temporary DB issue
         
+        # ✅ ROLE DOWNGRADE GUARD
+        # Check whether this user already exists with a role in the DB.
+        # If they do, we must not overwrite a higher-privilege role (landlord/admin)
+        # with a lower one (tenant) unless the caller explicitly confirms it.
+        # This prevents silent downgrades caused by OAuth re-auth or duplicate
+        # sync calls where the incoming profile.user_type resolved to 'tenant'
+        # due to a stale OAuth state cookie or missing JWT metadata.
+        ROLE_RANK = {"tenant": 1, "landlord": 2, "admin": 3}
+        resolved_user_type = profile.user_type  # default: use what was sent
+
+        try:
+            existing_check = supabase_admin.table("users").select(
+                "id, user_type, onboarding_completed"
+            ).eq("id", profile.user_id).execute()
+
+            if existing_check.data and len(existing_check.data) > 0:
+                existing_row = existing_check.data[0]
+                existing_role = existing_row.get("user_type")
+                incoming_role = profile.user_type
+
+                if existing_role and existing_role != incoming_role:
+                    existing_rank = ROLE_RANK.get(existing_role, 0)
+                    incoming_rank = ROLE_RANK.get(incoming_role, 0)
+
+                    if incoming_rank < existing_rank:
+                        # ✅ BLOCK: Would be a downgrade — preserve the existing role.
+                        # Example: landlord being re-synced as tenant due to lost state.
+                        logger.warning(
+                            f"🛡️ ROLE DOWNGRADE BLOCKED: "
+                            f"user {profile.user_id} is '{existing_role}' in DB, "
+                            f"incoming sync requested '{incoming_role}'. "
+                            f"Keeping existing role."
+                        )
+                        resolved_user_type = existing_role
+                    else:
+                        # Upgrade or lateral move (e.g. tenant → landlord) — allow.
+                        logger.info(
+                            f"🔄 Role change allowed: "
+                            f"'{existing_role}' → '{incoming_role}' for user {profile.user_id}"
+                        )
+        except Exception as guard_err:
+            logger.warning(f"Could not run role downgrade guard: {guard_err}. Proceeding with incoming role.")
+
         # Prepare user record with correct user_type
         user_record = {
             "id": profile.user_id,
@@ -966,19 +1009,19 @@ async def sync_user_profile(profile: SyncUserProfile):
             "first_name": profile.first_name,
             "last_name": profile.last_name,
             "full_name": profile.full_name,
-            "user_type": profile.user_type,  # ✅ Explicitly set
+            "user_type": resolved_user_type,  # ✅ Downgrade-protected
             "auth_provider": profile.auth_provider,
             "email_verified": False,
             "onboarding_completed": False,
-            "onboarding_step": 1 if profile.user_type == 'landlord' else 4,
-            "verification_status": 'pending' if profile.user_type == 'landlord' else 'approved',
+            "onboarding_step": 1 if resolved_user_type == 'landlord' else 4,
+            "verification_status": 'pending' if resolved_user_type == 'landlord' else 'approved',
             "trust_score": 50,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat()
         }
-        
+
         # Use UPSERT to handle both new and existing users
-        logger.info(f"Upserting user record...")
+        logger.info(f"Upserting user record with role: {resolved_user_type}...")
         result = supabase_admin.table("users").upsert(
             user_record,
             on_conflict="id"  # Update if user already exists
@@ -987,9 +1030,9 @@ async def sync_user_profile(profile: SyncUserProfile):
         if not result.data:
             logger.warning(f"No data returned from upsert")
         
-        # Create appropriate profile table
-        logger.info(f"Creating profile table for {profile.user_type}...")
-        if profile.user_type == 'landlord':
+        # Create appropriate profile table — use resolved_user_type (downgrade-protected)
+        logger.info(f"Creating profile table for {resolved_user_type}...")
+        if resolved_user_type == 'landlord':
             supabase_admin.table('landlord_profiles').upsert({
                 'id': profile.user_id,
                 'created_at': datetime.now().isoformat(),
@@ -997,7 +1040,7 @@ async def sync_user_profile(profile: SyncUserProfile):
             }, on_conflict="id").execute()
             logger.info(f"Created landlord_profile")
             
-        elif profile.user_type == 'tenant':
+        elif resolved_user_type == 'tenant':
             supabase_admin.table('tenant_profiles').upsert({
                 'id': profile.user_id,
                 'created_at': datetime.now().isoformat(),
@@ -1013,14 +1056,14 @@ async def sync_user_profile(profile: SyncUserProfile):
             }, on_conflict="id").execute()
             logger.info(f"Created admin profile")
         
-        # Also update auth.users metadata to keep in sync
+        # Also update auth.users metadata to keep in sync — use resolved role
         logger.info(f"Updating auth metadata...")
         try:
             supabase_admin.auth.admin.update_user_by_id(
                 profile.user_id,
                 {
                     "user_metadata": {
-                        "user_type": profile.user_type,
+                        "user_type": resolved_user_type,  # ✅ use protected role
                         "first_name": profile.first_name,
                         "last_name": profile.last_name,
                         "full_name": profile.full_name
@@ -1037,8 +1080,8 @@ async def sync_user_profile(profile: SyncUserProfile):
         return {
             "success": True,
             "user_id": profile.user_id,
-            "user_type": profile.user_type,
-            "message": f"{profile.user_type.capitalize()} profile created successfully"
+            "user_type": resolved_user_type,  # ✅ return the actual role used
+            "message": f"{resolved_user_type.capitalize()} profile created successfully"
         }
         
     except Exception as e:

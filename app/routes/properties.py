@@ -35,6 +35,14 @@ router = APIRouter(prefix="/properties")
 # Helps prevent WinError 10035 socket exhaustion under load
 executor = ThreadPoolExecutor(max_workers=8)
 
+# Fields needed by marketplace cards and map markers. Detail-only fields such
+# as long descriptions, amenities, rules, tours, and nearby_places stay on the
+# property-detail endpoint instead of being sent for every search result.
+MARKETPLACE_PROPERTY_FIELDS = (
+    "id,landlord_id,title,property_type,location,city,state,latitude,longitude,"
+    "price,beds,baths,sqft,images,status,featured,view_count,created_at"
+)
+
 # ============================================================================
 # VALIDATION HELPERS
 # ============================================================================
@@ -306,7 +314,7 @@ async def search_properties(
         # FILTER 1: Only vacant AND approved + non-deleted properties (uses idx_properties_status)
         # Filter out soft-deleted properties from public marketplace (REG-08 fix)
         query = supabase_admin.table("properties").select(
-            "*"
+            MARKETPLACE_PROPERTY_FIELDS, count="exact"
         ).eq(
             "status", "vacant"
         ).eq(
@@ -463,7 +471,12 @@ async def search_properties(
             property_ids = [p["id"] for p in properties]
             
             landlords_dict, favorited_ids = await asyncio.gather(
-                fetch_landlords_batch(property_ids),
+                # landlord_id is already projected above, so avoid a second
+                # lookup of the same property rows inside the batch helper.
+                fetch_landlords_batch(
+                    property_ids,
+                    [p.get("landlord_id") for p in properties],
+                ),
                 fetch_favorites_batch(
                     current_user.get("id") if current_user else None,
                     property_ids
@@ -1614,7 +1627,6 @@ async def delete_property(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to delete property: {str(e)}"
         )
-
 
 
 

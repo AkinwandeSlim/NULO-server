@@ -23,6 +23,7 @@ from app.routes import (
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import sys
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -55,17 +56,29 @@ def setup_logging():
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # File handler with auto-rotation (5MB per file, keep 3 backups)
-    # Write outside the uvicorn reload-watched directory to avoid "watchfiles -1 change detected" spam
+    # File handler - Use basic FileHandler on Windows to avoid multiprocessing lock issues
+    # RotatingFileHandler causes "PermissionError: [WinError 32]" on Windows with uvicorn workers
     import tempfile
     log_dir = tempfile.gettempdir()  # e.g. C:\Users\USER\AppData\Local\Temp
     log_path = os.path.join(log_dir, "nulo-serverlog.txt")
-    file_handler = RotatingFileHandler(
-        log_path,
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=3,
-        encoding="utf-8",
-    )
+    
+    # Use platform-specific handler
+    if sys.platform == "win32":
+        # Windows: Use simple FileHandler to avoid multiprocessing file locking issues
+        file_handler = logging.FileHandler(
+            log_path,
+            mode='a',  # Append mode
+            encoding="utf-8",
+        )
+    else:
+        # Unix: RotatingFileHandler works fine
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=3,
+            encoding="utf-8",
+        )
+    
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     

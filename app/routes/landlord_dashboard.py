@@ -198,7 +198,9 @@ def get_landlord_profile(landlord_id: str) -> dict:
         logger.error(f"Error getting landlord profile: {str(e)}")
         # Return basic user data if profile doesn't exist
         try:
-            user_result = supabase_admin.table("users").select("id, full_name, email, phone_number, avatar_url, trust_score, verification_status, created_at, updated_at").eq("id", landlord_id).single().execute()
+            user_result = run_db_sync(
+                lambda: supabase_admin.table("users").select("id, full_name, email, phone_number, avatar_url, trust_score, verification_status, created_at, updated_at").eq("id", landlord_id).single().execute()
+            )
             user = user_result.data if user_result.data else {}
             return {
                 "id": user.get("id"),
@@ -1116,7 +1118,9 @@ async def get_landlord_onboarding_status(
         if current_user.get('user_type') != 'landlord':
             raise HTTPException(status_code=403, detail="Access denied. Landlord access required.")
         
-        result = supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("landlord_onboarding").select("*").eq("landlord_id", landlord_id).single().execute()
+        )
         
         if not result.data:
             return {"onboarding": None}

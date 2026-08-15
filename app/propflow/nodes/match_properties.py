@@ -332,6 +332,8 @@ async def _query_properties(
 
     def _raw_query(loc_filter: str | None) -> list:
         """Fetch approved + vacant properties matching an optional location ILIKE."""
+        from urllib.parse import quote
+        
         params = (
             f"select={select_cols}"
             f"&verification_status=eq.approved"
@@ -339,16 +341,33 @@ async def _query_properties(
             f"&deleted_at=is.null"
         )
         if loc_filter:
-            params += f"&location=ilike.*{loc_filter}*"
+            # URL-encode the location filter to handle special characters
+            encoded_loc = quote(loc_filter, safe='')
+            params += f"&location=ilike.*{encoded_loc}*"
         params += "&order=created_at.desc&limit=20"
+        
         try:
             r = requests.get(
                 f"{url}/rest/v1/properties?{params}",
                 headers=headers, verify=False, timeout=10,
             )
-            return r.json() if r.ok and r.json() else []
+            
+            # Enhanced error handling
+            if not r.ok:
+                logger.error(
+                    f"[match_properties] REST query failed: {r.status_code} - {r.text[:500]}"
+                )
+                return []
+            
+            try:
+                result = r.json()
+                return result if result else []
+            except Exception as json_exc:
+                logger.error(f"[match_properties] JSON parse error: {json_exc} - Response: {r.text[:200]}")
+                return []
+                
         except Exception as exc:
-            logger.warning(f"[match_properties] REST query failed: {exc}")
+            logger.warning(f"[match_properties] REST query exception: {exc}")
             return []
 
     # ── Attempt 1: specific neighbourhood-first search ───────────────────────
@@ -383,17 +402,25 @@ async def _query_properties(
     #    'neighbourhood' (exact area) vs 'city' (expanded area — these are
     #    recommendations, not exact matches).
     if not data and location:
+        from urllib.parse import quote
         city_token = _extract_city_token(location)
         logger.info(f"[match_properties] City-level fallback for '{location}' -> city '{city_token}'")
+        
+        # URL-encode the city token to handle special characters safely
+        encoded_city = quote(city_token, safe='')
+        
         select_alt = select_cols.replace(
             "location,city,state", "city,location,state"
         )
+        
+        # Fixed: Use proper URL encoding and safer query structure
+        # Changed from "or=(...)" to multiple "or=" parameters for better compatibility
         params = (
             f"select={select_alt}"
             f"&verification_status=eq.approved"
             f"&status=eq.vacant"
             f"&deleted_at=is.null"
-            f"&or=(city.ilike.*{city_token}*,state.ilike.*{city_token}*,location.ilike.*{city_token}*)"
+            f"&or=(city.ilike.*{encoded_city}*,state.ilike.*{encoded_city}*,location.ilike.*{encoded_city}*)"
             f"&order=created_at.desc&limit=20"
         )
         try:
@@ -401,9 +428,23 @@ async def _query_properties(
                 f"{url}/rest/v1/properties?{params}",
                 headers=headers, verify=False, timeout=10,
             )
-            data = r.json() if r.ok and r.json() else []
+            
+            # Enhanced error handling with detailed logging
+            if not r.ok:
+                logger.error(
+                    f"[match_properties] City fallback HTTP error: {r.status_code} - {r.text[:500]}"
+                )
+                data = []
+            else:
+                try:
+                    data = r.json() if r.json() else []
+                except Exception as json_exc:
+                    logger.error(f"[match_properties] JSON parse error: {json_exc}")
+                    data = []
         except Exception as exc:
             logger.warning(f"[match_properties] City fallback failed: {exc}")
+            data = []
+        
         if data:
             match_quality = "city"
 

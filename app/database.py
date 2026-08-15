@@ -86,6 +86,15 @@ def _is_transient_db_error(e: Exception) -> bool:
         "connection terminated",
         "goaway",
         "received goaway",
+        # Transient TLS-layer failures (raw ssl.SSLError or wrapped
+        # httpx.ReadError). Anyio surfaces "bad record mac" as a raw
+        # ssl.SSLError when a stale TLS record arrives on a recycled
+        # connection — a single retry on a fresh connection succeeds.
+        "sslv3_alert_bad_record_mac",
+        "bad record mac",
+        "ssl:",
+        "sslerror",
+        "tlsv1_alert",
     )
     return any(m in msg for m in markers)
 
