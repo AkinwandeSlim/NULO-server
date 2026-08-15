@@ -38,7 +38,10 @@ import asyncio
 import json
 import logging
 import os
+import ssl
+import uuid
 from typing import Any, AsyncIterator, Iterator, Optional, List, Tuple, Dict
+from datetime import datetime
 
 import httpx
 import requests
@@ -153,13 +156,26 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
         table: str,
         params: Optional[dict] = None,
         json_body: Any = None,
+        prefer: Optional[str] = None,
     ) -> Any:
         """
         Async HTTP call to the Supabase REST API.
-        Retries on 5xx / network errors with exponential backoff.
+        Retries on 5xx / network / SSL errors with exponential backoff.
+
+        Args:
+            prefer: Optional override for the Prefer header. Defaults to
+                    "return=representation" (set in self._headers). Pass
+                    e.g. "return=representation,resolution=merge-duplicates"
+                    to upsert on POST.
         """
         client = self._get_async_client()
         url = self._table_url(table)
+
+        # Build per-request headers so we can override Prefer for upsert
+        # without mutating the shared self._headers.
+        req_headers = dict(self._headers)
+        if prefer is not None:
+            req_headers["Prefer"] = prefer
 
         last_error = None
         for attempt in range(1, self._retries + 1):
@@ -169,10 +185,10 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
                     url,
                     params=params,
                     json=json_body,
+                    headers=req_headers,
                 )
 
-                # 409 Conflict on upsert means row already exists with same PK —
-                # this is expected for retries and is not an error.
+                # 2xx success, or 204/409 (no body / duplicate-key on plain POST)
                 if response.is_success or response.status_code in (204, 409):
                     if response.status_code == 204 or not response.text:
                         return []
@@ -191,8 +207,10 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
                     f"{response.text[:200]}"
                 )
 
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-                last_error = f"Network error on {method} {table}: {exc}"
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, ssl.SSLError, OSError) as exc:
+                # Catches transient network / TLS errors (incl. SSLV3_ALERT_BAD_RECORD_MAC
+                # which anyio surfaces as a raw ssl.SSLError instead of an httpx wrapper).
+                last_error = f"Network/SSL error on {method} {table}: {exc}"
 
             # Exponential backoff before retry
             if attempt < self._retries:
@@ -208,46 +226,64 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
         table: str,
         params: Optional[dict] = None,
         json_body: Any = None,
+        prefer: Optional[str] = None,
     ) -> Any:
         """
         Sync HTTP call to the Supabase REST API (for sync method wrappers).
-        Retries on 5xx / network errors.
+        Retries on 5xx / network / SSL errors.
+
+        Args:
+            prefer: Optional override for the Prefer header (see _request).
         """
         session = self._get_sync_session()
         url = self._table_url(table)
         fn = getattr(session, method.lower())
 
+        # Snapshot default Prefer, optionally override for this call only.
+        original_prefer = self._headers.get("Prefer")
+        if prefer is not None:
+            session.headers["Prefer"] = prefer
+
         last_error = None
-        for attempt in range(1, self._retries + 1):
-            try:
-                response = fn(url, params=params, json=json_body, timeout=30)
+        try:
+            for attempt in range(1, self._retries + 1):
+                try:
+                    response = fn(url, params=params, json=json_body, timeout=30)
 
-                if response.ok or response.status_code in (204, 409):
-                    if response.status_code == 204 or not response.text:
-                        return []
-                    return response.json()
+                    if response.ok or response.status_code in (204, 409):
+                        if response.status_code == 204 or not response.text:
+                            return []
+                        return response.json()
 
-                if 400 <= response.status_code < 500 and response.status_code != 409:
-                    raise SupabaseRestCheckpointerError(
+                    if 400 <= response.status_code < 500 and response.status_code != 409:
+                        raise SupabaseRestCheckpointerError(
+                            f"HTTP {response.status_code} on sync {method} {table}: "
+                            f"{response.text[:300]}"
+                        )
+
+                    last_error = (
                         f"HTTP {response.status_code} on sync {method} {table}: "
-                        f"{response.text[:300]}"
+                        f"{response.text[:200]}"
                     )
 
-                last_error = (
-                    f"HTTP {response.status_code} on sync {method} {table}: "
-                    f"{response.text[:200]}"
-                )
+                except (requests.RequestException, ssl.SSLError, OSError) as exc:
+                    last_error = f"Network/SSL error on sync {method} {table}: {exc}"
 
-            except requests.RequestException as exc:
-                last_error = f"Network error on sync {method} {table}: {exc}"
+                if attempt < self._retries:
+                    import time
+                    time.sleep(0.5 * (2 ** (attempt - 1)))
 
-            if attempt < self._retries:
-                import time
-                time.sleep(0.5 * (2 ** (attempt - 1)))
-
-        raise SupabaseRestCheckpointerError(
-            f"Sync request failed after {self._retries} retries: {last_error}"
-        )
+            raise SupabaseRestCheckpointerError(
+                f"Sync request failed after {self._retries} retries: {last_error}"
+            )
+        finally:
+            # Restore the session's Prefer header so we don't leak the override
+            # into other sync calls sharing the same Session.
+            if prefer is not None:
+                if original_prefer is not None:
+                    session.headers["Prefer"] = original_prefer
+                else:
+                    session.headers.pop("Prefer", None)
 
     # ── Thread registry ────────────────────────────────────────────────────────
 
@@ -296,12 +332,233 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
         }
 
         try:
-            await self._request("POST", "propflow_threads", json_body=row)
+            # Use resolution=merge-duplicates so re-runs upsert the row by
+            # primary key (thread_id) instead of returning 409 Conflict.
+            # This also keeps current_stage / status in sync across checkpoints.
+            await self._request(
+                "POST",
+                "propflow_threads",
+                json_body=row,
+                prefer="return=representation,resolution=merge-duplicates",
+            )
         except Exception as exc:
             logger.warning(
                 "[CHECKPOINTER] Thread registry upsert failed for %s: %s",
                 thread_id, exc,
             )
+
+    # ── Thread resurrection ────────────────────────────────────────────────────
+
+    async def resurrect_thread(
+        self,
+        thread_id: str,
+        tenant_id: str,
+        target_property_id: Optional[str] = None,
+        target_property_index: Optional[int] = None,
+    ) -> Optional[Checkpoint]:
+        """
+        Resurrect a missing or expired thread at the Trust Passport gate.
+
+        Creates a new thread with property selection context preserved, ensuring
+        that tenants can continue applications even after page refreshes or
+        session interruptions.
+
+        Args:
+            thread_id: The thread ID to resurrect
+            tenant_id: The tenant's UUID
+            target_property_id: Optional property ID to seed in the resurrection
+            target_property_index: Optional property index from original matches
+
+        Returns:
+            The resurrected checkpoint if successful, None otherwise
+        """
+        try:
+            # First, check if the thread exists and is accessible
+            thread_config = {"configurable": {"thread_id": thread_id}}
+            existing = await self.aget_tuple(thread_config)
+
+            if existing and existing.checkpoint:
+                # Thread exists - log but don't recreate
+                logger.info(
+                    f"[CHECKPOINTER] Thread {thread_id[:8]}... already exists - "
+                    f"stage: {existing.checkpoint.get('channel_values', {}).get('current_stage', 'unknown')}"
+                )
+                return existing.checkpoint
+
+            # Thread doesn't exist - resurrect it
+            logger.info(f"[CHECKPOINTER] Resurrecting missing thread {thread_id[:8]}...")
+
+            # If target_property_id provided, try to fetch it from DB to populate matches
+            property_matches = []
+            landlord_id = None
+            if target_property_id:
+                logger.info(f"[CHECKPOINTER] Fetching property {target_property_id[:8]}... for resurrection")
+                try:
+                    from app.database import get_supabase_admin
+                    supabase = get_supabase_admin()
+                    
+                    # Add retry logic for Supabase connection issues
+                    max_retries = 3
+                    retry_delay = 1  # seconds
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            response = supabase.from_("properties").select(
+                                "id, title, location, price, beds, baths, images, landlord_id, property_type, virtual_tour_url"
+                            ).eq("id", target_property_id).single().execute()
+                            
+                            if hasattr(response, 'data') and response.data:
+                                # Ensure all required fields are present with defaults
+                                property_data = response.data
+                                property_matches = [{
+                                    "id": property_data.get("id", target_property_id),
+                                    "title": property_data.get("title", "Property"),
+                                    "location": property_data.get("location", "Unknown"),
+                                    "price": property_data.get("price", 0),
+                                    "beds": property_data.get("beds", 0),
+                                    "baths": property_data.get("baths", 0),
+                                    "images": property_data.get("images", []),
+                                    "landlord_id": property_data.get("landlord_id"),
+                                    "property_type": property_data.get("property_type", "property"),
+                                    "virtual_tour_url": property_data.get("virtual_tour_url"),
+                                }]
+                                landlord_id = property_data.get("landlord_id")
+                                logger.info(f"[CHECKPOINTER] Property data fetched successfully for resurrection")
+                                break
+                            else:
+                                logger.warning(f"[CHECKPOINTER] Property {target_property_id[:8]}... not found during resurrection")
+                                break
+                        except Exception as retry_exc:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"[CHECKPOINTER] Retry {attempt + 1}/{max_retries} after Supabase error: {retry_exc}")
+                                import asyncio
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                            else:
+                                raise
+                                
+                except Exception as e:
+                    logger.error(f"[CHECKPOINTER] Failed to fetch property during resurrection after retries: {e}")
+                    # Create a minimal property entry if fetch fails completely
+                    if target_property_id:
+                        logger.warning(f"[CHECKPOINTER] Creating minimal property entry for {target_property_id[:8]}...")
+                        property_matches = [{
+                            "id": target_property_id,
+                            "title": "Property (Details Loading)",
+                            "location": "Unknown",
+                            "price": 0,
+                            "beds": 0,
+                            "baths": 0,
+                            "images": [],
+                            "landlord_id": None,
+                            "property_type": "property",
+                            "virtual_tour_url": None,
+                        }]
+
+            # Create initial checkpoint at Trust Passport gate
+            from app.propflow.state import PropFlowState
+            from app.propflow.config import get_propflow_settings
+
+            settings = get_propflow_settings()
+
+            # Convert tenant_id to UUID object for state
+            tenant_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+
+            # Convert landlord_id to UUID if present
+            landlord_uuid = None
+            if landlord_id:
+                try:
+                    landlord_uuid = uuid.UUID(landlord_id) if isinstance(landlord_id, str) else landlord_id
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"[CHECKPOINTER] Invalid landlord_id format: {e}")
+            
+            # Convert target_property_id to UUID if present and not already set as selected
+            selected_property_uuid = None
+            if target_property_id:
+                try:
+                    selected_property_uuid = uuid.UUID(target_property_id) if isinstance(target_property_id, str) else target_property_id
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"[CHECKPOINTER] Invalid target_property_id format: {e}")
+            
+            resurrected_state = PropFlowState(
+                workflow_id=thread_id,
+                tenant_id=tenant_uuid,
+                raw_inquiry_text="",  # Empty for resurrected thread
+                current_stage="awaiting_trust_profile",
+                error_log=[],
+                conversation_history=[],
+                extracted_intent=None,
+                extraction_confidence=None,
+                prior_intent=None,
+                is_relaxation_request=None,
+                property_matches=property_matches,  # Populated from DB if target_property_id provided
+                selected_property_id=selected_property_uuid,  # Set if target_property_id was provided
+                application_id=None,
+                application_status=None,
+                agreement_id=None,
+                agreement_status=None,
+                agreement_pdf_oss_key=None,
+                nomba_account_ref=None,
+                nomba_virtual_account_number=None,
+                expected_payment_amount=None,
+                reconciliation_status=None,
+                disbursement_merchant_tx_ref=None,
+                prior_tenant_memories=None,
+                prior_landlord_memories=None,
+                landlord_briefing=None,
+                is_returning_tenant=None,
+                disbursement_amount=None,
+                platform_fee=None,
+                rejection_reason=None,
+                landlord_id=landlord_uuid,  # Set from fetched property data
+                trust_documents=None,
+                trust_references=None,
+                trust_consent=None,
+                trust_profile_completion=None,
+                trust_employment_status=None,
+                trust_employer_name=None,
+                trust_job_title=None,
+                trust_employment_duration=None,
+                trust_monthly_income=None,
+                trust_emergency_contact_name=None,
+                trust_emergency_contact_phone=None,
+                trust_phone_number=None,
+                trust_move_in_date=None,
+                trust_lease_duration=None,
+                trust_number_of_occupants=None,
+                trust_has_pets=None,
+                trust_pet_details=None,
+                trust_message=None,
+                document_verification_status=None,
+                reference_verification_status=None,
+            )
+
+            # Store the resurrected checkpoint
+            checkpoint = Checkpoint(
+                id=str(uuid.uuid4()),
+                ts=datetime.utcnow().isoformat(),
+                channel_values=dict(resurrected_state),
+                channel_versions={},
+                versions_seen={},
+                updated_channels=["current_stage"],
+            )
+
+            # Use aput to store the checkpoint
+            await self.aput(thread_config, checkpoint, {}, {})
+
+            # Update thread registry
+            await self._update_thread_registry(checkpoint, thread_id)
+
+            logger.info(
+                f"[CHECKPOINTER] Thread {thread_id[:8]}... resurrected successfully "
+                f"at Trust Passport gate with {len(property_matches)} property match(es)"
+            )
+
+            return checkpoint
+
+        except Exception as exc:
+            logger.error(f"[CHECKPOINTER] Thread resurrection failed for {thread_id[:8]}...: {exc}")
+            return None
 
     # ── Checkpointer interface: async methods ──────────────────────────────────
 
@@ -894,7 +1151,12 @@ class SupabaseRestCheckpointer(BaseCheckpointSaver[str]):
         }
 
         try:
-            self._request_sync("POST", "propflow_threads", json_body=row)
+            self._request_sync(
+                "POST",
+                "propflow_threads",
+                json_body=row,
+                prefer="return=representation,resolution=merge-duplicates",
+            )
         except Exception:
             pass  # best-effort
 

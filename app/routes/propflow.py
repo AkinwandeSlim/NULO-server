@@ -21,7 +21,7 @@ from typing import Dict, Any, Optional, List, ClassVar
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.middleware.auth import get_current_user
 from app.database import get_supabase_admin
@@ -33,6 +33,21 @@ from app.services.nomba_helpers import calculate_expected_amount
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/propflow", tags=["PropFlow AI Agent"])
+
+# Stages where an application/lease/payment is already in flight.
+# /select must NEVER overwrite these — doing so would destroy an active
+# lease, payment, or disbursement. Instead /select returns the existing
+# stage so the client can render the correct next-step UI.
+PROTECTED_SELECT_STAGES: frozenset[str] = frozenset({
+    "application_created",
+    "awaiting_landlord_approval",
+    "agreement_drafted",
+    "awaiting_landlord_signature",
+    "nomba_provisioned",
+    "awaiting_full_payment",
+    "disbursement_complete",
+    "rejected",
+})
 
 # Sentinel tenant used for guest (unauthenticated) search-only runs. Search
 # nodes (extract_intent / match_properties) never read tenant_id, and the
@@ -103,7 +118,23 @@ class StatusResponse(BaseModel):
 
 class SelectRequest(BaseModel):
     """Tenant selects a property from matched results."""
-    property_index: int = Field(..., ge=0, description="Index of the selected property in the matches list")
+    property_index: Optional[int] = Field(
+        default=None, ge=0, description="Index of the selected property in the matches list (mutually exclusive with property_id)"
+    )
+    property_id: Optional[str] = Field(
+        default=None, description="ID of the selected property (mutually exclusive with property_index)"
+    )
+
+    @model_validator(mode='after')
+    def validate_mutually_exclusive(self) -> 'SelectRequest':
+        """Ensure exactly one of property_index or property_id is provided."""
+        has_index = self.property_index is not None
+        has_id = self.property_id is not None
+        if has_index and has_id:
+            raise ValueError('Exactly one of property_index or property_id must be provided, not both')
+        if not has_index and not has_id:
+            raise ValueError('Either property_index or property_id must be provided')
+        return self
 
 
 class SelectResponse(BaseModel):
@@ -545,11 +576,12 @@ async def select_property(
     The application is only created once the tenant completes the trust checks
     via POST /complete-application/{workflow_id}.
 
-    Steps:
-      1. Retrieve the paused graph state from the checkpointer
-      2. Get the property_matches list from the state
-      3. Update state with the selected property's ID + landlord_id
-         and advance to awaiting_trust_profile (do not resume yet)
+    Enhanced to support property_id selection alongside property_index, with
+    multiple resolution paths:
+    1. Index-based (existing - backward compatible)
+    2. State-based (from current thread's matched_properties)
+    3. Direct DB lookup (when property_id provided)
+    4. Thread resurrection (if thread missing/expired)
     """
     try:
         graph = propflow_graph()
@@ -559,34 +591,184 @@ async def select_property(
         # can lose channel_values during reconstruction — read raw instead).
         # Use async aget_tuple so httpx (not requests.Session) handles SSL.
         saved = await graph.checkpointer.aget_tuple(thread_config)
+        channel_values: dict = {}
         if saved:
             channel_values = saved.checkpoint.get("channel_values", {})
             matches = channel_values.get("property_matches", []) or []
         else:
             matches = []
 
-        if not matches:
+        # ENHANCED: Multiple resolution paths based on which parameter was provided
+        selected = None
+        selected_id = None
+        landlord_id = None
+
+        if request.property_id:
+            # Path 2/3/4: property_id provided - use robust resolution
+            logger.info(f"[PROPFLOW] Property selection via property_id: {request.property_id}")
+
+            # Validate property_id is a valid UUID
+            try:
+                uuid.UUID(request.property_id)
+            except ValueError:
+                return SelectResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="Invalid property ID format.",
+                    error_message=f"property_id {request.property_id} is not a valid UUID",
+                )
+
+            # Path 2: Try state-based resolution (property_id in current matches)
+            if matches:
+                selected = next((m for m in matches if m.get("id") == request.property_id), None)
+                if selected:
+                    logger.info(f"[PROPFLOW] Property resolved from current thread state")
+
+            # Path 3: Direct DB lookup as primary fallback (simpler than resurrection)
+            if not selected:
+                logger.info(f"[PROPFLOW] Attempting direct database lookup for property_id: {request.property_id}")
+                from app.database import get_supabase_admin
+                try:
+                    supabase = get_supabase_admin()
+                    response = supabase.from_("properties").select(
+                        "id, title, location, price, beds, baths, images, landlord_id, property_type, virtual_tour_url"
+                    ).eq("id", request.property_id).single().execute()
+
+                    if hasattr(response, 'data') and response.data:
+                        selected = response.data
+                        logger.info(f"[PROPFLOW] Property found via direct database lookup")
+                    else:
+                        logger.warning(f"[PROPFLOW] Property not found in database: {request.property_id}")
+                except Exception as e:
+                    logger.error(f"[PROPFLOW] Database lookup failed: {e}")
+
+            # Path 4: Thread resurrection (only if DB lookup also failed and thread exists)
+            if not selected and saved:
+                logger.info(f"[PROPFLOW] Attempting thread resurrection for property_id: {request.property_id}")
+                from app.propflow.checkpointer import get_checkpointer
+                checkpointer = get_checkpointer()
+
+                # Attempt to resurrect the thread at Trust Passport gate
+                resurrected = await checkpointer.resurrect_thread(
+                    thread_id=workflow_id,
+                    tenant_id=str(current_user["id"]),
+                    target_property_id=request.property_id,
+                    target_property_index=request.property_index
+                )
+
+                if resurrected:
+                    # Thread resurrected - check if it has the property in matches
+                    resurrected_channel_values = resurrected.get("channel_values", {})
+                    resurrected_matches = resurrected_channel_values.get("property_matches", []) or []
+
+                    for match in resurrected_matches:
+                        if match.get("id") == request.property_id:
+                            selected = match
+                            matches = resurrected_matches  # Use matches from resurrected thread
+                            logger.info(f"[PROPFLOW] Property found in resurrected thread")
+                            break
+                else:
+                    logger.warning(f"[PROPFLOW] Thread resurrection failed")
+
+            if not selected:
+                return SelectResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message=f"Property not found or access denied.",
+                    error_message=f"Could not resolve property_id {request.property_id} via any path",
+                )
+        else:
+            # Path 1: Original index-based logic (backward compatible)
+            logger.info(f"[PROPFLOW] Property selection via index: {request.property_index}")
+
+            if not matches:
+                return SelectResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message="No properties found to select from. Please start a new search.",
+                    error_message="No property_matches in workflow state",
+                )
+
+            if request.property_index < 0 or request.property_index >= len(matches):
+                return SelectResponse(
+                    success=False,
+                    workflow_id=workflow_id,
+                    current_stage="error",
+                    response_message=f"Invalid selection. Please choose between 1 and {len(matches)}.",
+                    error_message=f"property_index {request.property_index} out of range (0-{len(matches)-1})",
+                )
+
+            # Get the selected property
+            selected = matches[request.property_index]
+
+        # Step 2: Validate and get the selected property with defensive checks
+        if not selected:
             return SelectResponse(
                 success=False,
                 workflow_id=workflow_id,
                 current_stage="error",
-                response_message="No properties found to select from. Please start a new search.",
-                error_message="No property_matches in workflow state",
+                response_message="Property selection failed. Please try again.",
+                error_message="Selected property is None or invalid",
             )
-
-        if request.property_index < 0 or request.property_index >= len(matches):
+        
+        # Ensure selected has required fields
+        if not isinstance(selected, dict):
+            logger.error(f"[PROPFLOW] Selected property is not a dict: {type(selected)}")
             return SelectResponse(
                 success=False,
                 workflow_id=workflow_id,
                 current_stage="error",
-                response_message=f"Invalid selection. Please choose between 1 and {len(matches)}.",
-                error_message=f"property_index {request.property_index} out of range (0-{len(matches)-1})",
+                response_message="Property data format error. Please try again.",
+                error_message=f"Selected property has invalid type: {type(selected)}",
             )
-
-        # Step 2: Get the selected property
-        selected = matches[request.property_index]
+        
+        if "id" not in selected:
+            logger.error(f"[PROPFLOW] Selected property missing 'id' field: {selected}")
+            return SelectResponse(
+                success=False,
+                workflow_id=workflow_id,
+                current_stage="error",
+                response_message="Property identification error. Please try again.",
+                error_message="Selected property missing 'id' field",
+            )
+        
         selected_id = uuid.UUID(selected["id"])
         landlord_id = uuid.UUID(selected["landlord_id"]) if selected.get("landlord_id") else None
+
+        # ── Protected-stage guard ──────────────────────────────────────────
+        # If the thread already has an active application / lease / payment
+        # in flight, do NOT overwrite the stage. Return the existing state so
+        # the client can render the correct next-step UI instead of reopening
+        # the Trust Passport.
+        current_stage = channel_values.get("current_stage", "")
+        existing_application_id = channel_values.get("application_id")
+        if current_stage in PROTECTED_SELECT_STAGES:
+            logger.info(
+                f"[PROPFLOW] Select blocked: thread {workflow_id[:16]}... "
+                f"is at protected stage '{current_stage}'"
+            )
+            if current_stage == "disbursement_complete":
+                msg = "This tenancy is already active and complete."
+            elif current_stage == "rejected":
+                msg = (
+                    "Your application for this property was not approved. "
+                    "You can start a fresh search to find other properties."
+                )
+            else:
+                msg = (
+                    "You already have an application in progress for this "
+                    "property. Continue from where you left off."
+                )
+            return SelectResponse(
+                success=True,
+                workflow_id=workflow_id,
+                current_stage=current_stage,
+                response_message=msg,
+                application_id=str(existing_application_id) if existing_application_id else None,
+            )
 
         # Step 3: Inject selection into the paused state — pause at the Trust
         # Passport gate instead of resuming to create_application.
