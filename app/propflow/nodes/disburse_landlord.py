@@ -40,7 +40,7 @@ async def disburse_landlord_node(state: PropFlowState) -> PropFlowState:
 
     Node-level logic:
       - Skips disbursement unless reconciliation_status == FULL_PAYMENT
-      - Bypasses FULL_PAYMENT check if using a demo (9391) NUBAN
+      - Bypasses FULL_PAYMENT check if using a demo (9390/9391/9392) NUBAN
 
     Args:
         state: PropFlowState with agreement_id, expected_payment_amount,
@@ -64,7 +64,11 @@ async def disburse_landlord_node(state: PropFlowState) -> PropFlowState:
         }
 
     # Only disburse on FULL_PAYMENT (skip check in demo mode)
-    is_demo_nuban = virtual_account_number and str(virtual_account_number).startswith("9391")
+    # Mock/demo NUBAN prefixes: 9390 (mock provider), 9391 (Nomba fallback),
+    # 9392 (Paystack fallback) -- see app/services/payments/*_provider.py
+    is_demo_nuban = virtual_account_number and str(virtual_account_number).startswith(
+        ("9390", "9391", "9392")
+    )
     if reconciliation_status != "FULL_PAYMENT" and not is_demo_nuban:
         logger.info(
             "[disburse_landlord] Skipping disbursement agreement=%s status=%s",

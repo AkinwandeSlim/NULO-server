@@ -1,13 +1,22 @@
 """
-Payment Service — shared service layer for Nomba payment operations.
+Payment Service — shared service layer for payment operations.
 
 Both FastAPI route handlers and PropFlow graph nodes call this service
 instead of writing to Supabase or Nomba directly. This ensures:
 
-1. Consistent DVA provisioning flow (Nomba sandbox first, mock fallback)
+1. Consistent DVA provisioning flow (provider first, mock fallback)
 2. Consistent disbursement flow (platform fee calculation, transaction records)
 3. propflow_workflow_id is always captured when present
 4. Business logic lives in one place
+
+Provider abstraction (2026-08-17)
+---------------------------------
+Tenant-facing COLLECTION (virtual-account provisioning) now goes through the
+pluggable provider layer in ``app/services/payments/``. The active provider is
+selected by ``PAYMENT_PROVIDER`` in ``server/.env`` (nomba | paystack | mock).
+
+DISBURSEMENT (landlord payout) always stays on Nomba regardless of the
+configured provider, because Paystack has no escrow/disbursement equivalent.
 
 Usage from routes:
     result = await payment_service.provision_virtual_account(
@@ -27,8 +36,9 @@ Usage from PropFlow nodes:
     )
 
 Architecture:
-  - Tries Nomba sandbox (sub-account VA creation / sub-account bank transfer) FIRST
-  - Falls back to mock NUBAN / mock transfer ONLY when Nomba is truly unavailable
+  - Collection: tries the configured provider (Nomba by default) FIRST,
+    falls back to mock NUBAN ONLY when the provider is truly unavailable
+  - Disbursement: always Nomba (sub-account bank transfer), mock fallback
   - All DB writes go through Supabase (never skip the write even on mock fallback)
   - propflow_workflow_id is stored in the agreement row for context-aware resume
 """
@@ -48,8 +58,10 @@ from app.services.nomba_helpers import (
     calculate_landlord_payout,
     build_merchant_tx_ref,
 )
+from app.services.payments import get_payment_provider
 
 logger = logging.getLogger(__name__)
+
 
 
 class PaymentService:
@@ -211,79 +223,35 @@ class PaymentService:
         # The "-SUB" suffix tags sub-account-scoped VAs for webhook routing
         sub_account_ref = f"{agreement_id}-SUB"
 
-        # ── Step 7: Recovery — try GET existing VA on Nomba ─────────────────────
-        # Handles the case where a previous provisioning call succeeded on Nomba
-        # but failed on our side (e.g. server crash between Nomba 200 and DB write)
-        data = None
-        if nomba_client.sub_account_id:
-            try:
-                existing = await nomba_client.get_virtual_account(sub_account_ref)
-                if existing and not existing.get("expired", False):
-                    logger.info(
-                        "[PAYMENT SERVICE] Recovered existing VA agreement=%s nuban=%s",
-                        agreement_id, existing.get("bankAccountNumber"),
-                    )
-                    # Map Nomba response fields to our expected shape
-                    data = {
-                        "bankAccountNumber": existing["bankAccountNumber"],
-                        "bankAccountName": existing["bankAccountName"],
-                        "accountRef": existing["accountRef"],
-                        "recovered": True,
-                    }
-            except Exception as exc:
-                logger.warning(
-                    "[PAYMENT SERVICE] Recovery GET failed (non-fatal) agreement=%s err=%s",
-                    agreement_id, exc,
-                )
+        # ── Step 7+8: Provision VA via the configured payment provider ──────────
+        # The provider layer (app/services/payments/) handles recovery-GET, create,
+        # and mock fallback internally. Active provider is selected by
+        # PAYMENT_PROVIDER in server/.env (nomba | paystack | mock).
+        provider = get_payment_provider()
+        logger.info(
+            "[PAYMENT SERVICE] Provisioning VA via provider=%s agreement=%s ref=%s name=%r",
+            provider.name, agreement_id, sub_account_ref, account_name,
+        )
+        va_result = await provider.provision_virtual_account(
+            account_ref=sub_account_ref,
+            account_name=account_name,
+            expected_amount=expected_amount,
+        )
 
-        # ── Step 8: CREATE on Nomba sandbox (with mock fallback) ────────────────
-        if data is None:
-            try:
-                if not nomba_client.sub_account_id:
-                    logger.warning(
-                        "[PAYMENT SERVICE] NOMBA_SUB_ACCOUNT_ID not set — falling back to mock"
-                    )
-                    raise NombaAPIError("sub_account_id not configured")
+        data = {
+            "bankAccountNumber": va_result.bankAccountNumber,
+            "bankAccountName": va_result.bankAccountName,
+            "bankName": va_result.bankName,
+            "accountRef": va_result.accountRef,
+            "recovered": va_result.recovered,
+        }
+        is_mock = va_result.is_mock
 
-                logger.info(
-                    "[PAYMENT SERVICE] Creating Nomba VA agreement=%s ref=%s name=%r",
-                    agreement_id, sub_account_ref, account_name,
-                )
-                nomba_data = await nomba_client.create_virtual_account_for_subaccount(
-                    sub_account_id=nomba_client.sub_account_id,
-                    account_ref=sub_account_ref,
-                    account_name=account_name,
-                )
-
-                if not nomba_data or not nomba_data.get("bankAccountNumber"):
-                    raise NombaAPIError("Nomba returned empty VA response")
-
-                data = {
-                    "bankAccountNumber": nomba_data["bankAccountNumber"],
-                    "bankAccountName": nomba_data["bankAccountName"],
-                    "bankName": nomba_data.get("bankName"),
-                    "accountRef": nomba_data.get("accountRef", sub_account_ref),
-                    "recovered": False,
-                }
-                logger.info(
-                    "[PAYMENT SERVICE] Nomba VA created agreement=%s nuban=%s",
-                    agreement_id, data["bankAccountNumber"],
-                )
-
-            except (NombaAPIError, Exception) as exc:
-                # ── Fall back to mock NUBAN ────────────────────────────────────
-                logger.warning(
-                    "[PAYMENT SERVICE] Nomba unavailable (%s) — using mock NUBAN",
-                    exc,
-                )
-                mock_nuban = f"9391{str(uuid.uuid4().hex)[:6].upper()}"
-                data = {
-                    "bankAccountNumber": mock_nuban,
-                    "bankAccountName": account_name,
-                    "bankName": "NuloAfrica (Sandbox)",
-                    "accountRef": sub_account_ref,
-                    "recovered": False,
-                }
+        logger.info(
+            "[PAYMENT SERVICE] VA %s agreement=%s nuban=%s provider=%s",
+            "recovered" if va_result.recovered else ("mock" if is_mock else "created"),
+            agreement_id, data["bankAccountNumber"], provider.name,
+        )
 
         # ── Step 9: Calculate next due date ─────────────────────────────────────
         next_due = None
@@ -321,8 +289,7 @@ class PaymentService:
                 .execute(),
         )
 
-        # Determine overall status
-        is_mock = data["bankAccountNumber"].startswith("9391")
+        # Determine overall status (is_mock already set from provider result)
         status = "mock_provisioned" if is_mock else "provisioned"
 
         logger.info(
