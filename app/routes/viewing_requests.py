@@ -8,7 +8,7 @@ from app.services.notification_service import notification_service
 from app.services.notification_helpers import create_notification
 from pydantic import BaseModel
 from typing import Optional, Literal
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime
 import logging
 import re
 import time
@@ -78,6 +78,8 @@ class TenantRescheduleDecision(BaseModel):
 
 _EXACT_TIME = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$|^(?:0?[1-9]|1[0-2]):[0-5]\d\s?(?:AM|PM)$", re.I)
 _PHONE = re.compile(r"^[\d\s+()\-]{9,20}$")
+_TIME_12H = re.compile(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$")
+_TIME_24H = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 
 def _validate_future_date(value: str, label: str) -> date:
@@ -97,6 +99,84 @@ def _validate_exact_time(value: Optional[str]) -> str:
     if not _EXACT_TIME.fullmatch(normalized):
         raise HTTPException(status_code=422, detail="Choose an exact appointment time, for example 10:00 AM")
     return normalized
+
+
+def _parse_confirmed_time(value: Optional[str]):
+    """Parse an exact appointment time (``10:00 AM`` / ``22:30``) into a time."""
+    norm = (value or "").strip().upper()
+    if not norm:
+        return None
+    m = _TIME_12H.fullmatch(norm)
+    if m:
+        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), m.group(3)
+        if not 1 <= hour <= 12:
+            return None
+        if meridiem == "PM" and hour != 12:
+            hour += 12
+        elif meridiem == "AM" and hour == 12:
+            hour = 0
+        return dtime(hour, minute)
+    m = _TIME_24H.fullmatch(norm)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if hour > 23:
+            return None
+        return dtime(hour, minute)
+    return None
+
+
+def _viewing_is_overdue(viewing: dict, now: datetime) -> bool:
+    """A confirmed viewing whose appointment moment has passed is stale."""
+    if viewing.get("status") != "confirmed":
+        return False
+    try:
+        appt_date = date.fromisoformat(str(viewing.get("confirmed_date") or "")[:10])
+    except ValueError:
+        return False
+    if appt_date < now.date():
+        return True
+    if appt_date > now.date():
+        return False
+    # Same day: compare against the exact confirmed time.
+    appt_time = _parse_confirmed_time(viewing.get("confirmed_time"))
+    if appt_time is None:
+        return True  # date has arrived and no valid time on record — don't leave it stale
+    return datetime.combine(appt_date, appt_time) < now
+
+
+async def _auto_complete_overdue_viewings(rows: list) -> int:
+    """Mark confirmed viewings past their appointment as ``completed``.
+
+    No background worker exists in this app, so expiry is evaluated lazily on
+    every list fetch: the row that was left stale gets a single batch UPDATE
+    here, and the row dicts are patched in place so the very response that
+    discovered them already reports the new status. Fails soft — if the write
+    fails, the next poll retries. Returns the count expired.
+    """
+    now = datetime.now()
+    overdue_ids = [r["id"] for r in rows if _viewing_is_overdue(r, now)]
+    if not overdue_ids:
+        return 0
+    stamp = now.isoformat()
+    try:
+        await run_db_async(
+            lambda: supabase_admin.table("viewing_requests").update({
+                "status": "completed",
+                "viewing_completed_at": stamp,
+                "updated_at": stamp,
+            }).in_("id", overdue_ids).execute(),
+        )
+    except Exception as e:
+        logger.warning(f"[viewing_requests] Failed to auto-complete overdue viewings (will retry on next poll): {e}")
+        return 0
+    overdue_set = set(overdue_ids)
+    for r in rows:
+        if r["id"] in overdue_set:
+            r["status"] = "completed"
+            r["viewing_completed_at"] = stamp
+            r["updated_at"] = stamp
+    logger.info(f"[viewing_requests] Auto-completed {len(overdue_ids)} overdue confirmed viewing(s)")
+    return len(overdue_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,10 +242,15 @@ async def get_landlord_viewing_requests(
             return query.order("created_at", desc=True).execute()
 
         response = await run_db_async(_run_query)
+        rows = response.data or []
+
+        # Expire confirmed viewings whose appointment time has passed (lazy
+        # auto-complete — keeps stale "confirmed" viewings from piling up in the DB).
+        await _auto_complete_overdue_viewings(rows)
 
         # Batch fetch all unique property IDs and tenant IDs to avoid N+1 queries
-        property_ids = list({req["property_id"] for req in response.data if req.get("property_id")})
-        tenant_ids = list({req["tenant_id"] for req in response.data if req.get("tenant_id")})
+        property_ids = list({req["property_id"] for req in rows if req.get("property_id")})
+        tenant_ids = list({req["tenant_id"] for req in rows if req.get("tenant_id")})
 
         # Fetch all properties in one query
         properties_map = {}
@@ -192,7 +277,7 @@ async def get_landlord_viewing_requests(
                 logger.warning(f"Could not fetch tenants: {tenants_error}")
 
         viewing_requests = []
-        for req in response.data:
+        for req in rows:
             try:
                 viewing_requests.append({
                     "id": req["id"],
@@ -240,22 +325,51 @@ async def get_viewing_requests(
         query = supabase_admin.table("viewing_requests").select("*").eq("tenant_id", tenant_id)
         if status_filter:
             query = query.eq("status", status_filter)
-        response = query.order("created_at", desc=True).execute()
+        response = _run_with_retry(
+            query.order("created_at", desc=True).execute,
+            label="list viewing_requests",
+        )
+
+        rows = response.data or []
+
+        # Expire confirmed viewings whose appointment time has passed (lazy
+        # auto-complete — keeps stale "confirmed" viewings from piling up in the DB).
+        await _auto_complete_overdue_viewings(rows)
+
+        # Batch-load related properties + landlords — 3 queries total instead of
+        # the old 1 + 2N per-request loop. This endpoint is polled by the tenant
+        # PropFlow chat every ~15s, so the N+1 made each poll tick take several
+        # seconds and delayed live card updates.
+        property_ids = sorted({r["property_id"] for r in rows if r.get("property_id")})
+        properties_by_id: dict = {}
+        landlords_by_id: dict = {}
+        if property_ids:
+            prop_response = _run_with_retry(
+                lambda: supabase_admin.table("properties").select("*").in_("id", property_ids).execute(),
+                label="batch properties for viewing_requests",
+            )
+            properties_by_id = {p["id"]: p for p in (prop_response.data or [])}
+
+            landlord_ids = sorted({
+                p["landlord_id"] for p in properties_by_id.values() if p.get("landlord_id")
+            })
+            if landlord_ids:
+                landlord_response = _run_with_retry(
+                    lambda: supabase_admin.table("users").select(
+                        "id, full_name, avatar_url, phone_number, email"
+                    ).in_("id", landlord_ids).execute(),
+                    label="batch landlords for viewing_requests",
+                )
+                landlords_by_id = {u["id"]: u for u in (landlord_response.data or [])}
 
         viewing_requests = []
-        for req in response.data:
+        for req in rows:
             try:
-                property_response = supabase_admin.table("properties").select("*").eq(
-                    "id", req["property_id"]
-                ).execute()
-                property_data = property_response.data[0] if property_response.data else None
+                property_data = properties_by_id.get(req["property_id"])
 
                 landlord_data = None
                 if property_data and property_data.get("landlord_id"):
-                    landlord_response = supabase_admin.table("users").select(
-                        "id, full_name, avatar_url, phone_number, email"
-                    ).eq("id", property_data["landlord_id"]).execute()
-                    landlord_data = landlord_response.data[0] if landlord_response.data else None
+                    landlord_data = landlords_by_id.get(property_data["landlord_id"])
 
                 viewing_requests.append({
                     "id": req["id"],

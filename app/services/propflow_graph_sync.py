@@ -113,7 +113,15 @@ async def advance_after_sign(agreement_id: str, supabase_admin) -> None:
 
     try:
         config = _thread_config(thread_id)
-        await graph.aupdate_state(config, {"agreement_status": "SIGNED"})
+        # as_node="create_agreement" is critical: without it, aupdate_state
+        # consumes the pending interrupt and ainvoke(None) becomes a no-op.
+        # Forking from create_agreement re-establishes the pending task at
+        # the provision_nomba_dva interrupt so ainvoke actually executes it.
+        await graph.aupdate_state(
+            config,
+            {"agreement_status": "SIGNED"},
+            as_node="create_agreement",
+        )
         result = await graph.ainvoke(None, config=config)
         logger.info(
             "[GRAPH SYNC] advanced %s after sign → stage=%s",
@@ -121,6 +129,54 @@ async def advance_after_sign(agreement_id: str, supabase_admin) -> None:
         )
     except Exception as exc:
         logger.warning("[GRAPH SYNC] advance_after_sign failed for %s: %s", agreement_id, exc)
+
+
+async def sync_stage_after_tenant_sign(agreement_id: str, supabase_admin) -> None:
+    """After the TENANT signs (via the agreement page, not the chat), flip the
+    thread stage to ``awaiting_landlord_signature`` so the PropFlow chat and
+    status endpoints reflect reality immediately.
+
+    The graph stays paused at the signing gate — it only resumes once BOTH
+    parties have signed (see ``advance_after_sign``). Best-effort.
+    """
+    thread_id = await resolve_thread_id(agreement_id, supabase_admin)
+    if not thread_id:
+        return
+
+    graph, stage = await _read_thread(thread_id)
+    if graph is None:
+        return
+
+    if stage != "agreement_drafted":
+        logger.info(
+            "[GRAPH SYNC] tenant-sign stage sync skipped (stage=%r, expected "
+            "'agreement_drafted') for %s",
+            stage, agreement_id,
+        )
+        return
+
+    try:
+        # as_node="create_agreement" is required: the thread is paused at the
+        # signing interrupt owned by create_agreement.  Calling aupdate_state
+        # without as_node would consume the interrupt, making the later
+        # advance_after_sign's ainvoke(None) a silent no-op.
+        await graph.aupdate_state(
+            _thread_config(thread_id),
+            {
+                "current_stage": "awaiting_landlord_signature",
+                "agreement_status": "PENDING_LANDLORD",
+            },
+            as_node="create_agreement",
+        )
+        logger.info(
+            "[GRAPH SYNC] tenant sign synced for %s → awaiting_landlord_signature",
+            thread_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[GRAPH SYNC] sync_stage_after_tenant_sign failed for %s: %s",
+            agreement_id, exc,
+        )
 
 
 async def sync_after_payment(agreement_id: str, amount, supabase_admin) -> None:
@@ -132,9 +188,23 @@ async def sync_after_payment(agreement_id: str, amount, supabase_admin) -> None:
     thread_id = await resolve_thread_id(agreement_id, supabase_admin)
     if not thread_id:
         return
+
+    graph, stage = await _read_thread(thread_id)
+    if graph is None:
+        return
+
+    # Guard: never regress a thread that has already progressed past
+    # payment_confirmed.  Without this, a late/duplicate payment callback
+    # would overwrite disbursement_complete → payment_confirmed, breaking
+    # the frontend stage card and any resume logic.
+    if stage == "disbursement_complete":
+        logger.info(
+            "[GRAPH SYNC] sync_after_payment skipped (stage=%r already past payment) for %s",
+            stage, agreement_id,
+        )
+        return
+
     try:
-        from app.propflow.graph import propflow_graph
-        graph = propflow_graph()
         await graph.aupdate_state(_thread_config(thread_id), {
             "reconciliation_status": "FULL_PAYMENT",
             "total_received_amount": float(amount or 0),

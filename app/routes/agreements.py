@@ -26,6 +26,7 @@ BUGS FIXED vs original:
 """
 import logging
 import asyncio
+import hashlib
 import re
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
 from app.database import supabase_admin, run_db_async
@@ -41,7 +42,7 @@ from io import BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageTemplate, Frame
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageTemplate, Frame, HRFlowable
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
@@ -711,6 +712,20 @@ async def sign_agreement(
                 logger.warning(
                     f"[AGREEMENTS] PropFlow graph advance failed (non-fatal): {graph_err}"
                 )
+        # ── PropFlow graph sync: tenant signed first (via the agreement page,
+        #     not the chat) → flip the thread stage to awaiting_landlord_signature
+        #     so the PropFlow chat/status reflect the real state immediately.
+        elif (
+            user_type == "tenant"
+            and str(agreement.get("status", "")).upper() == "PENDING_LANDLORD"
+        ):
+            try:
+                from app.services.propflow_graph_sync import sync_stage_after_tenant_sign
+                await sync_stage_after_tenant_sign(agreement_id, supabase_admin)
+            except Exception as graph_err:
+                logger.warning(
+                    f"[AGREEMENTS] PropFlow tenant-sign stage sync failed (non-fatal): {graph_err}"
+                )
 
         enriched = _enrich(agreement)
 
@@ -784,6 +799,273 @@ async def sign_agreement(
             detail=f"Failed to sign agreement: {str(e)}"
         )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REGENERATE AGREEMENT TERMS (fix stale pricing after payment-model changes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{agreement_id}/regenerate")
+async def regenerate_agreement_terms(
+    agreement_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Regenerate the agreement terms text using the CURRENT pricing model
+    (property payment_frequency, waived deposit/fees).
+
+    WHY THIS ROUTE EXISTS:
+    Agreements generated before the payment-integration pricing changes still
+    carry the old "annual upfront + 2-month deposit" terms. This endpoint lets
+    a party refresh the terms in place WITHOUT creating a new agreement row.
+
+    Guards:
+      - Only the tenant or landlord on this agreement may call it.
+      - Refuses if EITHER party has already signed (terms are frozen once
+        signing starts, since a signature binds the signed text).
+    """
+    try:
+        user_id = current_user["id"]
+        user_type = current_user["user_type"]
+
+        response = await run_db_async(
+            lambda: supabase_admin.table("agreements").select("*").eq("id", agreement_id).execute()
+        )
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agreement not found"
+            )
+
+        agreement = response.data[0]
+
+        # Access control — only a party to this agreement
+        if agreement["tenant_id"] != user_id and agreement["landlord_id"] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to regenerate this agreement"
+            )
+
+        # Freeze once signing has started — a signature binds the signed text
+        if agreement.get("tenant_signed_at") or agreement.get("landlord_signed_at"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot regenerate terms after signing has started"
+            )
+
+        # ── Fetch property + tenant + landlord for generation context ────────
+        prop_resp = await run_db_async(
+            lambda: supabase_admin.table("properties").select("*").eq("id", agreement["property_id"]).execute()
+        )
+        if not prop_resp.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Property not found for this agreement"
+            )
+        property_data = prop_resp.data[0]
+
+        tenant_resp = await run_db_async(
+            lambda: supabase_admin.table("users").select("*").eq("id", agreement["tenant_id"]).execute()
+        )
+        tenant_data = (tenant_resp.data or [{}])[0]
+
+        landlord_resp = await run_db_async(
+            lambda: supabase_admin.table("users").select("*").eq("id", agreement["landlord_id"]).execute()
+        )
+        landlord_data = (landlord_resp.data or [{}])[0]
+        landlord_name = landlord_data.get("full_name", "Landlord")
+
+
+        # ── Regenerate terms (deterministic template) ────────────────────────
+        from app.services.agreement_service import AgreementService
+
+        lease_dates = {
+            "lease_start_date": agreement.get("lease_start_date"),
+            "lease_end_date": agreement.get("lease_end_date"),
+            "lease_duration": agreement.get("lease_duration", 12),
+        }
+
+        terms_result = await AgreementService.generate_enhanced_agreement_terms(
+            property_data=property_data,
+            tenant_data=tenant_data,
+            landlord_name=landlord_name,
+            lease_dates=lease_dates,
+            application={"id": agreement.get("application_id")},
+            landlord_email=landlord_data.get("email"),
+            landlord_phone=landlord_data.get("phone_number"),
+        )
+
+        # ── Persist the refreshed terms ──────────────────────────────────────
+        metadata = terms_result["metadata"]
+        metadata["regenerated_at"] = datetime.now().isoformat()
+        metadata["regenerated_by"] = user_id
+
+        # Keep the DB row consistent with the regenerated text: deposit is
+        # resolved from platform policy (same helper the template uses).
+        deposit_amount = AgreementService.resolve_security_deposit(
+            property_data.get("price", 0)
+        )[0]
+
+        update_resp = await run_db_async(
+            lambda: supabase_admin.table("agreements").update({
+                "terms": terms_result["terms"],
+                "agreement_source": terms_result["source"],
+                "generation_metadata": metadata,
+                "payment_frequency": property_data.get("payment_frequency", "MONTHLY"),
+                "deposit_amount": deposit_amount,
+                "updated_at": datetime.now().isoformat(),
+            }).eq("id", agreement_id).execute()
+        )
+
+        if not update_resp.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save regenerated terms"
+            )
+
+        # ── Invalidate the cached tenant brief so it reflects the new terms ──
+        _TENANT_BRIEF_CACHE.pop(agreement_id, None)
+
+        logger.info(
+            f"✅ [AGREEMENTS] Terms regenerated for agreement {agreement_id} "
+            f"(source: {terms_result['source']}, by {user_type} {user_id})"
+        )
+
+        return {
+            "success": True,
+            "agreement": _enrich(update_resp.data[0]),
+            "source": terms_result["source"],
+            "message": "Agreement terms regenerated with current pricing"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [AGREEMENTS] Failed to regenerate agreement {agreement_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to regenerate agreement: {str(e)}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TENANT AGREEMENT BRIEF (Qwen AI plain-English summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory cache: agreement_id -> (terms_hash, brief_text, generated_at).
+# The brief is derived from the agreement terms, so the cache entry is only
+# valid while the terms are unchanged. Keying on a hash of the terms means
+# ANY terms change (regeneration endpoint or direct DB patch) automatically
+# invalidates the brief without needing an explicit pop. Keeps repeat page
+# loads instant and avoids re-billing Qwen.
+_TENANT_BRIEF_CACHE: dict[str, tuple[str, str, datetime]] = {}
+_TENANT_BRIEF_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
+
+def _terms_hash(terms: str) -> str:
+    return hashlib.sha256((terms or "").encode("utf-8")).hexdigest()
+
+
+@router.get("/{agreement_id}/tenant-brief")
+async def get_tenant_brief(
+    agreement_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate (or return cached) plain-English AI brief of the agreement for the
+    tenant, so they understand the key clauses BEFORE signing.
+
+    Tenant-only. Powered by Qwen via the PropFlow qwen_client, with a
+    deterministic fallback when the LLM is unavailable. Cached in-memory for
+    24h per agreement.
+    """
+    try:
+        user_id = current_user["id"]
+        user_type = current_user["user_type"]
+
+        if user_type != "tenant":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only tenants can request an agreement brief"
+            )
+
+        response = await run_db_async(
+            lambda: supabase_admin.table("agreements").select("*").eq("id", agreement_id).execute()
+        )
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agreement not found"
+            )
+
+        agreement = response.data[0]
+
+        # Access control — only the tenant on this agreement
+        if agreement["tenant_id"] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to view this agreement"
+            )
+
+        # ── Serve from cache when fresh AND terms unchanged ──────────────────
+        current_hash = _terms_hash(agreement.get("terms", ""))
+        cached = _TENANT_BRIEF_CACHE.get(agreement_id)
+        if cached:
+            cached_hash, brief_text, generated_at = cached
+            age = (datetime.utcnow() - generated_at).total_seconds()
+            if cached_hash == current_hash and age < _TENANT_BRIEF_TTL_SECONDS:
+                return {
+                    "success": True,
+                    "brief": brief_text,
+                    "cached": True,
+                    "agreement_id": agreement_id,
+                }
+
+        # ── Fetch property for context (title + payment frequency) ───────────
+        property_title = None
+        payment_frequency = None
+        try:
+            prop_resp = await run_db_async(
+                lambda: supabase_admin.table("properties").select(
+                    "title, payment_frequency"
+                ).eq("id", agreement["property_id"]).execute()
+            )
+            if prop_resp.data:
+                property_title = prop_resp.data[0].get("title")
+                payment_frequency = prop_resp.data[0].get("payment_frequency")
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] tenant-brief: property lookup failed: {e}")
+
+        # ── Generate via Qwen (falls back to mock internally) ────────────────
+        from app.propflow.services.qwen_client import qwen_client
+
+        brief_text = await qwen_client.generate_tenant_agreement_brief(
+            agreement_terms=agreement.get("terms", ""),
+            property_title=property_title,
+            rent_amount=agreement.get("rent_amount"),
+            lease_duration_months=agreement.get("lease_duration"),
+            payment_frequency=payment_frequency,
+        )
+
+        _TENANT_BRIEF_CACHE[agreement_id] = (current_hash, brief_text, datetime.utcnow())
+
+        logger.info(f"✅ [AGREEMENTS] Tenant brief generated for agreement {agreement_id}")
+        return {
+            "success": True,
+            "brief": brief_text,
+            "cached": False,
+            "agreement_id": agreement_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [AGREEMENTS] Failed to generate tenant brief for {agreement_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate agreement brief: {str(e)}"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERATE PDF
@@ -795,10 +1077,14 @@ async def generate_pdf(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Generate professional PDF version of a fully signed agreement.
-    Both tenant and landlord must have signed before PDF generation is allowed.
-    Uses ReportLab to generate formatted PDF, uploads to Supabase Storage.
-    Returns public download URL.
+    Generate a professional PDF of the signed agreement document.
+
+    Only available once BOTH parties have signed — the PDF is the executed
+    legal document, so it must not be generated (or mistaken for) an unsigned
+    draft. Both parties can download it after execution.
+
+    Uses ReportLab to generate the formatted PDF and uploads it to Supabase
+    Storage. Returns the public download URL.
     """
     try:
         user_id = current_user["id"]
@@ -821,10 +1107,11 @@ async def generate_pdf(
                 detail="Not authorized to access this agreement"
             )
 
-        if agreement["status"] != "SIGNED":
+        # Guard: the PDF is the executed document — both signatures required.
+        if not agreement.get("tenant_signed_at") or not agreement.get("landlord_signed_at"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Agreement must be fully signed before generating PDF"
+                detail="The agreement PDF can only be generated after both parties have signed."
             )
 
         pdf_url = _generate_agreement_pdf(agreement)
@@ -937,6 +1224,17 @@ def generate_agreement_terms(property_data: dict, agreement_data: dict) -> str:
     security_deposit = 0  # MVP: Caution fee set to 0 for transparency
     platform_fee = 0  # MVP: Platform fee set to 0% for transparency
 
+    # Frequency-based period rent (matches nomba_helpers.FREQUENCY_MULTIPLIERS)
+    _freq_mult = {"MONTHLY": 1, "QUARTERLY": 3, "SEMI_ANNUAL": 6, "ANNUAL": 12}
+    _freq = str(property_data.get("payment_frequency") or "MONTHLY").upper()
+    _period_rent = monthly_rent * _freq_mult.get(_freq, 1)
+    _freq_schedule = {
+        "MONTHLY": "monthly in advance",
+        "QUARTERLY": "quarterly (every 3 months) in advance",
+        "SEMI_ANNUAL": "semi-annually (every 6 months) in advance",
+        "ANNUAL": "annually (every 12 months) in advance",
+    }.get(_freq, "monthly in advance")
+
     return f"""
 RESIDENTIAL LEASE AGREEMENT
 
@@ -944,8 +1242,9 @@ PROPERTY DETAILS:
 Address: {property_data.get('full_address', property_data.get('address', 'N/A'))}
 City: {property_data.get('city', 'N/A')}, {property_data.get('state', 'N/A')}
 Monthly Rent: \u20a6{monthly_rent:,}
-Security Deposit (Caution Fee): \u20a6{security_deposit:,}
-Platform Fee: \u20a6{platform_fee:,}
+Period Rent ({_freq}): \u20a6{_period_rent:,}
+Security Deposit (Caution Fee): \u20a6{security_deposit:,} (waived)
+Platform Fee: \u20a6{platform_fee:,} (waived)
 
 LEASE TERMS:
 Duration: {agreement_data.get('lease_duration', 12)} months
@@ -953,9 +1252,9 @@ Start Date: {agreement_data.get('lease_start_date', 'N/A')}
 End Date: {agreement_data.get('lease_end_date', 'N/A')}
 
 TERMS AND CONDITIONS:
-1. Rent is due annually in advance, on or before the lease start date.
-2. Security deposit (caution fee) will be returned within 30 days of lease end, less any deductions for damages beyond normal wear and tear.
-3. Platform fee is non-refundable and covers NuloAfrica transaction processing.
+1. Rent is due {_freq_schedule}, on or before the commencement date of each payment period.
+2. The security deposit (caution fee) is waived (\u20a60) for this tenancy under NuloAfrica's MVP policy.
+3. The platform fee is waived (\u20a60) for this tenancy.
 4. All payments are processed through the NuloAfrica platform escrow system.
 5. Tenant must keep the property in good and tenantable repair throughout the lease.
 6. No subletting permitted without written consent from the landlord.
@@ -1065,6 +1364,85 @@ def _draw_header_footer(canvas_obj: "canvas.Canvas", agreement: dict) -> None:
     page_num = canvas_obj.getPageNumber()
     canvas_obj.drawRightString(page_w - RIGHT_MARGIN, 0.50 * inch,
                                f"Page {page_num}")
+
+
+def _md_inline_to_rl(text: str) -> str:
+    """
+    Convert inline Markdown (bold / italic) to ReportLab paragraph markup and
+    escape any raw HTML so user-supplied text can never inject tags.
+    """
+    import html as _html
+    t = _html.escape(text or "", quote=False)
+    # Bold: **text** or __text__
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"__(.+?)__", r"<b>\1</b>", t)
+    # Italic: *text* or _text_ (after bold so ** is not double-matched)
+    t = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", t)
+    return t
+
+
+def _markdown_terms_to_flowables(terms: str, styles) -> list:
+    """
+    Render the deterministic Markdown agreement terms as ReportLab flowables
+    so the downloadable PDF contains the FULL legal document (not a summary).
+
+    Supports the subset of Markdown the deterministic template emits:
+    # / ## headings, **bold**, *italic*, bullet lists (-), numbered clauses,
+    horizontal rules (---) and plain paragraphs.
+    """
+    h1 = ParagraphStyle(
+        "TermsH1", parent=styles["Heading1"], fontSize=15, leading=18,
+        textColor=BRAND_ORANGE_DARK, fontName="Helvetica-Bold",
+        alignment=TA_CENTER, spaceBefore=4, spaceAfter=10,
+    )
+    h2 = ParagraphStyle(
+        "TermsH2", parent=styles["Heading2"], fontSize=11, leading=14,
+        textColor=BRAND_SLATE, fontName="Helvetica-Bold",
+        spaceBefore=12, spaceAfter=4,
+    )
+    body = ParagraphStyle(
+        "TermsBody", parent=styles["BodyText"], fontSize=9.5, leading=13,
+        textColor=colors.HexColor("#1E293B"), alignment=TA_JUSTIFY,
+        spaceAfter=5,
+    )
+    bullet = ParagraphStyle(
+        "TermsBullet", parent=body, leftIndent=16, bulletIndent=6, spaceAfter=3,
+    )
+    italic = ParagraphStyle(
+        "TermsItalic", parent=body, fontName="Helvetica-Oblique",
+        textColor=BRAND_SLATE_LIGHT, fontSize=8.5, leading=11,
+    )
+
+    elements = []
+    for raw_line in (terms or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("---"):
+            elements.append(Spacer(1, 4))
+            elements.append(HRFlowable(
+                width="100%", thickness=0.6, color=BRAND_SLATE_LIGHT,
+                spaceBefore=2, spaceAfter=6,
+            ))
+            continue
+        if stripped.startswith("# "):
+            elements.append(Paragraph(_md_inline_to_rl(stripped[2:]), h1))
+            continue
+        if stripped.startswith("## "):
+            elements.append(Paragraph(_md_inline_to_rl(stripped[3:]), h2))
+            continue
+        if stripped.startswith("- "):
+            elements.append(Paragraph(
+                _md_inline_to_rl(stripped[2:]), bullet, bulletText="\u2022"
+            ))
+            continue
+        if stripped.startswith("*") and stripped.endswith("*") and not stripped.startswith("**"):
+            # Standalone italic footer line from the template
+            elements.append(Paragraph(_md_inline_to_rl(stripped.strip("*")), italic))
+            continue
+        elements.append(Paragraph(_md_inline_to_rl(stripped), body))
+    return elements
 
 
 def _generate_agreement_pdf(agreement: dict) -> str:
@@ -1185,6 +1563,18 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         # Reference block — Agreement ID + generated date in a tidy 2-col
         # table so the reference is scannable and looks like a real
         # letterhead reference block (rather than loose body text).
+        # Status reflects the ACTUAL signature state so a pre-signature
+        # review copy never claims to be fully executed.
+        _both_signed = bool(
+            agreement.get("tenant_signed_at") and agreement.get("landlord_signed_at")
+        )
+        if _both_signed:
+            _status_label, _status_color = "FULLY EXECUTED", "#16A34A"
+        elif agreement.get("tenant_signed_at") or agreement.get("landlord_signed_at"):
+            _status_label, _status_color = "PARTIALLY SIGNED", "#D97706"
+        else:
+            _status_label, _status_color = "AWAITING SIGNATURES", "#F97316"
+
         ref_table = Table(
             [[
                 Paragraph(
@@ -1199,7 +1589,7 @@ def _generate_agreement_pdf(agreement: dict) -> str:
                 ),
                 Paragraph(
                     f"<b>Status</b><br/>"
-                    f"<font size=8 color='#F97316'><b>FULLY EXECUTED</b></font>",
+                    f"<font size=8 color='{_status_color}'><b>{_status_label}</b></font>",
                     body_style,
                 ),
             ]],
@@ -1271,7 +1661,22 @@ def _generate_agreement_pdf(agreement: dict) -> str:
         elements.append(Paragraph(f"<b>Security Deposit:</b> ₦{deposit:,}", body_style))
         elements.append(Paragraph(f"<b>Platform Fee:</b> ₦{platform_fee:,}", body_style))
         elements.append(Spacer(1, 0.15 * inch))
-        
+
+        # ── FULL LEGAL TERMS ─────────────────────────────────────────────────
+        # The complete deterministic agreement text (Markdown) rendered as
+        # formatted flowables, so the downloadable PDF is the actual lease
+        # document — not just a summary. Falls back to the summary-only
+        # layout if the terms column is empty.
+        terms_text = (agreement.get("terms") or "").strip()
+        if terms_text:
+            elements.append(Paragraph("FULL TERMS AND CONDITIONS", heading_style))
+            elements.append(HRFlowable(
+                width="100%", thickness=0.8, color=BRAND_ORANGE,
+                spaceBefore=0, spaceAfter=8,
+            ))
+            elements.extend(_markdown_terms_to_flowables(terms_text, styles))
+            elements.append(Spacer(1, 0.2 * inch))
+
         # Signature Status
         elements.append(Paragraph("SIGNATURE STATUS", heading_style))
         
@@ -1330,8 +1735,17 @@ def _generate_agreement_pdf(agreement: dict) -> str:
             "<hr/>",
             body_style
         ))
+        _closing_note = (
+            "This is a digitally generated agreement. Both parties have electronically signed "
+            "this document via NuloAfrica's secure signing system. The signature timestamps and "
+            "IP addresses are recorded for audit purposes."
+            if _both_signed else
+            "This is a digitally generated agreement document. It becomes binding only once both "
+            "parties have electronically signed it via NuloAfrica's secure signing system. "
+            "Signature timestamps and IP addresses are recorded for audit purposes."
+        )
         elements.append(Paragraph(
-            "This is a digitally generated agreement. Both parties have electronically signed this document via NuloAfrica's secure signing system. The signature timestamps and IP addresses are recorded for audit purposes.",
+            _closing_note,
             ParagraphStyle(
                 'Footer',
                 parent=styles['BodyText'],

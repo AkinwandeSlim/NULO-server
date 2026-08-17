@@ -1029,7 +1029,7 @@ async def _handle_payout_event(
         None,
         lambda: supabase_admin
             .table("transactions")
-            .select("id, status")
+            .select("id, status, agreement_id")
             .eq("nomba_transfer_ref", merchant_tx_ref)
             .maybe_single()  # Fixed: use maybe_single() instead of single()
             .execute(),
@@ -1061,3 +1061,22 @@ async def _handle_payout_event(
         "Payout event processed | ref=%s | event=%s | new_status=%s",
         merchant_tx_ref, event_type, new_status,
     )
+
+    # Keep the PropFlow thread in sync when the payout finally settles. The
+    # disburse endpoint may have returned PENDING (Nomba still processing), in
+    # which case the graph was never advanced to disbursement_complete — this
+    # webhook is the moment it must happen. Best-effort: the transactions row
+    # above is the source of truth; a sync failure must not fail the webhook.
+    if event_type == "payout_success" and current.get("agreement_id"):
+        try:
+            from app.services.propflow_graph_sync import sync_after_release
+            await sync_after_release(str(current["agreement_id"]), supabase_admin)
+            logger.info(
+                "Payout event synced PropFlow thread | agreement=%s | ref=%s",
+                current["agreement_id"], merchant_tx_ref,
+            )
+        except Exception as sync_err:
+            logger.warning(
+                "Payout event PropFlow sync failed (non-fatal) | ref=%s | err=%s",
+                merchant_tx_ref, sync_err,
+            )

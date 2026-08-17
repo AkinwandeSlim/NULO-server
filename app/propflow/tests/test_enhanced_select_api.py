@@ -21,6 +21,7 @@ def test_protected_select_stages_defined():
     assert "agreement_drafted" in PROTECTED_SELECT_STAGES
     assert "awaiting_landlord_signature" in PROTECTED_SELECT_STAGES
     assert "nomba_provisioned" in PROTECTED_SELECT_STAGES
+    assert "payment_confirmed" in PROTECTED_SELECT_STAGES
     assert "awaiting_full_payment" in PROTECTED_SELECT_STAGES
     assert "disbursement_complete" in PROTECTED_SELECT_STAGES
     assert "rejected" in PROTECTED_SELECT_STAGES

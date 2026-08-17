@@ -237,10 +237,24 @@ async def match_properties_node(state: PropFlowState) -> PropFlowState:
             location = alias
 
     bedrooms: Optional[int] = intent.get("bedrooms")
-    budget_monthly: Optional[float] = (
-        intent.get("budget_monthly")
-        or (intent.get("budget_annual", 0) / 12 if intent.get("budget_annual") else None)
-    )
+    # Resolve the tenant's budget to a MONTHLY figure for comparison. Properties
+    # store their own `payment_frequency` (MONTHLY/ANNUAL/QUARTERLY/SEMI_ANNUAL),
+    # so the price-proximity scorer normalises each listing's price to monthly
+    # too — comparing an annual tenant budget against a monthly listing price
+    # (or vice versa) would otherwise be off by up to 12x.
+    budget_monthly_raw: Optional[float] = intent.get("budget_monthly")
+    if budget_monthly_raw is not None:
+        budget_monthly: Optional[float] = float(budget_monthly_raw)
+    elif intent.get("budget_annual"):
+        budget_monthly = float(intent["budget_annual"]) / 12.0
+    else:
+        budget_monthly = None
+    # When the tenant stated a budget but Qwen left payment_frequency null
+    # (older extractions), infer it from whichever field is populated so the
+    # scoring/scaling downstream treats the budget consistently.
+    _intent_payment_frequency = intent.get("payment_frequency")
+    if budget_monthly is not None and not _intent_payment_frequency:
+        intent = {**intent, "payment_frequency": "ANNUAL" if intent.get("budget_annual") and not intent.get("budget_monthly") else "MONTHLY"}
 
     logger.info(
         f"[match_properties] searching: location={location} "
@@ -466,10 +480,23 @@ async def _query_properties(
             else:
                 s -= 20 * (b_diff - 1)   # penalty per extra bedroom beyond 1-off
 
-        # Price proximity
+        # Price proximity — compare in a COMMON unit (monthly). Listing `price`
+        # is stored against the listing's own `payment_frequency`, so convert it
+        # to a monthly-equivalent before comparing to `budget_monthly`. Without
+        # this, an annual listing price (e.g. ₦3,000,000/yr) vs a monthly budget
+        # (e.g. ₦250,000/mo) gives a wildly wrong ratio.
         p_price = p.get("price") or 0
+        p_freq = (p.get("payment_frequency") or "MONTHLY").upper()
         if budget_monthly is not None and p_price > 0:
-            ratio = p_price / budget_monthly
+            if p_freq == "ANNUAL":
+                p_price_monthly = p_price / 12.0
+            elif p_freq == "SEMI_ANNUAL":
+                p_price_monthly = p_price / 6.0
+            elif p_freq == "QUARTERLY":
+                p_price_monthly = p_price / 3.0
+            else:
+                p_price_monthly = p_price  # MONTHLY (default / unknown)
+            ratio = p_price_monthly / budget_monthly
             if ratio <= 1.0:
                 # Within budget — closer to max budget = better value for landlord
                 s += 50

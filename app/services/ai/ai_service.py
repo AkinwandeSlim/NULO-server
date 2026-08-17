@@ -1,26 +1,43 @@
-import os
-import json
 from datetime import datetime
 from typing import Dict, Any, Optional
-from groq import Groq
 from dotenv import load_dotenv
 import logging
+
+from app.services.ai.agreement_validator import enforce_financial_terms
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Approximate blended USD cost per 1M tokens, per provider. Used only for the
+# usage-stats/cost-tracking figures returned by the /api/v1/groq routes --
+# never for billing. Tune freely; unknown providers report $0.
+_COST_PER_MILLION_TOKENS: Dict[str, float] = {
+    "groq": 0.05,     # llama family (historical default)
+    "qwen": 0.40,     # qwen-plus blended in/out pricing
+    "openai": 0.60,   # gpt-4o-mini blended pricing
+    "mock": 0.0,
+}
+
+
 class AIService:
+    """
+    Tenancy-agreement generation service (Phase B -- configurable LLM layer).
+
+    No longer hard-wired to Groq: every LLM call is routed through the
+    provider plugin registry (``app.propflow.services.llm_provider``), so the
+    backing model is chosen by ``LLM_PROVIDER`` in server/.env
+    (qwen | groq | openai | mock). Switching models is a one-line .env change.
+
+    The provider is resolved lazily (never at import time), so importing this
+    module -- e.g. when FastAPI wires the /api/v1/groq routes -- can no longer
+    crash the app because an API key is missing. When the active provider is
+    unavailable, generation calls return ``{"success": False, ...}`` exactly
+    like a failed API call did before.
+    """
+
     def __init__(self):
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY not found in environment variables")
-        
-        self.client = Groq(api_key=api_key)
-        self.model = "llama-3.3-70b-versatile"  # Best for legal documents
-        
-        # Cost tracking (Groq: $0.05 per 1M tokens)
-        self.cost_per_million_tokens = 0.05
+        self._provider = None  # resolved lazily via _get_provider()
         self.usage_stats = {
             "total_requests": 0,
             "total_tokens": 0,
@@ -28,22 +45,122 @@ class AIService:
             "successful_generations": 0,
             "failed_generations": 0
         }
-        
-        logger.info(f"✅ Groq AI Service initialized with model: {self.model}")
+        logger.info(
+            "✅ AI Service initialized (provider resolved lazily via LLM_PROVIDER)"
+        )
+
+    # -- provider plumbing ----------------------------------------------------
+
+    def _get_provider(self):
+        """Return the active LLM provider from the plugin registry (lazy)."""
+        from app.propflow.services.llm_provider import get_llm_provider
+        self._provider = get_llm_provider()
+        return self._provider
+
+    @property
+    def provider_name(self) -> str:
+        """Name of the active provider (qwen | groq | openai | mock)."""
+        return self._get_provider().name
+
+    @property
+    def model(self) -> str:
+        """Primary model identifier of the active provider."""
+        return self._get_provider().model
+
+    @property
+    def cost_per_million_tokens(self) -> float:
+        """USD per 1M tokens for the active provider (stats only)."""
+        return _COST_PER_MILLION_TOKENS.get(self.provider_name, 0.0)
+
+    async def _complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float = 0.1,
+        top_p: float = 0.9,
+    ):
+        """
+        Run one chat completion through the active provider.
+
+        Returns ``(text, tokens_used)`` or raises ``RuntimeError`` when the
+        provider is unavailable or every model in its fallback chain failed --
+        callers already wrap this in try/except and report
+        ``{"success": False}``, matching the historical Groq error path.
+        """
+        provider = self._get_provider()
+        if not provider.available:
+            raise RuntimeError(
+                f"LLM provider '{provider.name}' is not configured "
+                f"(missing API key). Set the matching *_API_KEY in server/.env "
+                f"or switch LLM_PROVIDER."
+            )
+        result = await provider.chat(
+            system_prompt,
+            user_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        if result.text is None:
+            raise RuntimeError(
+                f"LLM provider '{provider.name}' returned no completion "
+                f"(model={provider.model})"
+            )
+        return result.text, result.tokens_used
 
     async def test_connection(self) -> bool:
-        """Test Groq AI connection"""
+        """Test the active LLM provider connection"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": "Say hello!"}],
-                max_tokens=20
+            text, _ = await self._complete(
+                "You are a helpful assistant.",
+                "Say hello!",
+                max_tokens=20,
             )
-            logger.info(f"✅ Groq Connected: {response.choices[0].message.content}")
+            logger.info(f"✅ LLM Connected ({self.provider_name}): {text}")
             return True
         except Exception as e:
             logger.error(f"❌ Connection Failed: {e}")
             return False
+
+    def _enforce_financial_terms(self, text: str, monthly_rent: int, frequency: str) -> dict:
+        """
+        Run the deterministic post-generation validation/repair layer on the
+        LLM output. Never raises: if the validator itself fails, the raw text
+        is kept and the error is recorded in the validation payload.
+        """
+        try:
+            result = enforce_financial_terms(text, monthly_rent, frequency)
+            if result["repaired"]:
+                logger.warning(
+                    "🔧 [VALIDATOR] Repaired hallucinated financial terms: "
+                    f"{'; '.join(result['repairs'])} | issues_before: "
+                    f"{[i['type'] for i in result['issues_before']]}"
+                )
+            return result
+        except Exception as e:
+            logger.error(f"❌ [VALIDATOR] Enforcement failed, keeping raw text: {e}")
+            return {
+                "text": text or "",
+                "valid_before": None,
+                "valid_after": None,
+                "repaired": False,
+                "issues_before": [],
+                "issues_after": [],
+                "repairs": [],
+                "expected": {},
+                "error": str(e),
+            }
+
+    # Frequency multipliers — must stay in sync with nomba_helpers.FREQUENCY_MULTIPLIERS
+    _FREQ_MULTIPLIERS = {"MONTHLY": 1, "QUARTERLY": 3, "SEMI_ANNUAL": 6, "ANNUAL": 12}
+    _FREQ_LABELS = {
+        "MONTHLY": "monthly in advance",
+        "QUARTERLY": "quarterly (every 3 months) in advance",
+        "SEMI_ANNUAL": "semi-annually (every 6 months) in advance",
+        "ANNUAL": "annually (every 12 months) in advance",
+    }
 
     async def generate_agreement(
         self,
@@ -52,12 +169,19 @@ class AIService:
         property_address: str,
         monthly_rent: int,
         lease_duration: str = "1 year",
-        property_type: str = "Apartment"
+        property_type: str = "Apartment",
+        payment_frequency: str = "MONTHLY"
     ) -> dict:
         """Generate Nigerian tenancy agreement with enhanced tracking"""
         
         # Update usage stats
         self.usage_stats["total_requests"] += 1
+        
+        # Compute frequency-based period rent (matches payment_service / nomba_helpers)
+        freq = (payment_frequency or "MONTHLY").upper()
+        multiplier = self._FREQ_MULTIPLIERS.get(freq, 1)
+        period_rent = monthly_rent * multiplier
+        freq_label = self._FREQ_LABELS.get(freq, "monthly in advance")
         
         # Enhanced prompt with more legal details
         prompt = f"""
@@ -96,13 +220,14 @@ class AIService:
         FINANCIAL TERMS:
         ================
         - Monthly Rent: ₦{monthly_rent:,}
-        - Annual Rent: ₦{monthly_rent * 12:,}
-        - Security Deposit: ₦0 (MVP: No caution fee for transparency)
-        - Platform Fee: ₦0 (MVP: No platform fee for transparency)
+        - Period Rent ({freq}): ₦{period_rent:,} — payable {freq_label}
+        - Security Deposit: ₦0 (waived — NuloAfrica MVP policy, no caution fee)
+        - Platform Fee: ₦0 (waived — NuloAfrica MVP policy)
+        - Service Charge: ₦0
         - Lease Duration: {lease_duration}
-        - Payment Structure: Annual upfront payment (Nigerian market standard)
-        - Payment Due: Commencement date
-        - Payment Method: Via NuloAfrica platform or bank transfer
+        - Payment Structure: Rent is paid {freq_label} via the NuloAfrica platform
+        - Payment Due: On or before the commencement date of each payment period
+        - Payment Method: Via NuloAfrica platform (virtual account transfer)
         
         LEGAL REQUIREMENTS:
         ===================
@@ -116,8 +241,8 @@ class AIService:
            - Parties identification with the ACTUAL NAMES provided above
            - Property description with the ACTUAL ADDRESS provided above
            - Lease term for exactly {lease_duration} months
-           - Rent amount exactly ₦{monthly_rent:,} per month, ₦{monthly_rent * 12:,} annually
-           - Security deposit exactly ₦{monthly_rent * 2:,}
+           - Rent amount exactly ₦{monthly_rent:,} per month, ₦{period_rent:,} per payment period ({freq})
+           - Security deposit: ₦0 (waived for this tenancy — do NOT include any deposit amount)
            - Utilities and service charge responsibilities
            - Maintenance and repair obligations (both parties)
            - Permitted use and specific restrictions
@@ -129,8 +254,8 @@ class AIService:
            - Force majeure and government compliance clauses
 
         3. NIGERIAN MARKET SPECIFICS:
-           - Annual rent payment of ₦{monthly_rent * 12:,} clearly stated
-           - 2-month security deposit of ₦{monthly_rent * 2:,} (refundable) standard
+           - Rent of ₦{period_rent:,} payable {freq_label}
+           - No security deposit / caution fee required (waived by platform policy)
            - Proper notice periods as per state laws
            - Rent review mechanisms (if applicable)
            - Utility payment responsibilities
@@ -156,7 +281,7 @@ class AIService:
         - Ensure all clauses are legally enforceable
         - Include practical examples where helpful
 
-        IMPORTANT: Use the real names "{landlord_name}" and "{tenant_name}" and real address "{property_address}" and real amounts ₦{monthly_rent:,} throughout the document. Do NOT use [Insert] placeholders.
+        IMPORTANT: Use the real names "{landlord_name}" and "{tenant_name}" and real address "{property_address}" and real amounts ₦{monthly_rent:,} per month (₦{period_rent:,} per payment period) throughout the document. Do NOT use [Insert] placeholders. Do NOT include any security deposit or caution fee clause — the deposit is waived (₦0) for this tenancy.
 
         Generate the complete, professional tenancy agreement now.
         """
@@ -165,23 +290,14 @@ class AIService:
             logger.info(f"📝 Generating agreement for: {tenant_name} → {landlord_name}")
             start_time = datetime.now()
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a senior Nigerian real estate lawyer. CRITICAL: Use ONLY the actual data provided in the prompt. NEVER use placeholders like [Insert Address] or [Insert Name]. All names, addresses, and amounts are real and must be used exactly as given. Generate ONLY the tenancy agreement document with no explanations or preambles. Start directly with 'TENANCY AGREEMENT'."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
+            agreement_text, tokens_used = await self._complete(
+                "You are a senior Nigerian real estate lawyer. CRITICAL: Use ONLY the actual data provided in the prompt. NEVER use placeholders like [Insert Address] or [Insert Name]. All names, addresses, and amounts are real and must be used exactly as given. Generate ONLY the tenancy agreement document with no explanations or preambles. Start directly with 'TENANCY AGREEMENT'.",
+                prompt,
                 max_tokens=2500,  # Increased for comprehensive agreements
                 temperature=0.1,  # Very low for maximum consistency
                 top_p=0.9,
-                stream=False
             )
 
-            agreement_text = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens
             generation_time = (datetime.now() - start_time).total_seconds()
             
             # Calculate cost
@@ -191,6 +307,12 @@ class AIService:
             self.usage_stats["total_tokens"] += tokens_used
             self.usage_stats["total_cost_usd"] += cost_usd
             self.usage_stats["successful_generations"] += 1
+
+            # Deterministic post-generation validation/repair of the financial
+            # terms (hallucinated deposits, wrong frequency wording, missing
+            # figures). The enforced text is what gets persisted downstream.
+            validation = self._enforce_financial_terms(agreement_text, monthly_rent, freq)
+            agreement_text = validation["text"]
 
             # Enhanced compliance checking
             compliance = self._check_compliance(agreement_text)
@@ -208,6 +330,14 @@ class AIService:
                 "compliance": compliance,
                 "compliance_score": compliance_score,
                 "summary": self._extract_summary(agreement_text, monthly_rent),
+                "validation": {
+                    "valid_before": validation["valid_before"],
+                    "valid_after": validation["valid_after"],
+                    "repaired": validation["repaired"],
+                    "issues_before": validation["issues_before"],
+                    "issues_after": validation["issues_after"],
+                    "repairs": validation["repairs"],
+                },
                 "usage_stats": self.get_usage_stats()
             }
 
@@ -230,6 +360,15 @@ class AIService:
         
         # Update usage stats
         self.usage_stats["total_requests"] += 1
+
+        # Frequency-based figures used by both the prompt and the validator
+        freq = str(property_data.get("payment_frequency") or "MONTHLY").upper()
+        if freq not in self._FREQ_MULTIPLIERS:
+            freq = "MONTHLY"
+        try:
+            monthly_rent = int(property_data.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            monthly_rent = 0
         
         # Build comprehensive prompt with full data
         prompt = f"""
@@ -268,11 +407,12 @@ class AIService:
         FINANCIAL TERMS:
         ================
         - Monthly Rent: ₦{property_data.get('price', 0):,}
-        - Annual Rent: ₦{property_data.get('price', 0) * 12:,}
-        - Security Deposit: ₦{property_data.get('security_deposit', property_data.get('price', 0) * 2):,}
+        - Period Rent ({(property_data.get('payment_frequency') or 'MONTHLY').upper()}): ₦{property_data.get('price', 0) * self._FREQ_MULTIPLIERS.get((property_data.get('payment_frequency') or 'MONTHLY').upper(), 1):,}
+        - Security Deposit: ₦0 (waived — NuloAfrica MVP policy, no caution fee)
+        - Platform Fee: ₦0 (waived)
         - Lease Duration: {tenant_data.get('preferred_lease_duration', '1 year')}
         - Move-in Date: {tenant_data.get('move_in_date', 'N/A')}
-        - Payment Structure: Annual upfront payment
+        - Payment Structure: Rent paid {(property_data.get('payment_frequency') or 'MONTHLY').lower()} in advance via NuloAfrica platform
         
         LEGAL & COMPLIANCE:
         ===================
@@ -291,22 +431,14 @@ class AIService:
             logger.info(f"📝 Generating advanced agreement for: {tenant_data.get('full_name', 'Unknown')}")
             start_time = datetime.now()
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a senior Nigerian real estate lawyer. Generate ONLY the tenancy agreement document with no explanations."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
+            agreement_text, tokens_used = await self._complete(
+                "You are a senior Nigerian real estate lawyer. Generate ONLY the tenancy agreement document with no explanations.",
+                prompt,
                 max_tokens=3000,  # Increased for comprehensive agreements
                 temperature=0.1,
-                top_p=0.9
+                top_p=0.9,
             )
 
-            agreement_text = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens
             generation_time = (datetime.now() - start_time).total_seconds()
             
             # Calculate cost
@@ -316,6 +448,12 @@ class AIService:
             self.usage_stats["total_tokens"] += tokens_used
             self.usage_stats["total_cost_usd"] += cost_usd
             self.usage_stats["successful_generations"] += 1
+
+            # Deterministic post-generation validation/repair of the financial
+            # terms (hallucinated deposits, wrong frequency wording, missing
+            # figures). The enforced text is what gets persisted downstream.
+            validation = self._enforce_financial_terms(agreement_text, monthly_rent, freq)
+            agreement_text = validation["text"]
 
             # Enhanced compliance checking
             compliance = self._check_compliance(agreement_text)
@@ -332,7 +470,15 @@ class AIService:
                 "cost_usd": cost_usd,
                 "compliance": compliance,
                 "compliance_score": compliance_score,
-                "summary": self._extract_summary(agreement_text, property_data.get('price', 0)),
+                "summary": self._extract_summary(agreement_text, monthly_rent),
+                "validation": {
+                    "valid_before": validation["valid_before"],
+                    "valid_after": validation["valid_after"],
+                    "repaired": validation["repaired"],
+                    "issues_before": validation["issues_before"],
+                    "issues_after": validation["issues_after"],
+                    "repairs": validation["repairs"],
+                },
                 "usage_stats": self.get_usage_stats(),
                 "metadata": {
                     "tenant_name": tenant_data.get('full_name'),
@@ -371,7 +517,7 @@ class AIService:
         return {
             "monthly_rent":    f"₦{monthly_rent:,}",
             "annual_rent":     f"₦{monthly_rent * 12:,}",
-            "security_deposit": f"₦{monthly_rent * 2:,}",
+            "security_deposit": "₦0 (waived)",
             "word_count":      len(text.split()),
             "character_count": len(text),
             "estimated_reading_time": f"{len(text.split()) // 200} minutes"  # Avg 200 words/min

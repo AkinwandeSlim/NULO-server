@@ -34,6 +34,18 @@ htmlcov/
 test_propflow_backend.py
 memory_saver_source.py
 
+# Local diagnostic / one-off scripts (never commit)
+scripts/backfill_deterministic_terms.py
+scripts/clean_property_addresses.py
+scripts/diag_payment_freq.py
+scripts/inspect_active_thread.py
+scripts/inspect_fixture_global.py
+scripts/inspect_fixture_phase.py
+scripts/inspect_maitama_budget.py
+scripts/patch_agreement_terms.py
+scripts/verify_validator_live.py
+verify_out.txt
+
 # ── Data files / generated outputs ───────────────────
 *.csv
 *.xlsx

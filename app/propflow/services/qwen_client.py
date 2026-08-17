@@ -1,18 +1,24 @@
 """
 PropFlow Qwen Client
-Real Qwen API integration via Alibaba Cloud DashScope (OpenAI-compatible endpoint).
+Real LLM integration via the configurable provider layer (Phase B).
 
-SDK used: openai>=1.0.0 pointed at the DashScope base URL.
-No separate qwen SDK needed -- the openai client handles it transparently.
+SDK used: openai>=1.0.0 pointed at the active provider's OpenAI-compatible
+base URL (DashScope for Qwen, api.groq.com for Groq, api.openai.com for
+OpenAI). No provider-specific SDK needed -- the openai client handles all of
+them transparently. See app/propflow/services/llm_provider.py.
 
 Three production use-cases:
   1. extract_intent       -- Nigerian Pidgin/English -> structured property JSON
   2. generate_briefing    -- Tenant profile -> 3-sentence landlord briefing
   3. generate_anomaly_sms -- Payment anomaly -> 160-char SMS for tenant
 
-Fallback chain:
-  QWEN_MODEL (qwen-plus) -> QWEN_FALLBACK_MODEL (qwen-turbo) -> mock
-  The mock is only reached in tests or when QWEN_API_KEY is unset.
+Provider selection (Phase B):
+  Set LLM_PROVIDER=qwen|groq|openai|mock in server/.env -- no code edits.
+  Default is "qwen" (Alibaba DashScope), preserving historical behaviour.
+
+Fallback chain (per provider):
+  primary model -> fallback model -> mock
+  The mock is only reached in tests or when the provider's API key is unset.
 """
 
 import json
@@ -55,9 +61,29 @@ Nigerian Pidgin translation guide:
   "VI" = Victoria Island, Lagos
   "GRA" = Government Reserved Area (a neighbourhood, NOT a city)
   "k" or "K" after number = thousands (e.g. "500k" = 500,000)
-  "m" or "M" after number = millions (e.g. "1.5m" = 1,500,000)
+  "m" or "M" after number = millions (e.g. "1.5m" = 1,500,000, "3M" = 3,000,000)
   "per month", "monthly" -> budget_monthly
-  "per year", "annually", "per annum" -> budget_annual
+  "per year", "annually", "per annum", "yearly" -> budget_annual
+
+  BUDGET UNIT ASSIGNMENT (CRITICAL — Nigerian default is ANNUAL rent):
+  Nigerian rent is almost always quoted and paid ANNUALLY. So when the tenant
+  gives a BARE amount with no "per month/year" qualifier, you MUST decide the unit
+  by the SIZE of the number, and set payment_frequency to match:
+    - >= 1,000,000 (e.g. "3M", "5 million", "1.2M naira") -> ANNUAL rent.
+        Set budget_annual = that number, budget_monthly = number / 12, payment_frequency = "ANNUAL".
+    - < 1,000,000 (e.g. "500k", "250k", "600 thousand") -> MONTHLY rent.
+        Set budget_monthly = that number, budget_annual = number * 12, payment_frequency = "MONTHLY".
+  EXAMPLE: "4 bedroom in Maitama Abuja budget of 3M naira" has NO "per month"
+    qualifier and 3,000,000 >= 1,000,000, so budget_annual = 3,000,000,
+    budget_monthly = 250,000, payment_frequency = "ANNUAL". The downstream matcher
+    treats price as MONTHLY, so it will use budget_monthly (250,000) to compare.
+  When the tenant explicitly says "per month"/"monthly", treat the number as
+    budget_monthly regardless of size, and set payment_frequency = "MONTHLY".
+  When the tenant explicitly says "per year"/"annual"/"annually", treat the
+    number as budget_annual regardless of size, and set payment_frequency = "ANNUAL".
+  Always fill BOTH budget_monthly and budget_annual (one from the other) AND
+    payment_frequency whenever a budget is stated. Never leave payment_frequency
+    null when a budget was given.
   If only monthly given, annual = monthly * 12. If only annual, monthly = annual / 12.
   "ASAP", "immediately" -> move_in_date = today's date
   "next month" -> move_in_date = first day of next month
@@ -109,6 +135,33 @@ Use plain language (no jargon). Format amounts as NGN with commas (e.g. NGN 50,0
 Return ONLY the SMS text -- nothing else.
 """
 
+_TENANT_AGREEMENT_BRIEF_PROMPT = """You are a friendly, plain-language Nigerian tenancy advisor.
+A tenant is about to sign a residential rental agreement and needs a short, honest "plain English"
+brief so they understand what they are signing BEFORE they sign.
+
+You will be given the full agreement text plus a few key facts. Produce a brief a normal person can
+read in under a minute. Use simple English (light Nigerian tone is fine), no legalese, no jargon.
+
+Structure your answer EXACTLY like this (keep these headings):
+WHAT YOU'RE RENTING: one line (property + lease length).
+WHAT YOU'LL PAY: rent amount, how often, and any upfront total (e.g. a year in advance). Mention
+deposits/fees only if they actually appear in the agreement.
+YOUR KEY RIGHTS: 2-3 short bullets drawn ONLY from the agreement (e.g. quiet enjoyment, repairs,
+notice period, how the tenancy can be ended).
+YOUR KEY RESPONSIBILITIES: 2-3 short bullets drawn ONLY from the agreement (e.g. pay rent on time,
+keep the property in good condition, no subletting without consent).
+WATCH OUT FOR: 1-3 short bullets on anything a tenant should double-check or that could catch them
+out (e.g. a strict notice clause, a penalty, an automatic renewal, who pays for repairs). If there is
+nothing unusual, write "Nothing unusual — but read the full agreement before signing."
+
+Rules:
+- Base EVERYTHING on the actual agreement text provided. Do NOT invent clauses, amounts, or dates.
+- If a fact is not in the agreement, do not mention it.
+- Keep the whole brief under ~180 words. Use "-" for bullet points. No markdown tables, no JSON.
+- End with one short line reminding them this is a helper summary and the signed agreement is what
+  legally binds them.
+"""
+
 _TENANT_REPLY_PROMPT = """You are PropFlow, a friendly Nigerian AI rental assistant chatting with a
 tenant in the NuloAfrica app. You have just searched for properties and need to present the results.
 
@@ -139,38 +192,23 @@ Rules:
 
 class QwenClient:
     """
-    Async client for Qwen API via DashScope OpenAI-compatible endpoint.
-    Uses the openai SDK (already in requirements.txt) with base_url override.
+    Async LLM client for PropFlow.
+
+    Phase B: this class no longer talks to DashScope directly. It delegates to
+    the configurable provider layer (``llm_provider.get_llm_provider()``), so
+    the backing model is chosen by ``LLM_PROVIDER`` in server/.env. The class
+    name, singleton (``qwen_client``) and all public methods are unchanged so
+    every existing caller and test keeps working.
     """
 
     def __init__(self):
         self._settings = propflow_settings
-        self._client = None      # Lazy-init to avoid crash on import if openai not installed
         self._fallback_used = False
 
-    def _get_openai_client(self):
-        """Lazy-init the openai AsyncOpenAI client."""
-        if self._client is None:
-            try:
-                from openai import AsyncOpenAI
-                import httpx
-                # QWEN_VERIFY_SSL defaults True (secure). Set false in local .env
-                # only if the dev machine's CA store rejects DashScope's cert
-                # chain (Python 3.14 / OpenSSL strict X.509). Production stays
-                # verified — mirrors the verify=False Supabase pattern.
-                http_client = httpx.AsyncClient(
-                    verify=self._settings.QWEN_VERIFY_SSL,
-                    timeout=60.0,
-                )
-                self._client = AsyncOpenAI(
-                    api_key=self._settings.QWEN_API_KEY or "placeholder",
-                    base_url=self._settings.QWEN_API_URL,
-                    http_client=http_client,
-                )
-            except ImportError:
-                logger.error("openai/httpx not installed. Run: pip install openai>=1.0.0 httpx")
-                return None
-        return self._client
+    def _get_provider(self):
+        """Return the active LLM provider from the plugin registry."""
+        from app.propflow.services.llm_provider import get_llm_provider
+        return get_llm_provider()
 
     async def _chat(
         self,
@@ -179,43 +217,25 @@ class QwenClient:
         max_tokens: Optional[int] = None,
     ) -> Optional[str]:
         """
-        Core chat completion call with automatic fallback to qwen-turbo.
-        Returns raw response text, or None on failure.
+        Core chat completion call, routed through the configurable provider.
+        The provider handles its own primary -> fallback model chain.
+        Returns raw response text, or None on failure (caller uses its mock).
         """
-        if not self._settings.QWEN_API_KEY:
-            logger.warning("QWEN_API_KEY not set -- returning mock response")
+        provider = self._get_provider()
+
+        if not provider.available:
+            logger.warning(
+                f"LLM provider '{provider.name}' unavailable -- returning mock response"
+            )
             return None
 
-        client = self._get_openai_client()
-        if client is None:
-            return None
-
-        models_to_try = [
-            self._settings.QWEN_MODEL,
-            self._settings.QWEN_FALLBACK_MODEL,
-        ]
-
-        for model in models_to_try:
-            try:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    temperature=self._settings.QWEN_TEMPERATURE,
-                    max_tokens=max_tokens or self._settings.QWEN_MAX_TOKENS,
-                )
-                content = response.choices[0].message.content
-                if model == self._settings.QWEN_FALLBACK_MODEL:
-                    logger.info(f"Used fallback model: {model}")
-                return content
-            except Exception as exc:
-                logger.warning(f"Qwen call failed with model={model}: {exc}")
-                continue
-
-        logger.error("All Qwen models failed -- falling back to mock")
-        return None
+        result = await provider.chat(
+            system_prompt,
+            user_message,
+            max_tokens=max_tokens,
+        )
+        self._fallback_used = bool(result.used_fallback)
+        return result.text
 
     # ── 1. Intent Extraction ──────────────────────────────────────────────────
 
@@ -487,6 +507,99 @@ class QwenClient:
             f"They are interested in the {property_data.get('title', 'listed property')} "
             f"and are ready to commence the lease upon approval. "
             f"Payment will be arranged via Nomba virtual account upon agreement signing."
+        )
+
+    # ── 2b. Tenant Agreement Brief (plain-English summary before signing) ────
+
+    async def generate_tenant_agreement_brief(
+        self,
+        agreement_terms: str,
+        property_title: Optional[str] = None,
+        rent_amount: Optional[float] = None,
+        lease_duration_months: Optional[int] = None,
+        payment_frequency: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a short plain-English brief of a tenancy agreement for the
+        tenant, so they understand the key clauses BEFORE signing.
+
+        Args:
+            agreement_terms:        Full agreement text (the `terms` column).
+            property_title:         Property title for context.
+            rent_amount:            Monthly rent (NGN) for context.
+            lease_duration_months:  Lease length in months for context.
+            payment_frequency:      MONTHLY / QUARTERLY / SEMI_ANNUAL / ANNUAL.
+
+        Returns:
+            Plain-English brief string. Falls back to a deterministic mock
+            when Qwen is unavailable.
+        """
+        context_parts = []
+        if property_title:
+            context_parts.append(f"Property: {property_title}")
+        if rent_amount is not None:
+            try:
+                context_parts.append(f"Monthly rent: NGN {float(rent_amount):,.0f}")
+            except (TypeError, ValueError):
+                context_parts.append(f"Monthly rent: {rent_amount}")
+        if lease_duration_months:
+            context_parts.append(f"Lease duration: {lease_duration_months} months")
+        if payment_frequency:
+            context_parts.append(f"Payment frequency: {payment_frequency}")
+
+        # Cap the agreement text so we stay within token limits on qwen-turbo.
+        terms = (agreement_terms or "").strip()
+        if len(terms) > 6000:
+            terms = terms[:6000] + "\n[... agreement text truncated ...]"
+
+        user_message = (
+            ("KEY FACTS:\n" + "\n".join(context_parts) + "\n\n" if context_parts else "")
+            + "FULL AGREEMENT TEXT:\n"
+            + terms
+        )
+
+        raw = await self._chat(
+            _TENANT_AGREEMENT_BRIEF_PROMPT, user_message, max_tokens=500
+        )
+
+        if raw is None:
+            return self._mock_tenant_agreement_brief(
+                property_title, rent_amount, lease_duration_months, payment_frequency
+            )
+
+        brief = raw.strip()
+        logger.info(f"Tenant agreement brief generated ({len(brief)} chars)")
+        return brief
+
+    def _mock_tenant_agreement_brief(
+        self,
+        property_title: Optional[str],
+        rent_amount: Optional[float],
+        lease_duration_months: Optional[int],
+        payment_frequency: Optional[str],
+    ) -> str:
+        """Deterministic fallback when Qwen is down — still useful, never invents clauses."""
+        prop = property_title or "the property"
+        duration = f"{lease_duration_months} months" if lease_duration_months else "the lease period"
+        freq = (payment_frequency or "ANNUAL").lower()
+
+        rent_line = "See the agreement for the exact rent amount."
+        if rent_amount is not None:
+            try:
+                rent_line = f"Rent is NGN {float(rent_amount):,.0f} per month, paid {freq}."
+            except (TypeError, ValueError):
+                rent_line = "See the agreement for the exact rent amount."
+
+        return (
+            f"WHAT YOU'RE RENTING: {prop} for {duration}.\n"
+            f"WHAT YOU'LL PAY: {rent_line}\n"
+            "YOUR KEY RIGHTS: Peaceful use of the property, and proper notice before any "
+            "landlord entry or tenancy changes — as set out in the agreement.\n"
+            "YOUR KEY RESPONSIBILITIES: Pay rent on time and keep the property in good "
+            "condition, as set out in the agreement.\n"
+            "WATCH OUT FOR: We couldn't generate the AI summary right now — please read "
+            "the full agreement carefully before signing.\n"
+            "This is a helper summary only — the agreement you sign is what legally binds you."
         )
 
     # ── 3. Payment Anomaly SMS ────────────────────────────────────────────────

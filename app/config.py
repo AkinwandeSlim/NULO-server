@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     PAYSTACK_PUBLIC_KEY: str | None = None   # DEPRECATED
     PAYSTACK_WEBHOOK_URL: str | None = None  # DEPRECATED
     PAYSTACK_API_URL: str = "https://api.paystack.co"  # DEPRECATED
+
+    # ---------------------------------------------------------------
+    # Payment provider selection (2026-08-17)
+    # Controls which provider is used for tenant-facing payment collection.
+    #   "nomba"    - Nomba virtual accounts (NUBAN) — current default
+    #   "paystack" - Paystack checkout (test mode) — available as fallback
+    # Disbursement (landlord payout) always stays on Nomba regardless of
+    # this setting, since Paystack has no escrow/disbursement equivalent.
+    # ---------------------------------------------------------------
+    PAYMENT_PROVIDER: str = "nomba"  # nomba | paystack
     
     # Environment
     ENV: str = "local"  # local | development | production

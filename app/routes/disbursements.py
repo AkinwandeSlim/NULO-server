@@ -148,6 +148,16 @@ async def simulate_payout_webhook(
         f"landlord={current_user['id']}"
     )
     
+    # Keep the PropFlow thread in sync — same as the real payout_success
+    # webhook path in nomba.py. Best-effort: the transactions row above is
+    # the source of truth; a sync failure must not fail the demo endpoint.
+    try:
+        from app.services.propflow_graph_sync import sync_after_release
+        await sync_after_release(agreement_id, supabase_admin)
+        logger.info("[DEMO] PropFlow thread synced to disbursement_complete for %s", agreement_id)
+    except Exception as sync_err:
+        logger.warning("[DEMO] PropFlow sync failed (non-fatal) for %s: %s", agreement_id, sync_err)
+
     return {
         "success": True,
         "message": "Payout webhook simulated successfully (DEMO MODE)",

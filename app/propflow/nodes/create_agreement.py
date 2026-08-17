@@ -87,11 +87,12 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
         }
 
     # ── Step 2: Fetch tenant + landlord + property in parallel ───────────────
-    tenant_data, property_data, landlord_name = await asyncio.gather(
+    tenant_data, property_data, landlord_data = await asyncio.gather(
         _fetch_tenant(tenant_id, loop, supabase_admin),
         _fetch_property(str(property_id), loop, supabase_admin),
-        _fetch_landlord_name(landlord_id, loop, supabase_admin),
+        _fetch_landlord(landlord_id, loop, supabase_admin),
     )
+    landlord_name = landlord_data.get("full_name", "Landlord")
 
     if not property_data:
         msg = f"create_agreement: property {property_id} not found"
@@ -116,6 +117,8 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
             tenant_data=tenant_data,
             landlord_name=landlord_name,
             propflow_workflow_id=state.get("workflow_id"),
+            landlord_email=landlord_data.get("email"),
+            landlord_phone=landlord_data.get("phone_number"),
         )
     except Exception as exc:
         msg = f"create_agreement: agreement_service failed: {exc}"
@@ -207,24 +210,27 @@ async def _fetch_property(property_id: str, loop, supabase_admin) -> Optional[di
         return None
 
 
-async def _fetch_landlord_name(landlord_id: str, loop, supabase_admin) -> str:
-    """Fetch landlord full name for the agreement header."""
+async def _fetch_landlord(landlord_id: str, loop, supabase_admin) -> dict:
+    """Fetch landlord user row (name + contact details) for the agreement header."""
     if not landlord_id:
-        return "Landlord"
+        return {"full_name": "Landlord"}
     try:
         result = await loop.run_in_executor(
             None,
             lambda: supabase_admin
                 .table("users")
-                .select("full_name")
+                .select("id, full_name, email, phone_number")
                 .eq("id", landlord_id)
                 .single()
                 .execute(),
         )
-        return (result.data or {}).get("full_name") or "Landlord"
+        data = result.data or {}
+        if not data.get("full_name"):
+            data["full_name"] = "Landlord"
+        return data
     except Exception as exc:
-        logger.warning(f"[create_agreement] landlord name fetch failed: {exc}")
-        return "Landlord"
+        logger.warning(f"[create_agreement] landlord fetch failed: {exc}")
+        return {"full_name": "Landlord"}
 
 
 async def _upload_agreement_to_oss(

@@ -1,14 +1,17 @@
 """
-Groq AI Agreement API Routes
-============================
+AI Agreement API Routes (Phase B -- configurable LLM provider)
+===============================================================
 
-FastAPI routes for generating Nigerian tenancy agreements using Groq AI.
-This provides REST endpoints for the NuloAfrica platform.
+FastAPI routes for generating Nigerian tenancy agreements via the
+configurable LLM provider layer (LLM_PROVIDER in server/.env:
+qwen | groq | openai | mock). The URL prefix stays /api/v1/groq for
+frontend compatibility, but the backing model is no longer hard-wired
+to Groq -- health/test/usage endpoints report the active provider.
 
 Endpoints:
 - POST /api/v1/groq/generate-agreement - Generate simple agreement
 - POST /api/v1/groq/generate-advanced-agreement - Generate advanced agreement
-- GET /api/v1/groq/test-connection - Test Groq AI connection
+- GET /api/v1/groq/test-connection - Test active LLM provider connection
 - GET /api/v1/groq/usage-stats - Get usage statistics
 - POST /api/v1/groq/reset-stats - Reset usage statistics
 """
@@ -21,7 +24,7 @@ import logging
 
 from app.services.ai.ai_service import ai_service
 
-router = APIRouter(prefix="/api/v1/groq", tags=["Groq AI Agreement"])
+router = APIRouter(prefix="/api/v1/groq", tags=["AI Agreement"])
 logger = logging.getLogger(__name__)
 
 # Request/Response Models
@@ -53,14 +56,16 @@ class AgreementResponse(BaseModel):
     summary: Optional[Dict[str, Any]] = None
     usage_stats: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    validation: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     message: Optional[str] = None
 
 class ConnectionTestResponse(BaseModel):
     """Response model for connection test"""
     connected: bool
-    service: str = "Groq AI"
-    model: str = "llama-3.3-70b-versatile"
+    service: str = "AI Agreement Service"
+    provider: Optional[str] = None
+    model: Optional[str] = None
     timestamp: str
     message: Optional[str] = None
 
@@ -80,14 +85,22 @@ async def test_connection():
         ConnectionTestResponse: Connection status and details
     """
     try:
-        logger.info("🔍 Testing Groq AI connection...")
+        provider_name = ai_service.provider_name
+        model_name = ai_service.model
+        logger.info(f"🔍 Testing LLM connection (provider={provider_name}, model={model_name})...")
         
         is_connected = await ai_service.test_connection()
         
         response = ConnectionTestResponse(
             connected=is_connected,
+            provider=provider_name,
+            model=model_name,
             timestamp=datetime.now().isoformat(),
-            message="Groq AI connection successful" if is_connected else "Groq AI connection failed"
+            message=(
+                f"{provider_name} ({model_name}) connection successful"
+                if is_connected
+                else f"{provider_name} ({model_name}) connection failed"
+            )
         )
         
         logger.info(f"✅ Connection test result: {is_connected}")
@@ -169,6 +182,7 @@ async def generate_simple_agreement(
             compliance_score=result["compliance_score"],
             summary=result["summary"],
             usage_stats=result["usage_stats"],
+            validation=result.get("validation"),
             message="Simple agreement generated successfully"
         )
         
@@ -262,6 +276,7 @@ async def generate_advanced_agreement(
             summary=result["summary"],
             usage_stats=result["usage_stats"],
             metadata=result["metadata"],
+            validation=result.get("validation"),
             message="Advanced agreement generated successfully"
         )
         
@@ -291,11 +306,10 @@ async def get_usage_statistics():
             "estimated_monthly_cost_500_agreements": stats["cost_per_agreement"] * 500,
             "estimated_monthly_cost_1000_agreements": stats["cost_per_agreement"] * 1000,
             "tokens_per_agreement": stats["average_tokens_per_request"],
-            "groq_vs_openai_savings": {
-                "groq_cost_per_1m_tokens": 0.05,
-                "openai_cost_per_1m_tokens": 2.00,
-                "savings_percentage": 97.5,
-                "savings_per_1m_tokens": 1.95
+            "active_provider": {
+                "provider": ai_service.provider_name,
+                "model": ai_service.model,
+                "cost_per_1m_tokens_usd": ai_service.cost_per_million_tokens
             }
         }
         
@@ -350,7 +364,8 @@ async def health_check():
         
         return {
             "status": "healthy" if is_connected else "unhealthy",
-            "service": "Groq AI Agreement Generator",
+            "service": "AI Agreement Generator",
+            "provider": ai_service.provider_name,
             "model": ai_service.model,
             "connected": is_connected,
             "total_requests": stats["total_requests"],
@@ -362,7 +377,7 @@ async def health_check():
         logger.error(f"❌ Health check error: {str(e)}")
         return {
             "status": "error",
-            "service": "Groq AI Agreement Generator",
+            "service": "AI Agreement Generator",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }

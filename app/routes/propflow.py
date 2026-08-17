@@ -44,6 +44,7 @@ PROTECTED_SELECT_STAGES: frozenset[str] = frozenset({
     "agreement_drafted",
     "awaiting_landlord_signature",
     "nomba_provisioned",
+    "payment_confirmed",
     "awaiting_full_payment",
     "disbursement_complete",
     "rejected",
@@ -112,7 +113,12 @@ class StatusResponse(BaseModel):
     extracted_intent: Optional[Dict[str, Any]] = None
     selected_property_id: Optional[str] = None
     application_id: Optional[str] = None
+    agreement_id: Optional[str] = None
     landlord_briefing: Optional[str] = None
+    # Payment account info — populated once provision_nomba_dva has run so the
+    # tenant's PropFlow chat can display the NUBAN + amount without a page refresh.
+    virtual_account_number: Optional[str] = None
+    expected_payment_amount: Optional[float] = None
     error_log: list[str] = []
 
 
@@ -1130,10 +1136,15 @@ async def resume_propflow_workflow(
             new_status = sign_result.get("status", "")
 
             if new_status == "SIGNED":
-                # Both parties signed → resume the graph
-                graph.update_state(
+                # Both parties signed → resume the graph.
+                # as_node="create_agreement" is critical: without it, update_state
+                # consumes the pending interrupt at provision_nomba_dva and the
+                # subsequent ainvoke(None) becomes a silent no-op, leaving the
+                # thread permanently stuck at the signing gate.
+                await graph.aupdate_state(
                     thread_config,
-                    {"agreement_status": "SIGNED"}
+                    {"agreement_status": "SIGNED"},
+                    as_node="create_agreement",
                 )
             else:
                 # Only tenant signed → PENDING_LANDLORD, wait for landlord
@@ -1214,6 +1225,7 @@ async def resume_propflow_workflow(
                 "agreement_drafted": "lease agreement created — tenant needs to sign first",
                 "awaiting_landlord_signature": "tenant signed — landlord must sign via Agreements page",
                 "nomba_provisioned": "payment account created — awaiting tenant payment",
+                "payment_confirmed": "payment received — awaiting landlord release",
                 "awaiting_full_payment": "awaiting payment confirmation",
                 "disbursement_complete": "this tenancy is already active",
                 "rejected": "this application was already rejected",
@@ -1288,6 +1300,133 @@ async def get_propflow_status(
                 error_log=["Workflow expired — server restart cleared in-progress state"],
             )
 
+        # ── Safety net: SIGNED + existing VA must never render as awaiting
+        #    landlord signature. If the graph checkpoint is stale (e.g. the
+        #    sign→advance sync failed mid-flight), correct the stage from the
+        #    agreement row, which is the source of truth. Only runs for the
+        #    two signing-gate stages so normal status polls pay no extra cost.
+        if workflow_stage in ("awaiting_landlord_signature", "agreement_drafted"):
+            agreement_id = values.get("agreement_id")
+            if agreement_id:
+                try:
+                    loop = asyncio.get_event_loop()
+                    sb = get_supabase_admin()
+                    agr_result = await loop.run_in_executor(
+                        None,
+                        lambda: sb.table("agreements")
+                        .select(
+                            "status, virtual_account_number, "
+                            "virtual_account_name, expected_payment_amount"
+                        )
+                        .eq("id", str(agreement_id))
+                        .maybe_single()
+                        .execute(),
+                    )
+                    agr = agr_result.data
+                    if (
+                        agr
+                        and str(agr.get("status", "")).upper() == "SIGNED"
+                        and agr.get("virtual_account_number")
+                    ):
+                        # Agreement is fully signed AND already has a VA — the
+                        # thread is past the signing gate. Correct the stage and
+                        # backfill the VA so the chat shows the payment card.
+                        values = {
+                            **values,
+                            "current_stage": "nomba_provisioned",
+                            "nomba_virtual_account_number": agr["virtual_account_number"],
+                            "expected_payment_amount": (
+                                agr.get("expected_payment_amount")
+                                or values.get("expected_payment_amount")
+                            ),
+                        }
+                        workflow_stage = "nomba_provisioned"
+                        logger.info(
+                            "[PROPFLOW] Status safety-net corrected stale stage for %s → nomba_provisioned",
+                            workflow_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[PROPFLOW] Status safety-net check failed for %s: %s",
+                        workflow_id, exc,
+                    )
+
+        # ── Safety net: payment landed / funds released must never render as
+        #    "awaiting_full_payment" or "nomba_provisioned". The agreement row
+        #    (reconciliation_status) and the transactions table (disbursement
+        #    status) are the source of truth. If the graph checkpoint is stale
+        #    (e.g. sync_after_payment resolved a different thread, or the
+        #    release webhook never synced the graph), correct the stage here so
+        #    the tenant's chat self-heals on the next poll. Only runs for the
+        #    payment-waiting stages so normal status polls pay no extra cost.
+        if workflow_stage in ("awaiting_full_payment", "nomba_provisioned", "payment_confirmed"):
+            agreement_id = values.get("agreement_id")
+            if agreement_id:
+                try:
+                    loop = asyncio.get_event_loop()
+                    sb = get_supabase_admin()
+                    agr_result = await loop.run_in_executor(
+                        None,
+                        lambda: sb.table("agreements")
+                        .select(
+                            "reconciliation_status, total_received_amount, "
+                            "virtual_account_number, expected_payment_amount"
+                        )
+                        .eq("id", str(agreement_id))
+                        .maybe_single()
+                        .execute(),
+                    )
+                    agr = agr_result.data
+                    if agr:
+                        recon = str(agr.get("reconciliation_status") or "").upper()
+                        # Has the landlord already released the funds? A released
+                        # disbursement row means the tenancy is active even if the
+                        # graph never advanced past payment_confirmed.
+                        disb_result = await loop.run_in_executor(
+                            None,
+                            lambda: sb.table("transactions")
+                            .select("status")
+                            .eq("agreement_id", str(agreement_id))
+                            .eq("transaction_type", "nomba_disbursement")
+                            .order("created_at", desc=True)
+                            .limit(20)
+                            .execute(),
+                        )
+                        disb_rows = disb_result.data or []
+                        released = any(r.get("status") == "released" for r in disb_rows)
+
+                        corrected_stage = None
+                        if released:
+                            corrected_stage = "disbursement_complete"
+                        elif recon in ("FULL_PAYMENT", "RECONCILED"):
+                            corrected_stage = "payment_confirmed"
+
+                        if corrected_stage and corrected_stage != workflow_stage:
+                            values = {
+                                **values,
+                                "current_stage": corrected_stage,
+                                # Backfill the NUBAN + amount so the tenant's
+                                # acknowledgment card can show the exact figure.
+                                "nomba_virtual_account_number": (
+                                    agr.get("virtual_account_number")
+                                    or values.get("nomba_virtual_account_number")
+                                ),
+                                "expected_payment_amount": (
+                                    agr.get("expected_payment_amount")
+                                    or values.get("expected_payment_amount")
+                                ),
+                            }
+                            workflow_stage = corrected_stage
+                            logger.info(
+                                "[PROPFLOW] Status safety-net corrected stale payment stage for %s → %s",
+                                workflow_id, corrected_stage,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "[PROPFLOW] Status payment safety-net check failed for %s: %s",
+                        workflow_id, exc,
+                    )
+
         return StatusResponse(
             success=True,
             workflow_id=workflow_id,
@@ -1298,7 +1437,10 @@ async def get_propflow_status(
             extracted_intent=values.get("extracted_intent"),
             selected_property_id=str(values["selected_property_id"]) if values.get("selected_property_id") else None,
             application_id=str(values["application_id"]) if values.get("application_id") else None,
+            agreement_id=str(values["agreement_id"]) if values.get("agreement_id") else None,
             landlord_briefing=values.get("landlord_briefing"),
+            virtual_account_number=values.get("nomba_virtual_account_number"),
+            expected_payment_amount=values.get("expected_payment_amount"),
             error_log=values.get("error_log", []),
         )
 
@@ -1874,8 +2016,21 @@ async def _generate_response_message(result: Dict[str, Any], user_type: str = "t
         else:
             return "Your application was approved! Payment details will be shared with you shortly."
     
+    elif stage == "payment_confirmed":
+        amount = _safe_amount(result.get("total_received_amount") or result.get("expected_payment_amount"))
+        amount_text = f" of ₦{amount:,.0f}" if amount else ""
+        return (
+            f"✅ Your payment{amount_text} has been received and verified! "
+            "The landlord has been notified. Once they confirm and release the funds, "
+            "your tenancy will be fully active. I'll update you here the moment it happens."
+        )
+
     elif stage == "disbursement_complete":
-        return "🎉 Payment received and processed! Your tenancy is now active. Welcome to your new home!"
+        return (
+            "🎉 Payment received and processed! Your tenancy is now active. "
+            "Welcome to your new home! You can now schedule your move-in and "
+            "coordinate key handover with the landlord."
+        )
     
     elif stage == "rejected":
         reason = result.get("rejection_reason", "Landlord requirements not met")

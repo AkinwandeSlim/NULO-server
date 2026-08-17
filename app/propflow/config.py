@@ -10,6 +10,16 @@ from functools import lru_cache
 class PropFlowSettings(BaseSettings):
     """PropFlow AI Agent Settings — loaded from server/.env"""
 
+    # ── LLM Provider Selection (Phase B — configurable LLM layer) ────────────
+    # Which provider backs ALL LLM calls (PropFlow chat agent + agreement AI).
+    # Switch models by changing this ONE line — no code edits required.
+    #   "qwen"   -> Alibaba DashScope (QWEN_* vars)          [default]
+    #   "groq"   -> Groq Cloud llama family (GROQ_* vars)
+    #   "openai" -> OpenAI (OPENAI_* vars)
+    #   "mock"   -> offline; every call falls to deterministic mocks
+    # See app/propflow/services/llm_provider.py for the plugin registry.
+    LLM_PROVIDER: str = "qwen"
+
     # ── Qwen API (Alibaba Cloud DashScope) ───────────────────────────────────
     QWEN_API_KEY: str | None = None
     QWEN_API_URL: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -24,6 +34,24 @@ class PropFlowSettings(BaseSettings):
     # store rejects DashScope's cert chain (Python 3.14 / OpenSSL strict X.509).
     # Production should keep this True.
     QWEN_VERIFY_SSL: bool = True
+
+    # ── Groq API (used when LLM_PROVIDER=groq) ───────────────────────────────
+    # Groq exposes an OpenAI-compatible endpoint, so the provider layer reuses
+    # the same client. GROQ_API_KEY also serves the legacy /api/v1/groq routes.
+    GROQ_API_KEY: str | None = None
+    GROQ_API_URL: str = "https://api.groq.com/openai/v1"
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_FALLBACK_MODEL: str | None = "llama-3.1-8b-instant"
+    GROQ_TEMPERATURE: float = 0.1
+    GROQ_MAX_TOKENS: int = 2500
+
+    # ── OpenAI API (used when LLM_PROVIDER=openai) ───────────────────────────
+    OPENAI_API_KEY: str | None = None
+    OPENAI_API_URL: str = "https://api.openai.com/v1"
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_FALLBACK_MODEL: str | None = None
+    OPENAI_TEMPERATURE: float = 0.1
+    OPENAI_MAX_TOKENS: int = 1000
 
     # ── Confidence Thresholds ─────────────────────────────────────────────────
     INTENT_CONFIDENCE_THRESHOLD: float = 0.7   # Below this, ask tenant to clarify
