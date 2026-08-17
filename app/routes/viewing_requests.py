@@ -119,7 +119,7 @@ def _parse_confirmed_time(value: Optional[str]):
     m = _TIME_24H.fullmatch(norm)
     if m:
         hour, minute = int(m.group(1)), int(m.group(2))
-        if hour > 23:
+        if hour > 23 or minute > 59:
             return None
         return dtime(hour, minute)
     return None
@@ -138,7 +138,10 @@ def _viewing_is_overdue(viewing: dict, now: datetime) -> bool:
     if appt_date > now.date():
         return False
     # Same day: compare against the exact confirmed time.
-    appt_time = _parse_confirmed_time(viewing.get("confirmed_time"))
+    try:
+        appt_time = _parse_confirmed_time(viewing.get("confirmed_time"))
+    except (TypeError, ValueError):
+        appt_time = None  # never let a malformed value break the list endpoint
     if appt_time is None:
         return True  # date has arrived and no valid time on record — don't leave it stale
     return datetime.combine(appt_date, appt_time) < now
