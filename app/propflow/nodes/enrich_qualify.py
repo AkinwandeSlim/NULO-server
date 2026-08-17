@@ -414,7 +414,12 @@ def _build_landlord_briefing(
 
     parts = [header]
     if facts:
-        parts.append("What we know: " + " · ".join(facts))
+        # One bullet per fact. The dashboard renders this through a markdown
+        # component (bullets become real list items) while the chat widget and
+        # any plain-text consumer keep it as clean, readable lines — so keep
+        # the syntax light: only newlines and "- " bullets, no ** or # markup.
+        parts.append("What we know:")
+        parts.extend(f"- {f}" for f in facts)
     else:
         parts.append("No additional details were provided by the tenant.")
 

@@ -119,14 +119,27 @@ RELAXATION DETECTION:
 _BRIEFING_SYSTEM_PROMPT = """You are a professional Nigerian property manager writing a briefing
 for a landlord about a prospective tenant.
 
-Write exactly 3 sentences. Be factual, professional, and concise.
-Sentence 1: Who the tenant is (occupation, employer if known, income level).
-Sentence 2: Their specific requirements and payment preference.
-Sentence 3: Why they are a good fit and any relevant prior history.
+Be factual, professional, and concise. Use EXACTLY this structure:
 
-If memory context is provided, use it to personalize the briefing.
-Do not invent facts. If information is missing, say "not provided" rather than guessing.
-Return ONLY the 3-sentence briefing text -- no JSON, no bullet points, no headers.
+Line 1: one short sentence — who the tenant is and what they applied for
+(occupation, employer if known, and the property).
+
+Then a line reading "What we know:" followed by 3-5 short bullet points,
+each starting with "- " (dash + space). Cover only facts that were provided:
+- who the tenant is (occupation, employer, income level)
+- their specific requirements (bedrooms, property type, location, budget)
+- their payment preference
+- why they are a good fit and any relevant prior history
+- verification status (documents / references), if provided
+
+Then, only if something important is missing, one final line:
+"Not provided by tenant: <comma-separated list of missing items>."
+
+Rules:
+- If memory context is provided, use it to personalize the briefing.
+- Do not invent facts. If information is missing, say "not provided" rather than guessing.
+- Return ONLY the briefing text. The ONLY formatting allowed is newlines and
+  "- " bullet points — no bold, no headers, no JSON, no other markdown.
 """
 
 _ANOMALY_SMS_PROMPT = """You are writing a professional but friendly SMS to a Nigerian tenant
@@ -502,11 +515,13 @@ class QwenClient:
         property_data: dict[str, Any],
     ) -> str:
         name = tenant_data.get("full_name") or tenant_data.get("email", "The applicant")
+        prop = property_data.get("title", "the listed property")
         return (
-            f"{name} is a working professional who has submitted a complete application. "
-            f"They are interested in the {property_data.get('title', 'listed property')} "
-            f"and are ready to commence the lease upon approval. "
-            f"Payment will be arranged via Nomba virtual account upon agreement signing."
+            f"{name} is a working professional who has submitted a complete application for {prop}.\n"
+            "What we know:\n"
+            "- Application is complete and ready for review\n"
+            "- Ready to commence the lease upon approval\n"
+            "- Payment will be arranged via a Nomba virtual account upon agreement signing"
         )
 
     # ── 2b. Tenant Agreement Brief (plain-English summary before signing) ────
