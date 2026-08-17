@@ -427,8 +427,10 @@ async def simulate_payment(
         },
     }
 
-    # Generate valid signature
-    SECRET = "NombaHackathon2026"
+    # Generate valid signature (secret comes from env, never hardcoded)
+    SECRET = os.environ.get("NOMBA_WEBHOOK_SECRET", "")
+    if not SECRET:
+        raise HTTPException(500, "NOMBA_WEBHOOK_SECRET is not configured")
     t = payload["data"]["transaction"]
     m = payload["data"]["merchant"]
     hashing_payload = (
