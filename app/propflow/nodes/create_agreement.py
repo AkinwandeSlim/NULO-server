@@ -16,7 +16,9 @@ Responsibility:
 Architecture:
   - Wraps agreement_service.auto_generate_agreement() — already production-tested
   - OSS upload is non-blocking (graceful degradation if creds not set)
-  - Rule 6: Supabase calls inside run_in_executor via the service layer
+  - Supabase reads offloaded to the thread pool via run_db_async (retry-aware),
+    so a transient connection hiccup (HTTP/2 ConnectionTerminated, WinError
+    10035, ...) is retried instead of aborting agreement creation.
 """
 
 import asyncio
@@ -75,10 +77,8 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
         f"tenant={tenant_id[:8]}..."
     )
 
-    loop = asyncio.get_event_loop()
-
     try:
-        from app.database import supabase_admin
+        from app.database import supabase_admin, run_db_async
     except Exception as exc:
         return {
             **state,
@@ -87,10 +87,14 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
         }
 
     # ── Step 2: Fetch tenant + landlord + property in parallel ───────────────
+    # Supabase reads are offloaded to the thread pool via run_db_async, which
+    # retries transient socket/connection hiccups (e.g. HTTP/2
+    # ConnectionTerminated on a stale keep-alive) before surfacing an error.
+    # A transient failure here no longer kills agreement creation.
     tenant_data, property_data, landlord_data = await asyncio.gather(
-        _fetch_tenant(tenant_id, loop, supabase_admin),
-        _fetch_property(str(property_id), loop, supabase_admin),
-        _fetch_landlord(landlord_id, loop, supabase_admin),
+        _fetch_tenant(tenant_id, supabase_admin, run_db_async),
+        _fetch_property(str(property_id), supabase_admin, run_db_async),
+        _fetch_landlord(landlord_id, supabase_admin, run_db_async),
     )
     landlord_name = landlord_data.get("full_name", "Landlord")
 
@@ -171,11 +175,10 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _fetch_tenant(tenant_id: str, loop, supabase_admin) -> dict:
+async def _fetch_tenant(tenant_id: str, supabase_admin, run_db_async) -> dict:
     """Fetch tenant user row for agreement generation."""
     try:
-        result = await loop.run_in_executor(
-            None,
+        result = await run_db_async(
             lambda: supabase_admin
                 .table("users")
                 .select("id, full_name, email, phone_number")
@@ -189,11 +192,10 @@ async def _fetch_tenant(tenant_id: str, loop, supabase_admin) -> dict:
         return {"id": tenant_id, "full_name": "Tenant", "email": ""}
 
 
-async def _fetch_property(property_id: str, loop, supabase_admin) -> Optional[dict]:
+async def _fetch_property(property_id: str, supabase_admin, run_db_async) -> Optional[dict]:
     """Fetch property data for agreement terms."""
     try:
-        result = await loop.run_in_executor(
-            None,
+        result = await run_db_async(
             lambda: supabase_admin
                 .table("properties")
                 .select(
@@ -210,13 +212,12 @@ async def _fetch_property(property_id: str, loop, supabase_admin) -> Optional[di
         return None
 
 
-async def _fetch_landlord(landlord_id: str, loop, supabase_admin) -> dict:
+async def _fetch_landlord(landlord_id: str, supabase_admin, run_db_async) -> dict:
     """Fetch landlord user row (name + contact details) for the agreement header."""
     if not landlord_id:
         return {"full_name": "Landlord"}
     try:
-        result = await loop.run_in_executor(
-            None,
+        result = await run_db_async(
             lambda: supabase_admin
                 .table("users")
                 .select("id, full_name, email, phone_number")
