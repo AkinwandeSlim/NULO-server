@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-from ..database import supabase, supabase_admin
+from ..database import supabase, supabase_admin, run_db_sync
 from ..middleware.auth import get_current_user
 from ..services.agreement_service import AgreementService
 from pydantic import BaseModel, Field
@@ -316,8 +316,30 @@ class TenantDashboardResponse(BaseModel):
 # HELPER FUNCTIONS
 # ============================================================================
 
-def calculate_tenant_stats(tenant_id: str) -> dict:
-    """Calculate tenant statistics with optimized queries"""
+def calculate_tenant_stats(
+    tenant_id: str,
+    favorites: Optional[List[dict]] = None,
+    viewings: Optional[List[dict]] = None,
+    conversations: Optional[List[dict]] = None,
+    applications: Optional[List[dict]] = None,
+    agreements: Optional[List[dict]] = None,
+) -> dict:
+    """Calculate tenant statistics.
+
+    Perf fix (fixes the long dashboard load): when the /dashboard endpoint
+    passes the already-fetched section rows, they are used directly instead
+    of re-querying the SAME tables (the old version issued ~10 duplicate
+    queries on every dashboard load). Only 3 lightweight queries remain for
+    data the sections do not carry (unread count, messages-sent count,
+    trust score), plus payment-ledger lookups.
+
+    Resilience (fixes the data flicker):
+      - Every query goes through run_db_sync so transient Cloudflare /
+        socket errors are retried ("JSON could not be generated", etc).
+      - Each individual query failure degrades ONLY that stat group to its
+        default. The old single try/except zeroed ALL stats when any one
+        query flaked, which is why cards appeared/disappeared.
+    """
     stats = {
         "totalFavorites": 0,
         "pendingViewings": 0,
@@ -343,61 +365,57 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
     }
 
     try:
-        # Fetch all data we need in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all queries
-            fav_future = executor.submit(
-                lambda: supabase_admin.table("favorites").select("id, property_id").eq("tenant_id", tenant_id).execute()
-            )
-            viewing_future = executor.submit(
-                lambda: supabase_admin.table("viewing_requests").select("id, property_id, status").eq("tenant_id", tenant_id).execute()
-            )
-            conv_future = executor.submit(
-                lambda: supabase_admin.table("conversations").select("id, property_id").eq("tenant_id", tenant_id).execute()
-            )
-            unread_future = executor.submit(
-                lambda: supabase_admin.table("messages").select("id").eq("recipient_id", tenant_id).eq("read", False).execute()
-            )
-            apps_future = executor.submit(
-                lambda: supabase_admin.table("applications").select("id, status, property_id").eq("user_id", tenant_id).execute()
-            )
-            agreements_future = executor.submit(
-                lambda: supabase_admin.table("agreements").select("id, status, tenant_signed_at, landlord_signed_at").eq("tenant_id", tenant_id).execute()
-            )
-            transactions_future = executor.submit(
-                lambda: supabase_admin.table("transactions").select("id, status").eq("tenant_id", tenant_id).execute()
-            )
-            user_future = executor.submit(
-                lambda: supabase_admin.table("users").select("trust_score").eq("id", tenant_id).single().execute()
-            )
-            messages_sent_future = executor.submit(
-                lambda: supabase_admin.table("messages").select("id").eq("sender_id", tenant_id).execute()
-            )
+        favorites = favorites or []
+        viewings = viewings or []
+        conversations = conversations or []
+        applications = applications or []
+        agreements = agreements or []
 
-            # Get results
-            fav_result = fav_future.result()
-            viewing_result = viewing_future.result()
-            conv_result = conv_future.result()
-            unread_result = unread_future.result()
-            apps_result = apps_future.result()
-            agreements_result = agreements_future.result()
-            transactions_result = transactions_future.result()
-            user_result = user_future.result()
-            messages_sent_result = messages_sent_future.result()
+        def _run(label, fn):
+            """Run one query with transient-error retries; degrade to None."""
+            try:
+                return run_db_sync(fn)
+            except Exception as e:
+                logger.warning(f"[TENANT STATS] '{label}' query failed for {tenant_id} (degraded): {e}")
+                return None
 
-        # Process results
+        # Only query the data the caller did NOT already fetch. These 4 are
+        # small index scans; everything else comes from the section rows.
+        # Each query runs through _run() (run_db_sync) INSIDE the worker
+        # thread so transient Cloudflare/socket errors get real retries
+        # around the actual network call, and a single flaky query degrades
+        # only its own stat group.
+        missing_queries = {
+            "unread": lambda: supabase_admin.table("messages").select("id").eq("recipient_id", tenant_id).eq("read", False).execute(),
+            "user": lambda: supabase_admin.table("users").select("trust_score").eq("id", tenant_id).single().execute(),
+            "transactions": lambda: supabase_admin.table("transactions").select("id, status, transaction_type").eq("tenant_id", tenant_id).execute(),
+            # Feeds only the engagement score — its failure never matters.
+            "messages_sent": lambda: supabase_admin.table("messages").select("id").eq("sender_id", tenant_id).execute(),
+        }
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {
+                label: executor.submit(lambda f=fn: _run(label, f))
+                for label, fn in missing_queries.items()
+            }
+            # _run() never raises — it returns None on failure, so .result()
+            # here is always safe.
+            results = {label: fut.result() for label, fut in future_map.items()}
+
+        unread_result = results.get("unread")
+        user_result = results.get("user")
+        transactions_result = results.get("transactions")
+        messages_sent_result = results.get("messages_sent")
+
         # Favorites
-        favorites = fav_result.data or []
         stats["totalFavorites"] = len(favorites)
         
         # Viewings
-        viewings = viewing_result.data or []
         stats["pendingViewings"] = sum(1 for v in viewings if v.get("status") == "pending")
         stats["confirmedViewings"] = sum(1 for v in viewings if v.get("status") == "confirmed")
         stats["completedViewings"] = sum(1 for v in viewings if v.get("status") == "completed")
         
         # Conversations
-        conversations = conv_result.data or []
         stats["totalConversations"] = len(conversations)
         
         # Properties Contacted
@@ -406,43 +424,98 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
             if conv.get("property_id"): properties_contacted.add(conv["property_id"])
         for v in viewings:
             if v.get("property_id"): properties_contacted.add(v["property_id"])
-        apps = apps_result.data or []
-        for app in apps:
+        for app in applications:
             if app.get("property_id"): properties_contacted.add(app["property_id"])
         stats["propertiesContacted"] = len(properties_contacted)
         
         # Unread messages
-        stats["unreadMessages"] = len(unread_result.data or [])
+        stats["unreadMessages"] = len((unread_result.data or []) if unread_result else [])
         
         # Applications
-        stats["applicationsSubmitted"] = len(apps)
-        for app in apps:
+        stats["applicationsSubmitted"] = len(applications)
+        for app in applications:
             if app.get("status") in ("submitted", "pending"): stats["pendingApplications"] +=1
             elif app.get("status") == "approved": stats["approvedApplications"] +=1
             elif app.get("status") == "rejected": stats["rejectedApplications"] +=1
             elif app.get("status") == "withdrawn": stats["withdrawnApplications"] +=1
             
-        # Agreements
-        agreements = agreements_result.data or []
+        # Agreements — derive the effective status once per row (works for
+        # both enriched rows from fetch_agreements and raw DB rows) and reuse
+        # it for the payment counts below so all card groups stay consistent.
+        agreement_statuses = []
         for agr in agreements:
-            effective_status = AgreementService.derive_effective_status(agr)
-            if effective_status in ["ACTIVE", "SIGNED"]:
+            try:
+                effective_status = AgreementService.derive_effective_status(agr)
+            except Exception:
+                effective_status = agr.get("raw_status") or agr.get("status")
+            agreement_statuses.append(effective_status)
+            if effective_status in ("ACTIVE", "SIGNED"):
                 stats["activeAgreements"] += 1
-            elif effective_status == "PENDING_TENANT":
+            elif effective_status in ("PENDING_TENANT", "PENDING_LANDLORD"):
                 stats["pendingSignatures"] += 1
             
         # Payments
-        transactions = transactions_result.data or []
-        stats["totalPayments"] = len(transactions)
-        stats["completedPayments"] = sum(1 for t in transactions if t.get("status") == "completed")
-        stats["paymentsDue"] = sum(1 for t in transactions if t.get("status") in ["pending", "processing"])
+        # The real rent-payment state lives on the agreement row, NOT on the
+        # `transactions` table:
+        #   - `transactions.status` is CHECK-constrained to
+        #     pending/held/released/refunded/failed — there is no 'completed'
+        #     and no 'processing', so counting that table always produced
+        #     completedPayments=0 and mis-labelled landlord payout rows
+        #     (pending/held) as the tenant's "pending payments".
+        #   - `agreements.reconciliation_status` is the source of truth for a
+        #     received + confirmed payment (set by the reconciliation engine
+        #     and by the simulate-payment/demo paths).
+        #   - Inbound collections are tracked in virtual_account_transfers
+        #     (the PropFlow simulate path writes no transactions row at all).
+        transactions = (transactions_result.data or []) if transactions_result else []
+        inbound_tx = [
+            t for t in transactions
+            if t.get("transaction_type") == "nomba_collection"
+        ]
+
+        # Fetch inbound transfers for the tenant's agreements by NUBAN ref
+        virtual_transfers = []
+        account_refs = [a.get("nomba_account_ref") for a in agreements if a.get("nomba_account_ref")]
+        if account_refs:
+            try:
+                vt_result = run_db_sync(
+                    lambda: supabase_admin.table("virtual_account_transfers")
+                        .select("id, reconciliation_result")
+                        .in_("account_ref", account_refs).execute()
+                )
+                virtual_transfers = (vt_result.data or []) if vt_result else []
+            except Exception as e:
+                logger.warning(f"Could not fetch virtual_account_transfers for {tenant_id} (degraded): {e}")
+
+        CONFIRMED_STATUSES = ("FULL_PAYMENT", "RECONCILED", "OVERPAYMENT")
+
+        # One expected rent payment per signed/active agreement (effective status)
+        expected_payment_count = sum(
+            1 for eff_status in agreement_statuses
+            if eff_status in ("SIGNED", "ACTIVE")
+        )
+        # Agreements whose current period payment has been received + confirmed
+        received_count = sum(
+            1 for agr in agreements
+            if agr.get("reconciliation_status") in CONFIRMED_STATUSES
+        )
+        # Inbound collections — count once even when both ledgers recorded the
+        # same transfer (real webhook path writes both tables)
+        collections = max(len(inbound_tx), len(virtual_transfers))
+        # Collections beyond the single period the agreement status tracks
+        extra_collections = max(0, collections - received_count)
+
+        stats["totalPayments"] = expected_payment_count + extra_collections
+        stats["completedPayments"] = received_count + extra_collections
+        stats["paymentsDue"] = max(0, expected_payment_count - received_count)
         
         # Trust Score
-        if user_result.data:
-            stats["trustScore"] = user_result.data.get("trust_score", 50)
+        user_data = user_result.data if user_result else None
+        if user_data:
+            stats["trustScore"] = user_data.get("trust_score") or 50
             
         # Engagement Score
-        messages_sent = len(messages_sent_result.data or [])
+        messages_sent = len((messages_sent_result.data or []) if messages_sent_result else [])
         activity_score = (
             stats["totalFavorites"] * 3 +
             len(viewings) * 4 +
@@ -470,11 +543,13 @@ def calculate_tenant_stats(tenant_id: str) -> dict:
 def fetch_favorites(tenant_id: str) -> List[dict]:
     """Fetch tenant favorites with property details"""
     try:
-        result = supabase_admin.table("favorites") \
-            .select("id, property_id, created_at") \
-            .eq("tenant_id", tenant_id) \
-            .order("created_at", desc=True) \
-            .limit(100).execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("favorites") \
+                .select("id, property_id, created_at") \
+                .eq("tenant_id", tenant_id) \
+                .order("created_at", desc=True) \
+                .limit(100).execute()
+        )
         
         if not result.data:
             logger.warning(f"No favorites found for user {tenant_id}")
@@ -516,13 +591,15 @@ def fetch_favorites(tenant_id: str) -> List[dict]:
 def fetch_viewing_requests(tenant_id: str) -> List[dict]:
     """Fetch tenant viewing requests with property and landlord details"""
     try:
-        result = supabase_admin.table("viewing_requests") \
-            .select(
-                "id, property_id, landlord_id, status, preferred_date, confirmed_date, "
-                "confirmed_time, time_slot, viewing_type, created_at, updated_at"
-            ) \
-            .eq("tenant_id", tenant_id) \
-            .order("created_at", desc=True).execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("viewing_requests") \
+                .select(
+                    "id, property_id, landlord_id, status, preferred_date, confirmed_date, "
+                    "confirmed_time, time_slot, viewing_type, created_at, updated_at"
+                ) \
+                .eq("tenant_id", tenant_id) \
+                .order("created_at", desc=True).execute()
+        )
         
         if not result.data:
             logger.warning(f"No viewing requests found for user {tenant_id}")
@@ -578,13 +655,15 @@ def fetch_viewing_requests(tenant_id: str) -> List[dict]:
 def fetch_conversations(tenant_id: str) -> List[dict]:
     """Fetch tenant conversations"""
     try:
-        result = supabase_admin.table("conversations") \
-            .select(
-                "id, property_id, landlord_id, last_message, last_message_at, "
-                "created_at, updated_at"
-            ) \
-            .eq("tenant_id", tenant_id) \
-            .order("updated_at", desc=True).execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("conversations") \
+                .select(
+                    "id, property_id, landlord_id, last_message, last_message_at, "
+                    "created_at, updated_at"
+                ) \
+                .eq("tenant_id", tenant_id) \
+                .order("updated_at", desc=True).execute()
+        )
         
         if not result.data:
             logger.warning(f"No conversations found for user {tenant_id}")
@@ -684,16 +763,18 @@ def fetch_applications(tenant_id: str) -> List[dict]:
 def fetch_agreements(tenant_id: str) -> List[dict]:
     """Fetch tenant agreements"""
     try:
-        result = supabase_admin.table("agreements") \
-            .select(
-                "id, property_id, landlord_id, rent_amount, deposit_amount, status, "
-                "tenant_signed_at, landlord_signed_at, lease_start_date, lease_end_date, "
-                "payment_frequency, expected_payment_amount, total_received_amount, "
-                "reconciliation_status, virtual_account_number, virtual_account_name, "
-                "nomba_account_ref, created_at, updated_at"
-            ) \
-            .eq("tenant_id", tenant_id) \
-            .order("created_at", desc=True).execute()
+        result = run_db_sync(
+            lambda: supabase_admin.table("agreements") \
+                .select(
+                    "id, property_id, landlord_id, rent_amount, deposit_amount, status, "
+                    "tenant_signed_at, landlord_signed_at, lease_start_date, lease_end_date, "
+                    "payment_frequency, expected_payment_amount, total_received_amount, "
+                    "reconciliation_status, virtual_account_number, virtual_account_name, "
+                    "nomba_account_ref, created_at, updated_at"
+                ) \
+                .eq("tenant_id", tenant_id) \
+                .order("created_at", desc=True).execute()
+        )
         
         if not result.data:
             logger.warning(f"No agreements found for user {tenant_id}")
@@ -782,23 +863,37 @@ async def get_tenant_dashboard(current_user = Depends(get_current_user)):
         print(f"[TENANT DASHBOARD] Fetching dashboard for user: {tenant_id}")
         
         with ThreadPoolExecutor(max_workers=8) as executor:
-            stats_future = executor.submit(calculate_tenant_stats, tenant_id)
             favorites_future = executor.submit(fetch_favorites, tenant_id)
             viewings_future = executor.submit(fetch_viewing_requests, tenant_id)
             conversations_future = executor.submit(fetch_conversations, tenant_id)
             applications_future = executor.submit(fetch_applications, tenant_id)
             agreements_future = executor.submit(fetch_agreements, tenant_id)
             
-            stats = stats_future.result()
+            favorites = favorites_future.result()
+            viewings = viewings_future.result()
+            conversations = conversations_future.result()
+            applications = applications_future.result()
+            agreements = agreements_future.result()
+            
+            # Stats are DERIVED from the rows above (no duplicate queries) —
+            # this was the main source of the slow dashboard load.
+            stats = calculate_tenant_stats(
+                tenant_id,
+                favorites=favorites,
+                viewings=viewings,
+                conversations=conversations,
+                applications=applications,
+                agreements=agreements,
+            )
             fetch_failed = stats.pop("_fetch_failed", False)
             
             response = TenantDashboardResponse(
                 stats=TenantStats(**stats),
-                favorites=favorites_future.result(),
-                viewing_requests=viewings_future.result(),
-                conversations=conversations_future.result(),
-                applications=applications_future.result(),
-                agreements=agreements_future.result()
+                favorites=favorites,
+                viewing_requests=viewings,
+                conversations=conversations,
+                applications=applications,
+                agreements=agreements
             )
             
             # Save to cache

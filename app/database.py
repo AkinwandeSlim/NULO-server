@@ -95,6 +95,16 @@ def _is_transient_db_error(e: Exception) -> bool:
         "ssl:",
         "sslerror",
         "tlsv1_alert",
+        # Intermittent Supabase/Cloudflare HTTP-level hiccup observed in the
+        # server logs: ApiError {'message': 'JSON could not be generated',
+        # 'code': 400, 'details': '<html>...400 Bad Request...cloudflare...'}.
+        # The same query succeeds seconds later on a fresh connection, and
+        # reads are idempotent, so it is safe to retry.
+        "json could not be generated",
+        "cloudflare",
+        "502 bad gateway",
+        "503 service unavailable",
+        "524",  # Cloudflare timeout in front of Supabase
     )
     return any(m in msg for m in markers)
 
@@ -123,12 +133,24 @@ def run_db_sync(db_op, *args, max_retries=3, base_delay=0.4, **kwargs):
 async def run_db_async(db_op, *args, max_retries=3, base_delay=0.4, **kwargs):
     """Async variant of :func:`run_db_sync` for use directly in async routes.
 
-    Same semantics, but sleeps with ``asyncio.sleep`` so the event loop is
-    not blocked while waiting for the retry backoff.
+    PERF FIX (root cause of the agreement sign/detail Axios timeouts): this
+    helper used to call ``db_op()`` DIRECTLY on the FastAPI event loop — only
+    the retry backoff slept asynchronously. supabase-py is a *synchronous*
+    httpx client, so the actual network round-trip still stalled the loop for
+    its full duration (1-5s each on cold PostgREST connections). While blocked,
+    no other request could be served — the sign response couldn't flush and the
+    tenant page's 5s auto-refresh poll queued up behind it, so the frontend's
+    Axios timeout fired.
+
+    The blocking call is now offloaded to the thread pool via
+    ``asyncio.to_thread`` (same pattern the agreement list route already uses),
+    which frees the event loop for the whole round-trip. The retry backoff
+    still uses ``asyncio.sleep``. Signature is unchanged, so every existing
+    caller becomes non-blocking with no edits.
     """
     for attempt in range(max_retries):
         try:
-            return db_op(*args, **kwargs)
+            return await asyncio.to_thread(db_op, *args, **kwargs)
         except Exception as e:
             if _is_transient_db_error(e) and attempt < max_retries - 1:
                 sleep_s = base_delay * (attempt + 1)

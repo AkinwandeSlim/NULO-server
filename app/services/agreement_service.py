@@ -20,7 +20,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
-from app.database import supabase_admin, run_db_async
+from app.database import supabase_admin, run_db_async, run_db_sync
 
 logger = logging.getLogger(__name__)
 
@@ -835,14 +835,27 @@ Signatures below constitute acceptance of all terms and conditions.
         user_type: str,
         ip_address: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """Sign agreement (tenant or landlord) - unchanged"""
+        """Sign agreement (tenant or landlord).
+
+        PERF FIX: the two Supabase calls below are synchronous (supabase-py is
+        a sync client). They used to run directly inside this async method,
+        which BLOCKED the FastAPI event loop for the full duration of each
+        network round-trip (Rule 6 violation). On cold connections that meant
+        10s+ of total loop stall — the frontend's axios timeout fired before
+        the sign response could even be flushed. Both calls now run in the
+        thread pool via asyncio.to_thread + run_db_sync (which also retries
+        transient socket errors like WinError 10035).
+        """
         try:
             logger.info(f"🔥 [AGREEMENT SERVICE] Signing agreement {agreement_id} by {user_type} {user_id}")
             
-            # Get current agreement
-            agreement_response = supabase_admin.table("agreements").select("*").eq(
-                "id", agreement_id
-            ).single().execute()
+            # Get current agreement (offloaded to thread pool — never blocks the loop)
+            agreement_response = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("agreements").select("*").eq(
+                    "id", agreement_id
+                ).single().execute()
+            )
             
             if not agreement_response.data:
                 logger.error(f"❌ [AGREEMENT SERVICE] Agreement not found: {agreement_id}")
@@ -874,10 +887,13 @@ Signatures below constitute acceptance of all terms and conditions.
             merged_agreement = {**agreement, **update_data}
             update_data["status"] = AgreementService.derive_effective_status(merged_agreement)
             
-            # Update agreement
-            update_response = supabase_admin.table("agreements").update(update_data).eq(
-                "id", agreement_id
-            ).execute()
+            # Update agreement (offloaded to thread pool — never blocks the loop)
+            update_response = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("agreements").update(update_data).eq(
+                    "id", agreement_id
+                ).execute()
+            )
             
             if update_response.data:
                 logger.info(f"✅ [AGREEMENT SERVICE] Agreement {agreement_id} signed by {user_type}")

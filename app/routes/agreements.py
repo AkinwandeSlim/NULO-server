@@ -29,7 +29,7 @@ import asyncio
 import hashlib
 import re
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status
-from app.database import supabase_admin, run_db_async
+from app.database import supabase_admin, run_db_async, run_db_sync
 from app.middleware.auth import get_current_user, get_current_tenant, get_current_landlord
 from app.services.notification_service import notification_service
 from app.routes.tenant_dashboard import invalidate_tenant_cache
@@ -139,8 +139,106 @@ def _enrich(agreement: dict) -> dict:
     """
     Attach tenant, landlord, and property sub-objects to an agreement dict.
     Returns a new dict — does not mutate the original.
+
+    NOTE: this is the SYNC variant (kept for sync callers such as the PDF
+    generators). In ``async def`` routes use :func:`_enrich_async` instead —
+    this one runs 4 sequential blocking Supabase queries on the event loop.
     """
     tenant_data, landlord_data, property_data = _fetch_agreement_participants(agreement)
+    return {
+        **agreement,
+        "tenant": tenant_data,
+        "landlord": landlord_data,
+        "property": property_data,
+    }
+
+
+async def _enrich_async(agreement: dict) -> dict:
+    """
+    Non-blocking drop-in replacement for :func:`_enrich` in async routes.
+
+    PERF FIX: ``_enrich`` -> ``_fetch_agreement_participants`` runs 4
+    SEQUENTIAL synchronous Supabase queries (tenant, landlord, landlord_profiles,
+    property) directly on the FastAPI event loop. On cold PostgREST connections
+    each takes ~1-3s -> 4-12s of total loop stall. That stall is what made the
+    sign response (and every concurrent request, including the tenant page's 5s
+    auto-refresh poll) hang past the Axios timeout.
+
+    Each lookup now runs in the thread pool via ``asyncio.to_thread`` +
+    ``run_db_sync`` (which also retries transient WinError 10035 / timeout
+    errors), and all lookups run IN PARALLEL via ``asyncio.gather`` — so total
+    latency ~= the slowest single query instead of the sum. Each fetcher
+    swallows its own error and returns None, matching the never-raise contract
+    of ``_fetch_agreement_participants`` (a missing join never 500s the caller).
+    """
+    async def _fetch_tenant():
+        try:
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("users").select(
+                    "id, full_name, email, phone_number, avatar_url"
+                ).eq("id", agreement["tenant_id"]).execute()
+            )
+            return resp.data[0] if resp.data else None
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Could not fetch tenant {agreement.get('tenant_id')}: {e}")
+            return None
+
+    async def _fetch_landlord():
+        try:
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("users").select(
+                    "id, full_name, email, phone_number, avatar_url"
+                ).eq("id", agreement["landlord_id"]).execute()
+            )
+            landlord = resp.data[0] if resp.data else None
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Could not fetch landlord {agreement.get('landlord_id')}: {e}")
+            return None
+
+        # Merge bank details from landlord_profiles (shared-PK table) so the
+        # confirm-release dialog and receipt generation show real values
+        # instead of "Your Bank" / "••••••••" placeholders.
+        if landlord:
+            try:
+                bp = await asyncio.to_thread(
+                    run_db_sync,
+                    lambda: supabase_admin.table("landlord_profiles").select(
+                        "bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
+                    ).eq("id", agreement["landlord_id"]).execute()
+                )
+                if bp.data:
+                    profile = bp.data[0]
+                    landlord = {
+                        **landlord,
+                        "bank_account_number": profile.get("bank_account_number"),
+                        "bank_name": profile.get("bank_name"),
+                        "account_name": profile.get("account_name"),
+                        "bank_code": profile.get("bank_code"),
+                        "bank_verified_at": profile.get("bank_verified_at"),
+                    }
+            except Exception as e:
+                logger.warning(f"[AGREEMENTS] Could not fetch landlord_profiles for {agreement.get('landlord_id')}: {e}")
+        return landlord
+
+    async def _fetch_property():
+        try:
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("properties").select(
+                    "id, title, location, city, state, address, full_address, price, images, payment_frequency"
+                ).eq("id", agreement["property_id"]).execute()
+            )
+            return resp.data[0] if resp.data else None
+        except Exception as e:
+            logger.warning(f"[AGREEMENTS] Could not fetch property {agreement.get('property_id')}: {e}")
+            return None
+
+    tenant_data, landlord_data, property_data = await asyncio.gather(
+        _fetch_tenant(), _fetch_landlord(), _fetch_property()
+    )
+
     return {
         **agreement,
         "tenant": tenant_data,
@@ -249,98 +347,123 @@ async def get_agreements(
         landlord_ids = list(set(a.get("landlord_id") for a in agreements if a.get("landlord_id")))
         property_ids = list(set(a.get("property_id") for a in agreements if a.get("property_id")))
 
-        # Batch fetch all related data in 3 queries instead of 3N queries
-        tenants_map = {}
-        landlords_map = {}
-        properties_map = {}
+        # ✅ PERF FIX: The 5 enrichment queries below used to run SEQUENTIALLY
+        # (each ~1-3s on a cold PostgREST connection → 15s+ total, causing
+        # Axios timeouts on the frontend). They now run IN PARALLEL via
+        # asyncio.to_thread + gather, so total latency ≈ slowest single query.
+        async def _fetch_tenants():
+            if not tenant_ids:
+                return {}
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("users").select(
+                    "id, full_name, email, phone_number, avatar_url"
+                ).in_("id", tenant_ids).execute()
+            )
+            return {u["id"]: u for u in resp.data}
 
-        try:
-            if tenant_ids:
-                tenants_resp = await run_db_async(
-                    lambda: supabase_admin.table("users").select(
-                        "id, full_name, email, phone_number, avatar_url"
-                    ).in_("id", tenant_ids).execute()
-                )
-                tenants_map = {u["id"]: u for u in tenants_resp.data}
-        except Exception as e:
-            logger.warning(f"[AGREEMENTS] Batch fetch tenants failed: {e}")
+        async def _fetch_landlords():
+            if not landlord_ids:
+                return {}
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("users").select(
+                    "id, full_name, email, phone_number, avatar_url"
+                ).in_("id", landlord_ids).execute()
+            )
+            return {u["id"]: u for u in resp.data}
 
-        try:
-            if landlord_ids:
-                landlords_resp = await run_db_async(
-                    lambda: supabase_admin.table("users").select(
-                        "id, full_name, email, phone_number, avatar_url"
-                    ).in_("id", landlord_ids).execute()
-                )
-                landlords_map = {u["id"]: u for u in landlords_resp.data}
-        except Exception as e:
-            logger.warning(f"[AGREEMENTS] Batch fetch landlords failed: {e}")
+        async def _fetch_landlord_profiles():
+            if not landlord_ids:
+                return {}
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("landlord_profiles").select(
+                    "id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
+                ).in_("id", landlord_ids).execute()
+            )
+            return {p["id"]: p for p in resp.data}
+
+        async def _fetch_properties():
+            if not property_ids:
+                return {}
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("properties").select(
+                    "id, title, location, city, state, address, full_address, price, images, payment_frequency"
+                ).in_("id", property_ids).execute()
+            )
+            return {p["id"]: p for p in resp.data}
+
+        async def _fetch_disbursements():
+            if not agreements:
+                return {}
+            resp = await asyncio.to_thread(
+                run_db_sync,
+                lambda: supabase_admin.table("transactions").select(
+                    "agreement_id, status, amount, nomba_transfer_ref"
+                ).in_("agreement_id", [a["id"] for a in agreements if a.get("id")])
+                .in_("transaction_type", ["nomba_disbursement"])
+                .order("created_at", desc=True)
+                .execute()
+            )
+            logger.info(f"[AGREEMENTS] Fetched {len(resp.data)} disbursements")
+            latest = {}
+            for d in resp.data:
+                aid = d["agreement_id"]
+                if aid not in latest:
+                    latest[aid] = d
+                elif d.get("status") == "released":
+                    latest[aid] = d
+            return latest
+
+        tenants_map, landlords_map, profiles_map, properties_map, disbursements_map = await asyncio.gather(
+            _fetch_tenants(),
+            _fetch_landlords(),
+            _fetch_landlord_profiles(),
+            _fetch_properties(),
+            _fetch_disbursements(),
+            return_exceptions=True,
+        )
+
+        # gather(return_exceptions=True) yields Exception objects for failed
+        # fetchers — degrade gracefully to empty maps (same behaviour as the
+        # old per-query try/except blocks).
+        if isinstance(tenants_map, BaseException):
+            logger.warning(f"[AGREEMENTS] Batch fetch tenants failed: {tenants_map}")
+            tenants_map = {}
+        if isinstance(landlords_map, BaseException):
+            logger.warning(f"[AGREEMENTS] Batch fetch landlords failed: {landlords_map}")
+            landlords_map = {}
+        if isinstance(profiles_map, BaseException):
+            logger.warning(f"[AGREEMENTS] Batch fetch landlord_profiles failed: {profiles_map}")
+            profiles_map = {}
+        if isinstance(properties_map, BaseException):
+            logger.warning(f"[AGREEMENTS] Batch fetch properties failed: {properties_map}")
+            properties_map = {}
+        if isinstance(disbursements_map, BaseException):
+            logger.warning(f"[AGREEMENTS] Batch fetch disbursements failed: {disbursements_map}")
+            disbursements_map = {}
 
         # Merge bank details from landlord_profiles into landlords_map.
         # landlord_profiles shares the same PK as users, so id == landlord_id.
         # Without this, every confirm-release dialog shows "Your Bank / ••••••••".
-        try:
-            if landlord_ids:
-                profiles_resp = await run_db_async(
-                    lambda: supabase_admin.table("landlord_profiles").select(
-                        "id, bank_account_number, bank_name, account_name, bank_code, bank_verified_at"
-                    ).in_("id", landlord_ids).execute()
-                )
-                for profile in profiles_resp.data:
-                    lid = profile["id"]
-                    if lid in landlords_map:
-                        landlords_map[lid] = {
-                            **landlords_map[lid],
-                            "bank_account_number": profile.get("bank_account_number"),
-                            "bank_name": profile.get("bank_name"),
-                            "account_name": profile.get("account_name"),
-                            "bank_code": profile.get("bank_code"),
-                            "bank_verified_at": profile.get("bank_verified_at"),
-                        }
-                    else:
-                        # landlord exists in profiles but not in users (edge case)
-                        landlords_map[lid] = profile
-        except Exception as e:
-            logger.warning(f"[AGREEMENTS] Batch fetch landlord_profiles failed: {e}")
+        for lid, profile in profiles_map.items():
+            if lid in landlords_map:
+                landlords_map[lid] = {
+                    **landlords_map[lid],
+                    "bank_account_number": profile.get("bank_account_number"),
+                    "bank_name": profile.get("bank_name"),
+                    "account_name": profile.get("account_name"),
+                    "bank_code": profile.get("bank_code"),
+                    "bank_verified_at": profile.get("bank_verified_at"),
+                }
+            else:
+                # landlord exists in profiles but not in users (edge case)
+                landlords_map[lid] = profile
 
-        try:
-            if property_ids:
-                properties_resp = await run_db_async(
-                    lambda: supabase_admin.table("properties").select(
-                        "id, title, location, city, state, address, full_address, price, images, payment_frequency"
-                    ).in_("id", property_ids).execute()
-                )
-                properties_map = {p["id"]: p for p in properties_resp.data}
-        except Exception as e:
-            logger.warning(f"[AGREEMENTS] Batch fetch properties failed: {e}")
-
-        # Batch fetch latest disbursement status for each agreement
-        disbursements_map = {}
-        try:
-            if agreements:
-                # Get the latest disbursement for each agreement
-                disbursements_resp = await run_db_async(
-                    lambda: supabase_admin.table("transactions").select(
-                        "agreement_id, status, amount, nomba_transfer_ref"
-                    ).in_("agreement_id", [a["id"] for a in agreements if a.get("id")]) \
-                    .in_("transaction_type", ["nomba_disbursement"]) \
-                    .order("created_at", desc=True) \
-                    .execute()
-                )
-                logger.info(f"[AGREEMENTS] Fetched {len(disbursements_resp.data)} disbursements")
-                # Keep only the latest disbursement per agreement.
-                # But prefer a 'released' row over a 'failed' row — if we already
-                # have a successful release, a stale failed row must not overwrite it.
-                for d in disbursements_resp.data:
-                    aid = d["agreement_id"]
-                    if aid not in disbursements_map:
-                        disbursements_map[aid] = d
-                    elif d.get("status") == "released":
-                        # Always let a released row win over any earlier failed entry
-                        disbursements_map[aid] = d
-                    logger.info(f"[AGREEMENTS] Agreement {aid} has disbursement status: {disbursements_map[aid].get('status')}")
-        except Exception as e:
-            logger.warning(f"[AGREEMENTS] Batch fetch disbursements failed: {e}")
+        for aid, d in disbursements_map.items():
+            logger.info(f"[AGREEMENTS] Agreement {aid} has disbursement status: {d.get('status')}")
 
         # Attach pre-fetched data to each agreement
         enhanced = []
@@ -704,28 +827,24 @@ async def sign_agreement(
         # ── PropFlow graph sync: once BOTH parties have signed, advance the
         #     workflow past the signing gate so provision_nomba_dva runs (real/
         #     mock VA). Best-effort — a graph hiccup must never fail the sign.
+        #     ⚠️ Runs as a BACKGROUND TASK: advance_after_sign triggers DVA
+        #     provisioning which makes external Nomba API calls (15s timeout
+        #     each) + multiple DB queries. Awaiting it inline was causing the
+        #     frontend's 30s axios timeout to fire before the response arrived.
         if str(agreement.get("status", "")).upper() == "SIGNED":
-            try:
-                from app.services.propflow_graph_sync import advance_after_sign
-                await advance_after_sign(agreement_id, supabase_admin)
-            except Exception as graph_err:
-                logger.warning(
-                    f"[AGREEMENTS] PropFlow graph advance failed (non-fatal): {graph_err}"
-                )
+            from app.services.propflow_graph_sync import advance_after_sign
+            background_tasks.add_task(advance_after_sign, agreement_id, supabase_admin)
         # ── PropFlow graph sync: tenant signed first (via the agreement page,
         #     not the chat) → flip the thread stage to awaiting_landlord_signature
         #     so the PropFlow chat/status reflect the real state immediately.
+        #     Also backgrounded — graph checkpoint I/O must not block the sign
+        #     response.
         elif (
             user_type == "tenant"
             and str(agreement.get("status", "")).upper() == "PENDING_LANDLORD"
         ):
-            try:
-                from app.services.propflow_graph_sync import sync_stage_after_tenant_sign
-                await sync_stage_after_tenant_sign(agreement_id, supabase_admin)
-            except Exception as graph_err:
-                logger.warning(
-                    f"[AGREEMENTS] PropFlow tenant-sign stage sync failed (non-fatal): {graph_err}"
-                )
+            from app.services.propflow_graph_sync import sync_stage_after_tenant_sign
+            background_tasks.add_task(sync_stage_after_tenant_sign, agreement_id, supabase_admin)
 
         enriched = _enrich(agreement)
 

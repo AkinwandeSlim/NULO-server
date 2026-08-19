@@ -418,8 +418,14 @@ def _build_landlord_briefing(
         # component (bullets become real list items) while the chat widget and
         # any plain-text consumer keep it as clean, readable lines — so keep
         # the syntax light: only newlines and "- " bullets, no ** or # markup.
-        parts.append("What we know:")
-        parts.extend(f"- {f}" for f in facts)
+        # Blocks (header / label+list / gaps) are joined with a blank line
+        # ("\n\n") at the end of this function so the Markdown renderer keeps
+        # them as separate paragraphs and a real bullet list. A single "\n" is
+        # collapsed to a space by Markdown, which merged the header into the
+        # label and let the gaps line be absorbed into the last bullet as a
+        # lazy continuation. Bullets inside the list stay single-spaced.
+        bullets = "\n".join(f"- {f}" for f in facts)
+        parts.append(f"What we know:\n\n{bullets}")
     else:
         parts.append("No additional details were provided by the tenant.")
 
@@ -434,7 +440,11 @@ def _build_landlord_briefing(
     if missing:
         parts.append(f"Not provided by tenant: {', '.join(missing)}.")
 
-    return "\n".join(parts)
+    # Blank line between blocks so the Markdown renderer keeps the header,
+    # the "What we know:" label + bullet list, and the gaps line as separate
+    # paragraphs. With single "\n" they collapsed into one paragraph and the
+    # gaps line was absorbed into the last bullet (lazy continuation).
+    return "\n\n".join(parts)
 
 
 def _fmt_ngn(value) -> str:
