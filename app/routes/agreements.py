@@ -708,7 +708,11 @@ async def get_agreement(
                 detail="Not authorized to view this agreement"
             )
 
-        enriched = _enrich(agreement)
+        # PERF FIX: use the async/parallel enrichment variant in this async route.
+        # The sync _enrich runs 4 sequential blocking Supabase queries on the event
+        # loop, which stalled concurrent requests (tenant poll, dashboards) past the
+        # Axios timeout under flaky connections.
+        enriched = await _enrich_async(agreement)
 
         # Fetch latest disbursement status for this agreement.
         # Prefer 'released' over 'failed' — a stale failed row must not
@@ -751,20 +755,31 @@ async def get_agreement(
         clean_agreement_id = uuid_match.group(0) if uuid_match else agreement_id
         suffixed_account_ref = f"{clean_agreement_id}-SUB"
 
-        transfers = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: supabase_admin
-                .table("virtual_account_transfers")
-                .select(
-                    "id, account_ref, account_number, amount_received, currency, "
-                    "sender_name, sender_bank, reconciliation_result, transaction_type, "
-                    "event_type, nomba_request_id, nomba_transaction_id, created_at"
-                )
-                .eq("account_ref", suffixed_account_ref)
-                .order("created_at", desc=True)
-                .execute(),
-        )
-        transfer_history = transfers.data or []
+        # DEFENSIVE FIX: fetch transfer history through run_db_async (transient
+        # retry) AND guard it with try/except. This is the request that produced
+        # the intermittent 500 on the tenant detail page — a single transient
+        # Supabase ConnectionTerminated / WinError 10035 here would propagate to
+        # the outer handler and return 500 even though the agreement itself
+        # loaded fine. On failure we degrade to an empty list (200) instead.
+        try:
+            transfers_resp = await run_db_async(
+                lambda: supabase_admin
+                    .table("virtual_account_transfers")
+                    .select(
+                        "id, account_ref, account_number, amount_received, currency, "
+                        "sender_name, sender_bank, reconciliation_result, transaction_type, "
+                        "event_type, nomba_request_id, nomba_transaction_id, created_at"
+                    )
+                    .eq("account_ref", suffixed_account_ref)
+                    .order("created_at", desc=True)
+                    .execute()
+            )
+            transfer_history = transfers_resp.data or []
+        except Exception as e:
+            logger.warning(
+                f"[AGREEMENTS] Failed to fetch transfer history for {agreement_id}: {e}"
+            )
+            transfer_history = []
 
         logger.info(f"✅ [AGREEMENTS] Returning agreement {agreement_id} to {user_type} {user_id}")
         return {

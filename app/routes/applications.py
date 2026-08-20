@@ -807,11 +807,22 @@ async def approve_application(
                     f"🔄 [PROPFLOW] Resumed workflow {propflow_thread_id} after manual "
                     f"approval → stage={resume_result.get('current_stage', 'unknown')}"
                 )
+                # The PropFlow graph has ALREADY created the agreement synchronously
+                # (the `create_agreement` node ran inside ainvoke). Surface the
+                # generated agreement_id in the response so the landlord frontend can
+                # redirect straight to /landlord/agreements/{id} without issuing a
+                # fragile secondary getByApplication call (audit gap G4).
+                agreement_id = resume_result.get("agreement_id")
+                agreement_payload = None
+                if agreement_id:
+                    agreement_payload = {"id": agreement_id}
                 return {
                     "success": True,
                     "application": updated_app_response.data,
+                    "agreement": agreement_payload,
+                    "agreement_id": agreement_id,
                     "propflow_resumed": True,
-                    "message": "Application approved. PropFlow workflow resumed \u2014 agreement will be generated automatically.",
+                    "message": "Application approved. PropFlow workflow resumed \u2014 agreement generated automatically.",
                 }
             except Exception as propflow_err:
                 logger.warning(

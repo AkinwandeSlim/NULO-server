@@ -671,6 +671,36 @@ Signatures below constitute acceptance of all terms and conditions.
         try:
             logger.info(f"🔥 [AGREEMENT SERVICE] Auto-generating enhanced agreement for application {application_id}")
 
+            # ── Idempotency guard ──────────────────────────────────────────────
+            # A single application must produce at most one agreement. If an
+            # agreement already exists for this application_id (e.g. the
+            # landlord double-approved, or the PropFlow graph resumed and
+            # re-ran the create_agreement node), return the existing row
+            # instead of re-running AI generation and inserting a duplicate.
+            # This also prevents a duplicate "agreement created" notification.
+            try:
+                existing = await run_db_async(
+                    lambda: supabase_admin.table("agreements")
+                        .select("*")
+                        .eq("application_id", application_id)
+                        .limit(1)
+                        .execute()
+                )
+            except Exception as exc:
+                # A transient read failure should not block creation; fall
+                # through and attempt the insert (which errors cleanly on its
+                # own if the DB is genuinely down).
+                logger.warning(f"⚠️ [AGREEMENT SERVICE] Idempotency check failed for {application_id}: {exc}")
+                existing = None
+
+            if existing and existing.data:
+                existing_row = existing.data[0]
+                logger.info(
+                    f"✅ [AGREEMENT SERVICE] Idempotent no-op: agreement {existing_row.get('id')} "
+                    f"already exists for application {application_id} — skipping re-creation"
+                )
+                return existing_row
+
             # Calculate standard lease dates
             lease_dates = AgreementService.calculate_standard_lease_dates()
 
