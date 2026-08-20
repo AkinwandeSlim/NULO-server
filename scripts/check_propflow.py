@@ -24,6 +24,15 @@ os.environ.setdefault("SUPABASE_KEY",         "placeholder")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "placeholder")
 os.environ.setdefault("JWT_SECRET_KEY",       "placeholder")
 
+# Windows consoles default to cp1252 and cannot print emoji/box-drawing chars —
+# force UTF-8 on stdout/stderr so this script runs without PYTHONIOENCODING.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 errors = []
 passes = []
 
@@ -108,7 +117,7 @@ try:
         "raw_inquiry_text", "extracted_intent", "extraction_confidence",
         "property_matches", "selected_property_id",
         "application_id", "application_status",
-        "agreement_id", "agreement_status", "agreement_pdf_oss_key",
+        "agreement_id", "agreement_status", "agreement_pdf_storage_key", "agreement_pdf_url",
         "nomba_account_ref", "nomba_virtual_account_number", "expected_payment_amount",
         "reconciliation_status", "disbursement_merchant_tx_ref",
         "prior_tenant_memories", "prior_landlord_memories",
@@ -273,7 +282,7 @@ except Exception as e:
 
 # -- 4. services/ -------------------------------------------------------------
 print("\n4. services/")
-for svc in ["qwen_client", "mem0_client", "oss_client"]:
+for svc in ["qwen_client", "mem0_client", "supabase_storage_client"]:
     try:
         __import__("app.propflow.services." + svc)
         ok("services/" + svc + ".py")
@@ -323,8 +332,7 @@ try:
         content = f.read()
     for key in [
         "QWEN_API_KEY", "QWEN_API_URL", "QWEN_MODEL",
-        "ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
-        "OSS_ENDPOINT", "OSS_BUCKET_NAME",
+        "AGREEMENT_STORAGE_BUCKET",
         "MEM0_MODE", "MEM0_LOCAL_PATH",
         "ENABLE_PROPFLOW", "INTENT_CONFIDENCE_THRESHOLD",
     ]:

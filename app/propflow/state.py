@@ -40,8 +40,10 @@ class PropFlowState(TypedDict):
     agreement_status: Optional[Literal[
         "PENDING_TENANT", "PENDING_LANDLORD", "SIGNED", "ACTIVE"
     ]]
-    # OSS key for the generated agreement PDF (Alibaba Cloud OSS)
-    agreement_pdf_oss_key: Optional[str]
+    # Supabase Storage path for the generated agreement draft PDF (ownership-docs bucket)
+    agreement_pdf_storage_key: Optional[str]
+    # Public URL for the generated agreement draft PDF (built via get_public_url)
+    agreement_pdf_url: Optional[str]
 
     # ── Nomba Monetary Infrastructure ────────────────────────────────────────
     nomba_account_ref: Optional[str]           # {agreement_id}-SUB

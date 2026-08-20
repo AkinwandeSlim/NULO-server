@@ -7,15 +7,15 @@ Responsibility:
   That service handles Groq AI generation with template fallback — we don't
   duplicate any of that logic here.
 
-  Optionally uploads the agreement PDF to Alibaba Cloud OSS so both parties
-  get a signed-URL download link (the mandatory hackathon proof file).
+  Optionally uploads the agreement PDF to Supabase Storage (ownership-docs
+  bucket) so both parties can view the draft via a public URL.
 
   Sets agreement_status = 'PENDING_TENANT' so the frontend knows to prompt
   the tenant to sign (INTERRUPT #2).
 
 Architecture:
   - Wraps agreement_service.auto_generate_agreement() — already production-tested
-  - OSS upload is non-blocking (graceful degradation if creds not set)
+  - Supabase Storage upload is non-blocking (graceful degradation if unavailable)
   - Supabase reads offloaded to the thread pool via run_db_async (retry-aware),
     so a transient connection hiccup (HTTP/2 ConnectionTerminated, WinError
     10035, ...) is retried instead of aborting agreement creation.
@@ -27,6 +27,7 @@ import uuid
 from typing import Optional
 
 from app.propflow.state import PropFlowState
+from app.propflow.services.supabase_storage_client import storage_client
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
       2. Fetch landlord name and tenant data for agreement generation
       3. Fetch property data for agreement terms
       4. Delegate to agreement_service.auto_generate_agreement()
-      5. Optionally upload PDF to Alibaba Cloud OSS
+      5. Optionally upload PDF to Supabase Storage
       6. Return updated state with agreement_id and agreement_status
 
     Args:
@@ -49,7 +50,8 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
 
     Returns:
         Updated state with agreement_id, agreement_status='PENDING_TENANT',
-        agreement_pdf_oss_key (if OSS available), and current_stage.
+        agreement_pdf_storage_key + agreement_pdf_url (if storage available),
+        and current_stage.
     """
     application_id = state.get("application_id")
     property_id    = state.get("selected_property_id")
@@ -151,25 +153,33 @@ async def create_agreement_node(state: PropFlowState) -> PropFlowState:
         f"source={agreement.get('agreement_source', 'unknown')}"
     )
 
-    # ── Step 4: Upload PDF to Alibaba Cloud OSS (optional) ───────────────────
-    # The PDF is generated from agreement["terms"] (the text content).
-    # If OSS is not configured this is a no-op — workflow continues.
-    oss_key = await _upload_agreement_to_oss(
+    # ── Step 4: Upload PDF to Supabase Storage (optional) ────────────────────
+    # The PDF is generated from agreement["terms"] (the text content) and
+    # stored in the public `ownership-docs` bucket. If storage is unavailable
+    # this is a no-op — the workflow continues (draft simply not stored).
+    storage_path = await _upload_agreement_to_supabase(
         agreement_id=str(agreement_id),
         agreement_terms=agreement.get("terms", ""),
         tenant_name=tenant_data.get("full_name", "Tenant"),
         property_title=property_data.get("title", "Property"),
     )
 
+    # Build a public URL from the stored path so tenants/landlords can view
+    # the draft PDF (ownership-docs is a public bucket → permanent URL).
+    agreement_pdf_url = None
+    if storage_path:
+        agreement_pdf_url = storage_client.get_download_url(storage_path)
+
     # propflow_workflow_id is embedded in generation_metadata by
     # agreement_service.auto_generate_agreement() — no separate UPDATE needed.
 
     return {
         **state,
-        "agreement_id":           agreement_id,
-        "agreement_status":       agreement_status,
-        "agreement_pdf_oss_key":  oss_key,
-        "current_stage":          "agreement_drafted",
+        "agreement_id":              agreement_id,
+        "agreement_status":          agreement_status,
+        "agreement_pdf_storage_key": storage_path,
+        "agreement_pdf_url":         agreement_pdf_url,
+        "current_stage":             "agreement_drafted",
     }
 
 
@@ -234,41 +244,46 @@ async def _fetch_landlord(landlord_id: str, supabase_admin, run_db_async) -> dic
         return {"full_name": "Landlord"}
 
 
-async def _upload_agreement_to_oss(
+async def _upload_agreement_to_supabase(
     agreement_id: str,
     agreement_terms: str,
     tenant_name: str,
     property_title: str,
 ) -> Optional[str]:
     """
-    Generate a minimal PDF from the agreement terms text and upload to OSS.
-    Returns the OSS key on success, None if OSS is unavailable or upload fails.
+    Generate a minimal PDF from the agreement terms text and upload it to
+    Supabase Storage (ownership-docs bucket).
+    Returns the storage path on success, None if storage is unavailable or
+    the upload fails.
 
     PDF generation uses reportlab (already in requirements.txt).
-    This is the mandatory Alibaba Cloud proof: oss_client.py stores the file,
-    and the judge can request a signed URL to verify the upload.
+    Mirrors the signed-PDF generator in app/routes/agreements.py which also
+    writes to ownership-docs/agreements/{id}.pdf — PropFlow drafts use a
+    sub-path with a timestamp/uuid suffix so they never clobber the final
+    signed document.
     """
     try:
-        from app.propflow.services.oss_client import oss_client
-        if not oss_client.available:
-            logger.info("[create_agreement] OSS not configured — skipping PDF upload")
-            return None
+        from app.propflow.services.supabase_storage_client import storage_client
 
         # Generate PDF bytes from agreement text using reportlab
         pdf_bytes = _build_pdf(agreement_terms, tenant_name, property_title)
         if not pdf_bytes:
             return None
 
-        oss_key = oss_client.upload_agreement_pdf(
+        path = await storage_client.upload_agreement_pdf(
             agreement_id=agreement_id,
             pdf_bytes=pdf_bytes,
         )
-        if oss_key:
-            logger.info(f"[create_agreement] PDF uploaded to OSS: {oss_key}")
-        return oss_key
+        if path:
+            logger.info(
+                f"[create_agreement] Draft PDF uploaded to Supabase Storage: {path}"
+            )
+        return path
 
     except Exception as exc:
-        logger.warning(f"[create_agreement] OSS upload failed (non-fatal): {exc}")
+        logger.warning(
+            f"[create_agreement] Supabase Storage upload failed (non-fatal): {exc}"
+        )
         return None
 
 

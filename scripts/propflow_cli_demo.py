@@ -24,6 +24,15 @@ from unittest.mock import patch, AsyncMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Windows consoles default to cp1252 and cannot print emoji/box-drawing chars —
+# force UTF-8 on stdout/stderr so this script runs without PYTHONIOENCODING.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # -- ANSI colors -----------------------------------------------------------------
 CYAN = "\033[96m"
 GREEN = "\033[92m"
@@ -164,7 +173,8 @@ def _make_state(thread_id: str) -> dict:
         "application_status": None,
         "agreement_id": None,
         "agreement_status": None,
-        "agreement_pdf_oss_key": None,
+        "agreement_pdf_storage_key": None,
+        "agreement_pdf_url": None,
         "nomba_account_ref": None,
         "nomba_virtual_account_number": None,
         "expected_payment_amount": None,

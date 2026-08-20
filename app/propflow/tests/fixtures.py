@@ -23,6 +23,9 @@ from typing import Dict, List, Any
 # SAMPLE TENANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# NOTE: The setup-guide markdown below is kept as a raw string so this module
+# stays importable. It documents the external services PropFlow tests touch.
+_SETUP_GUIDE = r"""
 ### **2. Mem0 API (RECOMMENDED)**
 
 **Step 1**: Go to [Mem0.ai](https://mem0.ai/)
@@ -45,21 +48,16 @@ MEM0_LLM_MODEL=gpt-4o-mini
 MEM0_ENABLED=false  # Uses mock memory instead
 ```
 
-### **3. Alibaba Cloud OSS (HACKATHON PROOF FILE)**
+### **3. Agreement PDF Storage (Supabase Storage)**
 
-**Step 1**: Go to [Alibaba Cloud OSS Console](https://oss.console.aliyun.com/)  
-**Step 2**: Create OSS bucket (e.g., `nuloafrica-agreements`)
-**Step 3**: Go to **RAM Access Control** → **AccessKey Management**
-**Step 4**: Create AccessKey pair
-**Step 5**: Note down AccessKeyId and AccessKeySecret
+PropFlow draft agreement PDFs are stored in the existing **`ownership-docs`**
+Supabase Storage bucket (public) under `agreements/{agreement_id}/...`.
+No extra account or credentials are needed — the same Supabase service-role
+client used everywhere else handles the upload.
 
-**Configuration**:
+**Configuration** (optional override):
 ```bash
-OSS_ACCESS_KEY_ID=your-oss-access-key-id
-OSS_ACCESS_KEY_SECRET=your-oss-access-key-secret
-OSS_BUCKET_NAME=nuloafrica-agreements
-OSS_ENDPOINT=https://oss-us-west-1.aliyuncs.com
-OSS_ENABLED=true
+AGREEMENT_STORAGE_BUCKET=ownership-docs
 ```
 
 ### **4. Supabase Database**
@@ -455,6 +453,8 @@ python scripts/generate_demo_report.py --output demo_results.md
 **Guide Status**: ✅ **Complete**  
 **Last Updated**: July 15, 2026  
 **PropFlow Version**: 3.1.0
+"""
+
 SAMPLE_TENANTS: List[Dict[str, Any]] = [
     {
         "id": "550e8400-e29b-41d4-a716-446655440001",

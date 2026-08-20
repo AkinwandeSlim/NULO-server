@@ -100,6 +100,10 @@ class ResumeResponse(BaseModel):
     response_message: str
     agreement_id: Optional[str] = None
     virtual_account_number: Optional[str] = None
+    # Public URL of the draft agreement PDF (Supabase Storage, ownership-docs
+    # bucket) — populated once create_agreement has uploaded the PDF so the
+    # frontend can offer a download link without a page refresh.
+    agreement_pdf_url: Optional[str] = None
     error_message: Optional[str] = None
 
 class StatusResponse(BaseModel):
@@ -119,6 +123,9 @@ class StatusResponse(BaseModel):
     # tenant's PropFlow chat can display the NUBAN + amount without a page refresh.
     virtual_account_number: Optional[str] = None
     expected_payment_amount: Optional[float] = None
+    # Draft agreement PDF public URL (Supabase Storage) — populated once
+    # create_agreement has uploaded the PDF.
+    agreement_pdf_url: Optional[str] = None
     error_log: list[str] = []
 
 
@@ -360,7 +367,8 @@ async def start_propflow_chat(
             application_status=None,
             agreement_id=None,
             agreement_status=None,
-            agreement_pdf_oss_key=None,
+            agreement_pdf_storage_key=None,
+            agreement_pdf_url=None,
             nomba_account_ref=None,
             nomba_virtual_account_number=None,
             expected_payment_amount=None,
@@ -492,7 +500,8 @@ async def guest_search(request: ChatRequest):
             application_status=None,
             agreement_id=None,
             agreement_status=None,
-            agreement_pdf_oss_key=None,
+            agreement_pdf_storage_key=None,
+            agreement_pdf_url=None,
             nomba_account_ref=None,
             nomba_virtual_account_number=None,
             expected_payment_amount=None,
@@ -1251,6 +1260,7 @@ async def resume_propflow_workflow(
             response_message=response_message,
             agreement_id=str(result["agreement_id"]) if result.get("agreement_id") else None,
             virtual_account_number=result.get("nomba_virtual_account_number"),
+            agreement_pdf_url=result.get("agreement_pdf_url"),
         )
 
     except Exception as e:
@@ -1441,6 +1451,7 @@ async def get_propflow_status(
             landlord_briefing=values.get("landlord_briefing"),
             virtual_account_number=values.get("nomba_virtual_account_number"),
             expected_payment_amount=values.get("expected_payment_amount"),
+            agreement_pdf_url=values.get("agreement_pdf_url"),
             error_log=values.get("error_log", []),
         )
 

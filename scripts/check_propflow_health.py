@@ -21,10 +21,19 @@ from typing import Dict, List, Any
 # Add the server directory to the Python path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Windows consoles default to cp1252 and cannot print emoji/box-drawing chars —
+# force UTF-8 on stdout/stderr so this script runs without PYTHONIOENCODING.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from app.propflow.config import get_propflow_settings
 from app.propflow.services.qwen_client import qwen_client  # ✅ Use global instance
 from app.propflow.services.mem0_client import mem0_service  # ✅ Use global instance  
-from app.propflow.services.oss_client import OSSClient
+from app.propflow.services.supabase_storage_client import storage_client
 from app.propflow.graph import get_propflow_graph  # ✅ Use global graph getter
 from app.database import get_supabase_admin
 
@@ -82,7 +91,7 @@ class PropFlowHealthChecker:
             # Check optional service configs
             optional_configs = [
                 ("ENABLE_MEM0_MEMORY", self.settings.ENABLE_MEM0_MEMORY),
-                ("ENABLE_OSS_STORAGE", self.settings.ENABLE_OSS_STORAGE)
+                ("AGREEMENT_STORAGE_BUCKET", self.settings.AGREEMENT_STORAGE_BUCKET)
             ]
             
             for config_name, config_value in optional_configs:
@@ -191,9 +200,9 @@ class PropFlowHealthChecker:
         
         return result
     
-    async def check_oss_service(self) -> Dict[str, Any]:
-        """Check Alibaba Cloud OSS service."""
-        self._log("☁️  Checking Alibaba Cloud OSS...")
+    async def check_storage_service(self) -> Dict[str, Any]:
+        """Check Supabase Storage service (ownership-docs bucket)."""
+        self._log("☁️  Checking Supabase Storage...")
         
         result = {
             "status": "healthy",
@@ -201,27 +210,26 @@ class PropFlowHealthChecker:
             "errors": []
         }
         
-        if not self.settings.ENABLE_OSS_STORAGE:  # ✅ Use correct setting name
-            result["status"] = "disabled"
-            result["details"]["service"] = "✗ Disabled in configuration"
-            self._log(f"   📋 OSS: Disabled")
-            return result
-        
         try:
-            oss_client = OSSClient()
-            
-            # Test bucket access (without uploading)
-            # Note: This might need to be adjusted based on actual OSSClient implementation
-            result["details"]["bucket_access"] = f"✓ {self.settings.OSS_BUCKET_NAME}"
-            result["details"]["endpoint"] = f"✓ {self.settings.OSS_ENDPOINT}"
-            
-            self._log(f"   ✅ OSS configuration: OK")
-            self._log(f"   ✅ Endpoint: {self.settings.OSS_ENDPOINT}")
+            # Verify the storage client can build a public URL for the
+            # agreement bucket (no upload performed — read-only probe).
+            bucket = self.settings.AGREEMENT_STORAGE_BUCKET
+            probe_path = "agreements/health-check-probe.pdf"
+            url = storage_client.get_download_url(probe_path)
+            if url:
+                result["details"]["bucket_access"] = f"✓ {bucket}"
+                result["details"]["public_url_format"] = "✓ get_public_url OK"
+                self._log(f"   ✅ Storage configuration: OK")
+                self._log(f"   ✅ Bucket: {bucket}")
+            else:
+                result["status"] = "error"
+                result["errors"].append("get_public_url returned None")
+                self._log(f"   ❌ Storage probe failed: get_public_url returned None", "error")
             
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
-            self._log(f"   ❌ OSS service error: {e}", "error")
+            self._log(f"   ❌ Storage service error: {e}", "error")
         
         return result
     
@@ -335,7 +343,7 @@ class PropFlowHealthChecker:
                 ("configuration", self.check_configuration),
                 ("qwen_api", self.check_qwen_api),
                 ("mem0_service", self.check_mem0_service),
-                ("oss_service", self.check_oss_service)
+                ("storage_service", self.check_storage_service)
             ]
         else:
             checks_to_run = [
@@ -344,7 +352,7 @@ class PropFlowHealthChecker:
                 ("propflow_graph", self.check_propflow_graph),
                 ("qwen_api", self.check_qwen_api),
                 ("mem0_service", self.check_mem0_service),
-                ("oss_service", self.check_oss_service)
+                ("storage_service", self.check_storage_service)
             ]
         
         for check_name, check_func in checks_to_run:
