@@ -644,6 +644,30 @@ Signatures below constitute acceptance of all terms and conditions.
         }
     
     @staticmethod
+    async def _get_agreement_for_application(application_id: str) -> Optional[Dict[str, Any]]:
+        """Return the single agreement for an application, if it exists."""
+        response = await run_db_async(
+            lambda: supabase_admin.table("agreements")
+                .select("*")
+                .eq("application_id", application_id)
+                .limit(1)
+                .execute()
+        )
+        return response.data[0] if response.data else None
+
+    @staticmethod
+    def _is_application_agreement_conflict(error: Exception) -> bool:
+        """Whether Postgres rejected a duplicate agreement for one application."""
+        error_code = str(getattr(error, "code", ""))
+        message = str(error).lower()
+        return (
+            error_code == "23505" or
+            "23505" in message or
+            "agreements_application_id_key" in message or
+            "duplicate key" in message
+        )
+
+    @staticmethod
     async def auto_generate_agreement(
         application_id: str,
         property_data: Dict[str, Any],
@@ -678,23 +702,11 @@ Signatures below constitute acceptance of all terms and conditions.
             # re-ran the create_agreement node), return the existing row
             # instead of re-running AI generation and inserting a duplicate.
             # This also prevents a duplicate "agreement created" notification.
-            try:
-                existing = await run_db_async(
-                    lambda: supabase_admin.table("agreements")
-                        .select("*")
-                        .eq("application_id", application_id)
-                        .limit(1)
-                        .execute()
-                )
-            except Exception as exc:
-                # A transient read failure should not block creation; fall
-                # through and attempt the insert (which errors cleanly on its
-                # own if the DB is genuinely down).
-                logger.warning(f"⚠️ [AGREEMENT SERVICE] Idempotency check failed for {application_id}: {exc}")
-                existing = None
-
-            if existing and existing.data:
-                existing_row = existing.data[0]
+            # This avoids repeat work for sequential retries. The database
+            # UNIQUE(application_id) constraint remains the authority when
+            # two requests execute concurrently.
+            existing_row = await AgreementService._get_agreement_for_application(application_id)
+            if existing_row:
                 logger.info(
                     f"✅ [AGREEMENT SERVICE] Idempotent no-op: agreement {existing_row.get('id')} "
                     f"already exists for application {application_id} — skipping re-creation"
@@ -737,9 +749,22 @@ Signatures below constitute acceptance of all terms and conditions.
             logger.info(f"🔥 [AGREEMENT SERVICE] Inserting enhanced agreement (source: {terms_result['source']})")
 
             # Insert agreement into database
-            agreement_response = await run_db_async(
-                lambda: supabase_admin.table("agreements").insert(agreement_dict).execute()
-            )
+            try:
+                agreement_response = await run_db_async(
+                    lambda: supabase_admin.table("agreements").insert(agreement_dict).execute()
+                )
+            except Exception as exc:
+                # The unique constraint resolves a read-then-insert race. Read
+                # the winning row and return it without duplicate side effects.
+                if AgreementService._is_application_agreement_conflict(exc):
+                    existing_row = await AgreementService._get_agreement_for_application(application_id)
+                    if existing_row:
+                        logger.info(
+                            "[AGREEMENT SERVICE] Concurrent creation resolved to existing "
+                            f"agreement {existing_row.get('id')} for application {application_id}"
+                        )
+                        return existing_row
+                raise
 
             if agreement_response.data:
                 agreement_id = agreement_response.data[0]['id']
@@ -801,7 +826,18 @@ Signatures below constitute acceptance of all terms and conditions.
                 return None
             
             application = app_response.data
-            
+            application_id = application["id"]
+
+            # The manual endpoint must follow the same one-agreement-per-
+            # application contract as automatic PropFlow creation.
+            existing_row = await AgreementService._get_agreement_for_application(application_id)
+            if existing_row:
+                logger.info(
+                    "[AGREEMENT SERVICE] Manual creation is an idempotent no-op: "
+                    f"agreement {existing_row.get('id')} already exists for application {application_id}"
+                )
+                return existing_row
+
             # Get property details
             property_response = supabase_admin.table("properties").select("*").eq(
                 "id", application["property_id"]
@@ -844,8 +880,22 @@ Signatures below constitute acceptance of all terms and conditions.
             agreement_dict["agreement_source"] = terms_result["source"]
             agreement_dict["generation_metadata"] = terms_result["metadata"]
             
-            # Insert agreement
-            agreement_response = supabase_admin.table("agreements").insert(agreement_dict).execute()
+            # The unique constraint also handles the race between the early
+            # lookup above and this insert.
+            try:
+                agreement_response = await run_db_async(
+                    lambda: supabase_admin.table("agreements").insert(agreement_dict).execute()
+                )
+            except Exception as exc:
+                if AgreementService._is_application_agreement_conflict(exc):
+                    existing_row = await AgreementService._get_agreement_for_application(application_id)
+                    if existing_row:
+                        logger.info(
+                            "[AGREEMENT SERVICE] Concurrent manual creation resolved to existing "
+                            f"agreement {existing_row.get('id')} for application {application_id}"
+                        )
+                        return existing_row
+                raise
             
             if agreement_response.data:
                 logger.info(f"✅ [AGREEMENT SERVICE] Enhanced manual agreement created ({terms_result['source']})")
